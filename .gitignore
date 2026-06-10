@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+data/
+*.sqlite
+
+.env
+
+# Local/private source material. Keep the code that imports these folders, but
+# do not push large or copyrighted PDFs to GitHub.
+RAG_corpus/
+not normal pdf/
