@@ -9,7 +9,5 @@ data/
 
 .env
 
-# Local/private source material. Keep the code that imports these folders, but
-# do not push large or copyrighted PDFs to GitHub.
-RAG_corpus/
+# Local/private source material outside the curated RAG corpus.
 not normal pdf/
