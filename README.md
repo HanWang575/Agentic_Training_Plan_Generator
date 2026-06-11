@@ -113,6 +113,27 @@ EMBED_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 `OPENAI_API_KEY` is optional when `LLM_*` and `EMBED_*` are configured. You can leave it empty while testing this block with aihubmix chat and DashScope embeddings.
 
+### Optional: Better PDF Tables With Marker
+
+The default PDF parser is PyMuPDF because it is fast and light. For table-heavy PDFs, use Marker instead:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[marker]"
+```
+
+Then add these values to `.env` and restart the backend:
+
+```text
+PDF_PARSER=marker
+MARKER_TORCH_DEVICE=cuda
+MARKER_FORCE_OCR=false
+MARKER_TIMEOUT_SECONDS=1800
+```
+
+Marker output is converted into semantic blocks before chunking. Prose is chunked section-first with LangChain header and recursive splitters. Table and figure chunks include `content_type` plus metadata such as `table_footnote`, `table_format`, `image_alt_text`, and `image_path`. Small tables and figures also carry nearby paragraph context into the final chunk text.
+
+Keep OCR off first because it is slower. If a PDF still has badly recognized words after Marker parsing, try `MARKER_FORCE_OCR=true`, restart the backend, remove the old source, upload the PDF again, and approve the new source.
+
 If the full install is slow because of large optional packages such as Chroma and Streamlit, you can still run the focused tests with this smaller dependency set:
 
 ```powershell
@@ -242,6 +263,8 @@ Expected behavior:
 - The response contains a `source_id`.
 - `approval_status` is `pending_review`.
 - `parser_status` is `parsed`.
+- PDF uploads may include `parser_warnings` when the parser repaired or still detected suspicious line wrapping or character-split text.
+- With `PDF_PARSER=marker`, table and figure chunks keep their `content_type` and metadata for retrieval/debug inspection.
 - `chunk_count` is at least `1`.
 
 ### 7B. Upload The Whole RAG_corpus Folder
@@ -505,7 +528,8 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/qa/traces/YOUR_TRACE_ID"
 
 Expected behavior:
 
-- You can see the question, retrieved chunk IDs, final context chunk IDs, answer, timings, citations, safety flags, and errors.
+- You can see the question, retrieved chunk IDs, merged chunk IDs, final context chunk IDs, answer, timings, citations, safety flags, and errors.
+- In Streamlit, the `Trace` tab also has a `View retrieved chunks` expander that shows the full stored text for citation chunks, merged chunks, and final chunks.
 
 ### 12. Try The Streamlit UI
 
@@ -529,14 +553,16 @@ http://localhost:8501
 
 UI tabs:
 
-- `Chat`: ask questions, preview retrieval, and read answers as formatted Markdown with a citation table.
+- `Chat`: ask questions, preview retrieval, and read answers as formatted Markdown with a citation table. The `View retrieved chunks` expander shows the full text for citation chunks, merged chunks, and final chunks, including parse quality warnings when a chunk still looks suspicious.
 - `Upload`: upload a source file or import all supported files from `RAG_corpus` with progress.
 - `Review`: approve/reject one source, selected sources, or all reviewable sources with progress.
 - `Sources`: inspect source status, remove approved sources, and remove rejected history records.
-- `Trace`: load a trace by ID.
+- `Trace`: load a trace by ID and inspect the full text behind citation, merged, and final chunk IDs.
 
 
 UI: `http://localhost:8501`
+
+Parser improvements only affect newly parsed files. To improve older malformed chunks, remove the old approved source, upload the PDF again, and approve the newly parsed source.
 
 ## Run Tests
 

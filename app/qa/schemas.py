@@ -43,8 +43,15 @@ class AnswerTraceOut(BaseModel):
     question: str
     topic_hint: str | None
     safety_mode: str
+    planner_used: str | None = None
+    clean_question: str | None = None
+    clarified_question: str | None = None
+    search_query: str | None = None
+    query_terms: list[str] = Field(default_factory=list)
+    planner_notes: list[str] = Field(default_factory=list)
     keyword_chunk_ids: list[str]
     semantic_chunk_ids: list[str]
+    merged_chunk_ids: list[str]
     final_chunk_ids: list[str]
     answer: str
     total_latency_ms: int
@@ -60,10 +67,13 @@ class QAState(TypedDict, total=False):
     question: str
     topic_hint: str | None
     clean_question: str
+    clarified_question: str
     safety_flags: list[dict[str, str]]
     safety_mode: str
     search_query: str
     query_terms: list[str]
+    planner_notes: list[str]
+    planner_used: str
     filters: dict[str, Any]
     keyword_results: list[RetrievedChunk]
     semantic_results: list[RetrievedChunk]
@@ -73,6 +83,7 @@ class QAState(TypedDict, total=False):
     evidence_context: str
     draft_answer: str
     final_answer: str
+    context_citations: list[CitationOut]
     citations: list[CitationOut]
     trace_id: str
     errors: list[str]

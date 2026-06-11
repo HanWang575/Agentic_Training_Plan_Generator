@@ -9,7 +9,7 @@ import time
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
-from app.core.llm_provider import AnswerRequest, OpenAIProvider
+from app.core.llm_provider import AnswerRequest, OpenAIProvider, QueryPlanRequest
 from app.knowledge.retrieval import expand_query_terms, normalize_query
 from app.knowledge.schemas import RetrievedChunk
 from app.knowledge.service import KnowledgeService
@@ -76,17 +76,53 @@ class SafetyClassifier:
 
 
 class QueryPlanner:
-    """Prepare keyword and semantic search terms."""
+    """Prepare keyword and semantic search terms with an LLM when available."""
+
+    def __init__(self, llm_provider: OpenAIProvider | None = None):
+        self.llm_provider = llm_provider
 
     def __call__(self, state: QAState) -> QAState:
         """Input: clean question and topic hint. Output: search query, terms, filters."""
 
         def work():
-            clean_question = state.get("clean_question", "")
-            terms = expand_query_terms(clean_question)
-            search_query = " ".join(dict.fromkeys(terms))
+            base_question = state.get("clean_question", "")
+            topic_hint = state.get("topic_hint")
+            errors = list(state.get("errors", []))
+            plan_notes: list[str] = []
+            planner_used = "fallback"
+            try:
+                if self.llm_provider is None or not hasattr(self.llm_provider, "generate_query_plan"):
+                    raise ConfigurationError("LLM query planner is unavailable.")
+                plan = self.llm_provider.generate_query_plan(
+                    QueryPlanRequest(
+                        question=base_question,
+                        topic_hint=topic_hint,
+                    )
+                )
+                clean_question = plan.clean_question or base_question
+                clarified_question = plan.clarified_question or clean_question
+                terms = _normalize_terms(plan.query_terms, clarified_question)
+                search_query = plan.search_query or " ".join(terms)
+                plan_notes = plan.notes
+                planner_used = "llm"
+            except Exception as exc:
+                clean_question = base_question
+                clarified_question = base_question
+                terms = expand_query_terms(base_question)
+                search_query = " ".join(dict.fromkeys(terms))
+                plan_notes = [f"Planner fallback used: {exc}"]
+                errors.append(f"Query planner fallback used: {exc}")
             filters = {"topic_hint": state.get("topic_hint")} if state.get("topic_hint") else {}
-            return {"search_query": search_query, "query_terms": terms, "filters": filters}
+            return {
+                "clean_question": clean_question,
+                "clarified_question": clarified_question,
+                "search_query": search_query,
+                "query_terms": terms,
+                "planner_notes": plan_notes,
+                "planner_used": planner_used,
+                "filters": filters,
+                "errors": errors,
+            }
 
         return _timed("QueryPlanner", state, work)
 
@@ -175,13 +211,16 @@ class ContextBuilder:
             token_total = 0
             parts: list[str] = []
             citations: list[CitationOut] = []
+            selected_chunks: list[RetrievedChunk] = []
             for chunk in state.get("context_results", state.get("merged_results", [])):
                 if token_total + chunk.token_count > self.settings.max_context_tokens:
                     break
                 token_total += chunk.token_count
+                selected_chunks.append(chunk)
                 page_or_section = _page_or_section(chunk)
                 parts.append(
                     f"[{chunk.source_id} / {chunk.chunk_id}] {chunk.title}, {page_or_section}\n"
+                    f"Content type: {chunk.content_type}\n"
                     f"{chunk.text}"
                 )
                 citations.append(
@@ -192,7 +231,12 @@ class ContextBuilder:
                         page_or_section=page_or_section,
                     )
                 )
-            return {"evidence_context": "\n\n---\n\n".join(parts), "citations": citations}
+            return {
+                "context_results": selected_chunks,
+                "evidence_context": "\n\n---\n\n".join(parts),
+                "context_citations": citations,
+                "citations": citations,
+            }
 
         return _timed("ContextBuilder", state, work)
 
@@ -251,19 +295,41 @@ class CitationChecker:
 
         def work():
             citations: list[CitationOut] = state.get("citations", [])
+            context_citations = state.get("context_citations", [])
+            if not context_citations:
+                context_citations = _citations_from_context_chunks(state.get("context_results", []))
             citations_by_pair = {(citation.source_id, citation.chunk_id): citation for citation in citations}
+            for citation in context_citations:
+                citations_by_pair.setdefault((citation.source_id, citation.chunk_id), citation)
             valid_pairs = set(citations_by_pair)
             answer = state.get("draft_answer", "")
-            cited_pairs = set(re.findall(r"\[(src_[A-Za-z0-9]+)\s*/\s*(chk_[A-Za-z0-9]+)\]", answer))
+            cited_pairs_in_answer = list(
+                dict.fromkeys(
+                    re.findall(r"\[(src_[A-Za-z0-9]+)\s*/\s*(chk_[A-Za-z0-9]+)\]", answer)
+                )
+            )
+            cited_pairs = set(cited_pairs_in_answer)
             invalid_pairs = cited_pairs - valid_pairs
             errors = list(state.get("errors", []))
             if invalid_pairs:
-                errors.append(f"Unsupported citation(s) removed: {sorted(invalid_pairs)}")
+                repaired_pairs: dict[tuple[str, str], CitationOut] = {}
+                removed_pairs: set[tuple[str, str]] = set()
 
                 def scrub(match: re.Match) -> str:
                     pair = (match.group(1), match.group(2))
-                    if pair in invalid_pairs:
-                        return "[unsupported citation removed]"
+                    if pair not in invalid_pairs:
+                        return match.group(0)
+                    replacement = _find_context_citation_for_invalid_marker(
+                        answer=answer,
+                        match=match,
+                        invalid_pair=pair,
+                        context_citations=context_citations,
+                    )
+                    if replacement:
+                        repaired_pairs[pair] = replacement
+                        citations_by_pair[(replacement.source_id, replacement.chunk_id)] = replacement
+                        return f"[{replacement.source_id} / {replacement.chunk_id}]"
+                    removed_pairs.add(pair)
                     return match.group(0)
 
                 answer = re.sub(
@@ -271,13 +337,36 @@ class CitationChecker:
                     scrub,
                     answer,
                 )
-                answer += "\n\nCitation check note: unsupported citation markers were removed."
-                cited_pairs = cited_pairs - invalid_pairs
+                if repaired_pairs:
+                    errors.append(
+                        f"Unsupported citation(s) repaired from final context: {sorted(repaired_pairs)}"
+                    )
+                if removed_pairs:
+                    errors.append(f"Unsupported citation(s) removed: {sorted(removed_pairs)}")
+
+                    def remove_unrepaired(match: re.Match) -> str:
+                        pair = (match.group(1), match.group(2))
+                        if pair in removed_pairs:
+                            return "[unsupported citation removed]"
+                        return match.group(0)
+
+                    answer = re.sub(
+                        r"\[(src_[A-Za-z0-9]+)\s*/\s*(chk_[A-Za-z0-9]+)\]",
+                        remove_unrepaired,
+                        answer,
+                    )
+                    answer += "\n\nCitation check note: unsupported citation markers were removed."
+                cited_pairs_in_answer = list(
+                    dict.fromkeys(
+                        re.findall(r"\[(src_[A-Za-z0-9]+)\s*/\s*(chk_[A-Za-z0-9]+)\]", answer)
+                    )
+                )
+                cited_pairs = set(cited_pairs_in_answer)
 
             filtered_citations = [
-                citation
-                for citation in citations
-                if (citation.source_id, citation.chunk_id) in cited_pairs
+                citations_by_pair[pair]
+                for pair in cited_pairs_in_answer
+                if pair in citations_by_pair
             ]
             if "- None" in answer and not cited_pairs:
                 filtered_citations = []
@@ -291,6 +380,100 @@ class CitationChecker:
             }
 
         return _timed("CitationChecker", state, work)
+
+
+def _citations_from_context_chunks(chunks: list[RetrievedChunk]) -> list[CitationOut]:
+    """Build citation records for chunks that were actually sent to the LLM."""
+
+    return [
+        CitationOut(
+            source_id=chunk.source_id,
+            chunk_id=chunk.chunk_id,
+            title=chunk.title,
+            page_or_section=_page_or_section(chunk),
+        )
+        for chunk in chunks
+    ]
+
+
+def _find_context_citation_for_invalid_marker(
+    answer: str,
+    match: re.Match,
+    invalid_pair: tuple[str, str],
+    context_citations: list[CitationOut],
+) -> CitationOut | None:
+    """Find a final-context citation that matches the invalid marker's line."""
+
+    line_tail = _line_tail_after_match(answer, match)
+    candidates = [
+        citation
+        for citation in context_citations
+        if citation.source_id == invalid_pair[0] and _citation_metadata_matches(line_tail, citation)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    candidates = [
+        citation
+        for citation in context_citations
+        if _citation_metadata_matches(line_tail, citation)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _line_tail_after_match(answer: str, match: re.Match) -> str:
+    """Return text after a marker on the same answer line."""
+
+    line_end = answer.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(answer)
+    return answer[match.end() : line_end]
+
+
+def _citation_metadata_matches(text: str, citation: CitationOut) -> bool:
+    """Match answer-line citation metadata to one final-context citation."""
+
+    normalized_text = _normalize_citation_text(text)
+    normalized_title = _normalize_citation_text(citation.title)
+    title_matches = bool(normalized_title and normalized_title in normalized_text)
+    location_matches = _citation_location_matches(text, citation.page_or_section)
+    if citation.page_or_section and "page " in citation.page_or_section:
+        return location_matches and (title_matches or not normalized_title)
+    if citation.page_or_section:
+        normalized_location = _normalize_citation_text(citation.page_or_section)
+        return title_matches and normalized_location in normalized_text
+    return title_matches
+
+
+def _citation_location_matches(text: str, page_or_section: str | None) -> bool:
+    """Return true when answer-line text mentions the citation page/section."""
+
+    if not page_or_section:
+        return False
+    page_match = re.search(r"page\s+(\d+)", page_or_section, flags=re.IGNORECASE)
+    if not page_match:
+        return _normalize_citation_text(page_or_section) in _normalize_citation_text(text)
+    citation_page = int(page_match.group(1))
+    for start_text, end_text in re.findall(r"page\s+(\d+)(?:\s*[-–]\s*(\d+))?", text, flags=re.IGNORECASE):
+        start_page = int(start_text)
+        end_page = int(end_text) if end_text else start_page
+        if start_page <= citation_page <= end_page:
+            return True
+    return False
+
+
+def _normalize_citation_text(text: str) -> str:
+    """Normalize citation titles and locations for conservative matching."""
+
+    return re.sub(r"\s+", " ", re.sub(r"[^0-9A-Za-z]+", " ", text).lower()).strip()
+
+
+def _normalize_terms(query_terms: list[str], clarified_question: str) -> list[str]:
+    """Deduplicate LLM query terms while preserving the clarified question first."""
+
+    ordered = [clarified_question, *query_terms]
+    return list(dict.fromkeys(term.strip() for term in ordered if term and term.strip()))[:12]
 
 
 def _page_or_section(chunk: RetrievedChunk) -> str:

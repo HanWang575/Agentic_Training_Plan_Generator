@@ -4,7 +4,8 @@ import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from sqlmodel import Session
 
 from app.core.config import Settings, get_settings
 from app.core.errors import NotFoundError
@@ -12,6 +13,8 @@ from app.knowledge.schemas import (
     BatchReviewRequest,
     BatchReviewResult,
     BulkUploadResult,
+    ChunkLookupRequest,
+    ChunkLookupResponse,
     CorpusPlanResult,
     RemoveSourcesRequest,
     RemoveSourcesResult,
@@ -22,7 +25,7 @@ from app.knowledge.schemas import (
     UploadResult,
 )
 from app.knowledge.service import KnowledgeService
-from app.storage.database import get_session
+from app.storage.database import engine, get_session
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -31,6 +34,14 @@ def _service_dependency():
     settings = get_settings()
     for session in get_session():
         yield KnowledgeService(session=session, settings=settings)
+
+
+def _parse_upload_in_background(source_id: str) -> None:
+    """Parse one queued upload after the async route returns."""
+
+    settings = get_settings()
+    with Session(engine) as session:
+        KnowledgeService(session=session, settings=settings).parse_pending_source(source_id)
 
 
 @router.post("/upload", response_model=UploadResult)
@@ -54,6 +65,34 @@ def upload_source(
         if temp_path.stat().st_size > settings.maximum_upload_bytes:
             raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
         return service.upload_file(temp_path, title=inferred_title, topic_tags=tags)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@router.post("/upload/async", response_model=UploadResult)
+def upload_source_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    topic_tags: str | None = Form(default=None),
+    service: KnowledgeService = Depends(_service_dependency),
+    settings: Settings = Depends(get_settings),
+) -> UploadResult:
+    """Upload one source and parse it in the background for UI progress polling."""
+
+    original_path = Path(file.filename or "upload")
+    suffix = original_path.suffix
+    inferred_title = title.strip() if title and title.strip() else original_path.stem
+    tags = [tag.strip() for tag in (topic_tags or "").split(",") if tag.strip()]
+    with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        shutil.copyfileobj(file.file, temp_file)
+        temp_path = Path(temp_file.name)
+    try:
+        if temp_path.stat().st_size > settings.maximum_upload_bytes:
+            raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
+        source_id = service.create_pending_upload(temp_path, title=inferred_title, topic_tags=tags)
+        background_tasks.add_task(_parse_upload_in_background, source_id)
+        return service.get_source_summary(source_id, result_type=UploadResult)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -102,6 +141,29 @@ def list_sources(
     """List source summaries, optionally filtered by approval status."""
 
     return service.list_sources(status=status)
+
+
+@router.get("/sources/{source_id}", response_model=SourceSummary)
+def get_source(
+    source_id: str,
+    service: KnowledgeService = Depends(_service_dependency),
+) -> SourceSummary:
+    """Return one source summary for polling upload progress."""
+
+    try:
+        return service.get_source_summary(source_id, result_type=SourceSummary)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/chunks", response_model=ChunkLookupResponse)
+def get_chunks(
+    request: ChunkLookupRequest,
+    service: KnowledgeService = Depends(_service_dependency),
+) -> ChunkLookupResponse:
+    """Return full stored text for requested chunk IDs."""
+
+    return service.get_chunks_by_ids(request.chunk_ids)
 
 
 @router.post("/review/batch", response_model=BatchReviewResult)
@@ -206,6 +268,8 @@ def search_knowledge(
             "title": chunk.title,
             "page_number": chunk.page_number,
             "section_heading": chunk.section_heading,
+            "content_type": chunk.content_type,
+            "content_metadata": chunk.content_metadata,
             "score": chunk.score,
             "retrieval_method": chunk.retrieval_method,
             "text_preview": chunk.text[:600],

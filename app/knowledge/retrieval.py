@@ -149,6 +149,8 @@ def _to_retrieved_chunk(
         text=chunk.text,
         page_number=chunk.page_number,
         section_heading=chunk.section_heading,
+        content_type=chunk.content_type,
+        content_metadata=json.loads(chunk.content_metadata_json or "{}"),
         topic_tags=json.loads(chunk.topic_tags_json or "[]"),
         token_count=chunk.token_count,
         score=score,

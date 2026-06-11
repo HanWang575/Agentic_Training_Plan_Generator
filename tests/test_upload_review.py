@@ -40,6 +40,62 @@ def test_upload_creates_pending_source_and_chunks(tmp_path: Path):
     session.close()
 
 
+def test_create_pending_upload_returns_queued_source_before_parsing(tmp_path: Path):
+    """Async upload registration should return immediately with queued parser state."""
+
+    _, session, service = _make_service(tmp_path)
+    source_path = tmp_path / "queued.txt"
+    source_path.write_text("Queued upload test.", encoding="utf-8")
+
+    source_id = service.create_pending_upload(source_path, title="Queued Note", topic_tags=["test"])
+    source = session.get(SourceDocument, source_id)
+
+    assert source is not None
+    assert source.parser_status == "queued"
+    assert source.parser_progress == 0.0
+    assert source.parser_progress_message == "Queued for parsing."
+    session.close()
+
+
+def test_parse_pending_source_updates_progress_and_creates_chunks(tmp_path: Path):
+    """Queued uploads can be parsed later by the background worker path."""
+
+    _, session, service = _make_service(tmp_path)
+    source_path = tmp_path / "later.txt"
+    source_path.write_text("Protein supports muscle repair after training.", encoding="utf-8")
+
+    source_id = service.create_pending_upload(source_path, title="Later Note", topic_tags=["nutrition"])
+    result = service.parse_pending_source(source_id)
+    source = session.get(SourceDocument, source_id)
+
+    assert result.parser_status == "parsed"
+    assert source is not None
+    assert source.parser_progress == 1.0
+    assert source.parser_progress_message == "Parsing complete."
+    assert session.exec(select(KnowledgeChunk).where(KnowledgeChunk.source_id == source_id)).all()
+    session.close()
+
+
+def test_get_chunks_by_ids_returns_full_text_and_missing_ids(tmp_path: Path):
+    """Chunk lookup returns readable text and reports IDs that are not stored."""
+
+    _, session, service = _make_service(tmp_path)
+    source_path = tmp_path / "protein.txt"
+    source_path.write_text("Protein supports muscle repair after resistance training.", encoding="utf-8")
+    upload = service.upload_file(source_path, title="Protein Note", topic_tags=["nutrition"])
+    chunk = session.exec(select(KnowledgeChunk).where(KnowledgeChunk.source_id == upload.source_id)).one()
+
+    result = service.get_chunks_by_ids([chunk.chunk_id, "chk_missing"])
+
+    assert result.missing_chunk_ids == ["chk_missing"]
+    assert len(result.chunks) == 1
+    assert result.chunks[0].chunk_id == chunk.chunk_id
+    assert result.chunks[0].title == "Protein Note"
+    assert result.chunks[0].topic_tags == ["nutrition"]
+    assert "muscle repair" in result.chunks[0].text
+    session.close()
+
+
 def test_pending_source_is_not_searchable(tmp_path: Path):
     """Pending chunks remain excluded from approved-only keyword search."""
 

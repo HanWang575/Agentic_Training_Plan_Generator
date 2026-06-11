@@ -63,8 +63,19 @@ class Settings(BaseSettings):
 
     upload_dir: Path = Path("data/uploads")
     rag_corpus_dir: Path = Path("RAG_corpus")
-    chunk_target_tokens: int = 700
-    chunk_overlap_tokens: int = 100
+    pdf_parser_backend: str = Field(
+        default="pymupdf",
+        validation_alias=AliasChoices("PDF_PARSER_BACKEND", "PDF_PARSER"),
+    )
+    marker_torch_device: str = Field(default="cuda", validation_alias="MARKER_TORCH_DEVICE")
+    marker_force_ocr: bool = Field(default=False, validation_alias="MARKER_FORCE_OCR")
+    marker_timeout_seconds: int = Field(default=1800, validation_alias="MARKER_TIMEOUT_SECONDS")
+    marker_page_batch_size: int = Field(default=20, validation_alias="MARKER_PAGE_BATCH_SIZE")
+    chunk_target_tokens: int = 512
+    chunk_overlap_tokens: int = 128
+    maximum_table_chunk_size: int = 2048
+    structured_context_previous_paragraphs: int = 2
+    structured_context_next_paragraphs: int = 1
     keyword_top_k: int = 30
     semantic_top_k: int = 30
     final_context_top_k: int = 12

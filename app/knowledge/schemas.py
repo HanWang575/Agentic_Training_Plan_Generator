@@ -1,6 +1,7 @@
 """Pydantic and dataclass objects for the knowledge service."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,9 @@ class ParsedTextBlock:
     text: str
     page_number: int | None = None
     section_heading: str | None = None
+    content_type: str = "plain_text"
+    content_metadata: dict[str, Any] = field(default_factory=dict)
+    quality_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -29,6 +33,7 @@ class ParsedDocument:
     title: str
     source_type: str
     blocks: list[ParsedTextBlock]
+    parser_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -40,6 +45,9 @@ class ChunkDraft:
     page_number: int | None
     section_heading: str | None
     token_count: int
+    content_type: str = "plain_text"
+    content_metadata: dict[str, Any] = field(default_factory=dict)
+    quality_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -61,6 +69,8 @@ class RetrievedChunk:
     score: float
     rank: int
     retrieval_method: str
+    content_type: str = "plain_text"
+    content_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class SourceSummary(BaseModel):
@@ -71,7 +81,10 @@ class SourceSummary(BaseModel):
     source_type: str
     approval_status: str
     parser_status: str
+    parser_progress: float = 0.0
+    parser_progress_message: str | None = None
     parser_error: str | None = None
+    parser_warnings: list[str] = Field(default_factory=list)
     topic_tags: list[str] = Field(default_factory=list)
     chunk_count: int = 0
 
@@ -165,3 +178,33 @@ class SearchKnowledgeResponse(BaseModel):
     """Output shape for knowledge search APIs and MCP tools."""
 
     chunks: list[dict]
+
+
+class ChunkLookupRequest(BaseModel):
+    """Input shape for looking up stored chunk text by chunk ID."""
+
+    chunk_ids: list[str] = Field(default_factory=list)
+
+
+class ChunkDetail(BaseModel):
+    """Output shape for one full stored chunk."""
+
+    source_id: str
+    chunk_id: str
+    title: str
+    text: str
+    page_number: int | None = None
+    section_heading: str | None = None
+    content_type: str = "plain_text"
+    content_metadata: dict[str, Any] = Field(default_factory=dict)
+    topic_tags: list[str] = Field(default_factory=list)
+    token_count: int = 0
+    approval_status: str
+    quality_warnings: list[str] = Field(default_factory=list)
+
+
+class ChunkLookupResponse(BaseModel):
+    """Output shape for full chunk lookup."""
+
+    chunks: list[ChunkDetail] = Field(default_factory=list)
+    missing_chunk_ids: list[str] = Field(default_factory=list)

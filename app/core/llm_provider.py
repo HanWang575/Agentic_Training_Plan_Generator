@@ -2,9 +2,12 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import json
+import re
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
+from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
 
 
 @dataclass(slots=True)
@@ -16,6 +19,25 @@ class AnswerRequest:
     safety_mode: str
     safety_flags: list[dict]
     max_tokens: int
+
+
+@dataclass(slots=True)
+class QueryPlanRequest:
+    """Input shape for query planning."""
+
+    question: str
+    topic_hint: str | None = None
+
+
+@dataclass(slots=True)
+class QueryPlanResult:
+    """Output shape for LLM-based query planning."""
+
+    clean_question: str
+    clarified_question: str
+    search_query: str
+    query_terms: list[str]
+    notes: list[str]
 
 
 class OpenAIProvider:
@@ -120,19 +142,11 @@ class OpenAIProvider:
             Evidence used, and Safety note sections.
         """
 
-        prompt = (
-            "You are the Evidence-Based Q&A Assistant for a personal trainer AI.\n"
-            "Answer only from the evidence context. If the evidence is not enough, "
-            "say it is insufficient. Do not invent citations.\n\n"
-            f"Safety mode: {request.safety_mode}\n"
-            f"Safety flags: {request.safety_flags}\n\n"
-            f"Question:\n{request.question}\n\n"
-            f"Evidence context:\n{request.evidence_context}\n\n"
-            "Use this exact structure:\n"
-            "Short answer:\n...\n\n"
-            "Practical guidance:\n...\n\n"
-            "Evidence used:\n- [source_id / chunk_id] title, page/section\n\n"
-            "Safety note:\n..."
+        prompt = build_answer_prompt(
+            question=request.question,
+            evidence_context=request.evidence_context,
+            safety_mode=request.safety_mode,
+            safety_flags=request.safety_flags,
         )
         client = self._require_chat_client()
         if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:
@@ -150,3 +164,56 @@ class OpenAIProvider:
         )
         content = response.choices[0].message.content
         return content or ""
+
+    def generate_query_plan(self, request: QueryPlanRequest) -> QueryPlanResult:
+        """Generate a retrieval-oriented query plan from the user's question."""
+
+        prompt = build_query_planner_prompt(
+            question=request.question,
+            topic_hint=request.topic_hint,
+        )
+        client = self._require_chat_client()
+        if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:
+            response = client.responses.create(
+                model=self.settings.active_chat_model,
+                input=prompt,
+                max_output_tokens=500,
+            )
+            raw_text = response.output_text or ""
+        else:
+            response = client.chat.completions.create(
+                model=self.settings.active_chat_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+            )
+            raw_text = response.choices[0].message.content or ""
+        payload = _parse_json_object(raw_text)
+        return QueryPlanResult(
+            clean_question=str(payload.get("clean_question", "")).strip(),
+            clarified_question=str(payload.get("clarified_question", "")).strip(),
+            search_query=str(payload.get("search_query", "")).strip(),
+            query_terms=[
+                str(item).strip()
+                for item in payload.get("query_terms", [])
+                if str(item).strip()
+            ],
+            notes=[
+                str(item).strip()
+                for item in payload.get("notes", [])
+                if str(item).strip()
+            ],
+        )
+
+
+def _parse_json_object(text: str) -> dict:
+    """Extract one JSON object from a model response."""
+
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("Query planner returned an empty response.")
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        return json.loads(cleaned)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        raise ValueError("Query planner did not return a JSON object.")
+    return json.loads(match.group(0))

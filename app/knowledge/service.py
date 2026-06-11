@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,6 +18,8 @@ from app.knowledge.retrieval import KeywordRetriever, SemanticRetriever, normali
 from app.knowledge.schemas import (
     BatchReviewResult,
     BulkUploadResult,
+    ChunkDetail,
+    ChunkLookupResponse,
     CorpusFileItem,
     CorpusPlanResult,
     RemoveSourcesResult,
@@ -58,6 +61,18 @@ class KnowledgeService:
             UploadResult: source metadata and chunk count.
         """
 
+        source_id = self.create_pending_upload(source_file_path, title=title, topic_tags=topic_tags)
+        self.parse_pending_source(source_id)
+        return self._summary_for_source(source_id, result_type=UploadResult)
+
+    def create_pending_upload(
+        self,
+        source_file_path: Path,
+        title: str | None,
+        topic_tags: list[str] | None,
+    ) -> str:
+        """Copy one file into upload storage and register a queued source."""
+
         source_id = f"src_{uuid4().hex[:12]}"
         tags = topic_tags or []
         source_dir = self.settings.upload_dir / source_id
@@ -72,18 +87,45 @@ class KnowledgeService:
             file_path=str(stored_path),
             topic_tags_json=json.dumps(tags),
             approval_status="pending_review",
+            parser_status="queued",
+            parser_progress=0.0,
+            parser_progress_message="Queued for parsing.",
         )
         self.session.add(source)
         self.session.commit()
+        return source_id
 
+    def parse_pending_source(self, source_id: str) -> UploadResult:
+        """Parse one queued upload and store pending chunks."""
+
+        source = self._get_source(source_id)
+        stored_path = Path(source.file_path)
+        tags = json.loads(source.topic_tags_json or "[]")
+        self._set_parse_progress(source, 0.02, "Preparing parser...")
         try:
-            parsed = parse_document(stored_path, title=source.title)
+            parsed = parse_document(
+                stored_path,
+                title=source.title,
+                settings=self.settings,
+                progress_callback=lambda progress, message: self._set_parse_progress(
+                    source,
+                    max(0.02, min(0.9, progress * 0.9)),
+                    message,
+                ),
+            )
+            self._set_parse_progress(source, 0.92, "Chunking parsed content...")
             drafts = chunk_document(
                 parsed,
                 target_tokens=self.settings.chunk_target_tokens,
                 overlap_tokens=self.settings.chunk_overlap_tokens,
+                maximum_table_chunk_size=self.settings.maximum_table_chunk_size,
+                structured_context_previous_paragraphs=self.settings.structured_context_previous_paragraphs,
+                structured_context_next_paragraphs=self.settings.structured_context_next_paragraphs,
             )
             source.parser_status = "parsed"
+            source.parser_progress = 1.0
+            source.parser_progress_message = "Parsing complete."
+            source.parser_warnings_json = json.dumps(parsed.parser_warnings)
             for draft in drafts:
                 self.session.add(
                     KnowledgeChunk(
@@ -93,9 +135,12 @@ class KnowledgeService:
                         text=draft.text,
                         page_number=draft.page_number,
                         section_heading=draft.section_heading,
+                        content_type=draft.content_type,
+                        content_metadata_json=json.dumps(draft.content_metadata),
                         topic_tags_json=json.dumps(tags),
                         token_count=draft.token_count,
                         approval_status="pending_review",
+                        quality_warnings_json=json.dumps(draft.quality_warnings),
                     )
                 )
             self.session.add(source)
@@ -103,10 +148,11 @@ class KnowledgeService:
         except Exception as exc:  # Store parser errors so review UI can show them.
             source.approval_status = "parse_error"
             source.parser_status = "parse_error"
+            source.parser_progress = 1.0
+            source.parser_progress_message = "Parsing failed."
             source.parser_error = str(exc)
             self.session.add(source)
             self.session.commit()
-
         return self._summary_for_source(source_id, result_type=UploadResult)
 
     def upload_rag_corpus(self, corpus_dir: Path | None = None) -> BulkUploadResult:
@@ -520,6 +566,48 @@ class KnowledgeService:
         sources = self.session.exec(statement.order_by(SourceDocument.uploaded_at.desc())).all()
         return [self._summary_for_source(source.source_id, SourceSummary) for source in sources]
 
+    def get_source_summary(self, source_id: str, result_type=SourceSummary):
+        """Return one source summary by source ID."""
+
+        return self._summary_for_source(source_id, result_type)
+
+    def get_chunks_by_ids(self, chunk_ids: list[str]) -> ChunkLookupResponse:
+        """Return full stored text for requested chunk IDs.
+
+        Parameters:
+            chunk_ids: requested chunk IDs with shape `[chunk_count]`.
+        Returns:
+            ChunkLookupResponse: chunks in the same order as requested, plus
+            IDs that no longer exist.
+        """
+
+        requested_ids = list(dict.fromkeys(chunk_ids))
+        chunks: list[ChunkDetail] = []
+        missing: list[str] = []
+        for chunk_id in requested_ids:
+            chunk = self.session.get(KnowledgeChunk, chunk_id)
+            if chunk is None:
+                missing.append(chunk_id)
+                continue
+            source = self.session.get(SourceDocument, chunk.source_id)
+            chunks.append(
+                ChunkDetail(
+                    source_id=chunk.source_id,
+                    chunk_id=chunk.chunk_id,
+                    title=source.title if source else "unknown source",
+                    text=chunk.text,
+                    page_number=chunk.page_number,
+                    section_heading=chunk.section_heading,
+                    content_type=chunk.content_type,
+                    content_metadata=json.loads(chunk.content_metadata_json or "{}"),
+                    topic_tags=json.loads(chunk.topic_tags_json or "[]"),
+                    token_count=chunk.token_count,
+                    approval_status=chunk.approval_status,
+                    quality_warnings=json.loads(chunk.quality_warnings_json or "[]"),
+                )
+            )
+        return ChunkLookupResponse(chunks=chunks, missing_chunk_ids=missing)
+
     def search(
         self,
         query: str,
@@ -601,6 +689,8 @@ class KnowledgeService:
                         text=neighbor.text,
                         page_number=neighbor.page_number,
                         section_heading=neighbor.section_heading,
+                        content_type=neighbor.content_type,
+                        content_metadata=json.loads(neighbor.content_metadata_json or "{}"),
                         topic_tags=json.loads(neighbor.topic_tags_json or "[]"),
                         token_count=neighbor.token_count,
                         score=retrieved.score,
@@ -633,10 +723,22 @@ class KnowledgeService:
             source_type=source.source_type,
             approval_status=source.approval_status,
             parser_status=source.parser_status,
+            parser_progress=source.parser_progress,
+            parser_progress_message=source.parser_progress_message,
             parser_error=source.parser_error,
+            parser_warnings=json.loads(source.parser_warnings_json or "[]"),
             topic_tags=json.loads(source.topic_tags_json or "[]"),
             chunk_count=chunk_count,
         )
+
+    def _set_parse_progress(self, source: SourceDocument, progress: float, message: str) -> None:
+        """Persist parse progress so the UI can poll it during long uploads."""
+
+        source.parser_status = "parsing"
+        source.parser_progress = max(0.0, min(1.0, progress))
+        source.parser_progress_message = message
+        self.session.add(source)
+        self.session.commit()
 
 
 def _title_from_file_name(source_path: Path) -> str:

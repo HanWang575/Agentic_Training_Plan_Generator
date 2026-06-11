@@ -51,7 +51,9 @@ class KeywordIndexer:
                     "source_id": chunk.source_id,
                     "title": source.title,
                     "text": chunk.text,
-                    "topic_tags": " ".join(json.loads(chunk.topic_tags_json or "[]")),
+                    "topic_tags": " ".join(
+                        [chunk.content_type, *json.loads(chunk.topic_tags_json or "[]")]
+                    ),
                 },
             )
         self.session.commit()
@@ -123,6 +125,8 @@ class VectorIndexer:
                         "title": source.title,
                         "page_number": chunk.page_number or "",
                         "section_heading": chunk.section_heading or "",
+                        "content_type": chunk.content_type,
+                        "content_metadata": chunk.content_metadata_json,
                         "topic_tags": chunk.topic_tags_json,
                         "approval_status": chunk.approval_status,
                     }

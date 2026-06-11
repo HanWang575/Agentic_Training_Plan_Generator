@@ -34,7 +34,10 @@ class SourceDocument(SQLModel, table=True):
     reviewed_at: Optional[datetime] = None
     review_note: Optional[str] = None
     parser_status: str = "pending"
+    parser_progress: float = 0.0
+    parser_progress_message: Optional[str] = None
     parser_error: Optional[str] = None
+    parser_warnings_json: str = "[]"
 
 
 class KnowledgeChunk(SQLModel, table=True):
@@ -48,10 +51,13 @@ class KnowledgeChunk(SQLModel, table=True):
     text: str
     page_number: Optional[int] = Field(default=None, index=True)
     section_heading: Optional[str] = None
+    content_type: str = Field(default="plain_text", index=True)
+    content_metadata_json: str = "{}"
     topic_tags_json: str = "[]"
     token_count: int = 0
     embedding_id: Optional[str] = None
     approval_status: str = Field(default="pending_review", index=True)
+    quality_warnings_json: str = "[]"
 
 
 class AnswerTrace(SQLModel, table=True):
@@ -63,8 +69,15 @@ class AnswerTrace(SQLModel, table=True):
     question: str
     topic_hint: Optional[str] = None
     safety_mode: str = "normal"
+    planner_used: Optional[str] = None
+    clean_question: Optional[str] = None
+    clarified_question: Optional[str] = None
+    search_query: Optional[str] = None
+    query_terms_json: str = "[]"
+    planner_notes_json: str = "[]"
     keyword_chunk_ids_json: str = "[]"
     semantic_chunk_ids_json: str = "[]"
+    merged_chunk_ids_json: str = "[]"
     final_chunk_ids_json: str = "[]"
     answer: str = ""
     created_at: datetime = Field(default_factory=utc_now)

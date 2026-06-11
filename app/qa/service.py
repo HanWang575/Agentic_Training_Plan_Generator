@@ -66,7 +66,7 @@ class QAService:
         nodes = [
             InputValidator(),
             SafetyClassifier(),
-            QueryPlanner(),
+            QueryPlanner(self.llm_provider),
             RetrievalNode(self.knowledge_service),
             ResultMerger(self.settings),
             NeighborExpander(self.knowledge_service),
@@ -82,10 +82,20 @@ class QAService:
         debug_payload = None
         if debug:
             debug_payload = {
+                "planner_used": state.get("planner_used"),
+                "clean_question": state.get("clean_question"),
+                "clarified_question": state.get("clarified_question"),
+                "search_query": state.get("search_query"),
+                "query_terms": state.get("query_terms", []),
+                "planner_notes": state.get("planner_notes", []),
                 "keyword_chunk_ids": [chunk.chunk_id for chunk in state.get("keyword_results", [])],
                 "semantic_chunk_ids": [chunk.chunk_id for chunk in state.get("semantic_results", [])],
                 "merged_chunk_ids": [chunk.chunk_id for chunk in state.get("merged_results", [])],
                 "final_chunk_ids": [chunk.chunk_id for chunk in state.get("context_results", [])],
+                "explicit_citation_chunk_ids": [
+                    citation.chunk_id for citation in state.get("context_citations", [])
+                ],
+                "returned_citation_chunk_ids": [citation.chunk_id for citation in citations],
                 "semantic_error": state.get("semantic_error"),
                 "errors": state.get("errors", []),
                 "timings": state.get("timings", {}),
@@ -113,8 +123,15 @@ class QAService:
             question=trace.question,
             topic_hint=trace.topic_hint,
             safety_mode=trace.safety_mode,
+            planner_used=trace.planner_used,
+            clean_question=trace.clean_question,
+            clarified_question=trace.clarified_question,
+            search_query=trace.search_query,
+            query_terms=json.loads(trace.query_terms_json or "[]"),
+            planner_notes=json.loads(trace.planner_notes_json or "[]"),
             keyword_chunk_ids=json.loads(trace.keyword_chunk_ids_json or "[]"),
             semantic_chunk_ids=json.loads(trace.semantic_chunk_ids_json or "[]"),
+            merged_chunk_ids=json.loads(trace.merged_chunk_ids_json or "[]"),
             final_chunk_ids=json.loads(trace.final_chunk_ids_json or "[]"),
             answer=trace.answer,
             total_latency_ms=trace.total_latency_ms,
@@ -152,11 +169,20 @@ class QAService:
                 question=state.get("question", ""),
                 topic_hint=state.get("topic_hint"),
                 safety_mode=state.get("safety_mode", "normal"),
+                planner_used=state.get("planner_used"),
+                clean_question=state.get("clean_question"),
+                clarified_question=state.get("clarified_question"),
+                search_query=state.get("search_query"),
+                query_terms_json=json.dumps(state.get("query_terms", [])),
+                planner_notes_json=json.dumps(state.get("planner_notes", [])),
                 keyword_chunk_ids_json=json.dumps(
                     [chunk.chunk_id for chunk in state.get("keyword_results", [])]
                 ),
                 semantic_chunk_ids_json=json.dumps(
                     [chunk.chunk_id for chunk in state.get("semantic_results", [])]
+                ),
+                merged_chunk_ids_json=json.dumps(
+                    [chunk.chunk_id for chunk in state.get("merged_results", [])]
                 ),
                 final_chunk_ids_json=json.dumps(
                     [chunk.chunk_id for chunk in state.get("context_results", [])]

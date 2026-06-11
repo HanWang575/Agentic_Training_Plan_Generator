@@ -44,6 +44,84 @@ def init_db(active_engine=None) -> None:
     db_engine = active_engine or engine
     SQLModel.metadata.create_all(db_engine)
     with db_engine.begin() as connection:
+        _ensure_column(
+            connection,
+            table_name="source_documents",
+            column_name="parser_warnings_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="source_documents",
+            column_name="parser_progress",
+            column_definition="REAL NOT NULL DEFAULT 0.0",
+        )
+        _ensure_column(
+            connection,
+            table_name="source_documents",
+            column_name="parser_progress_message",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="knowledge_chunks",
+            column_name="quality_warnings_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="knowledge_chunks",
+            column_name="content_type",
+            column_definition="TEXT NOT NULL DEFAULT 'plain_text'",
+        )
+        _ensure_column(
+            connection,
+            table_name="knowledge_chunks",
+            column_name="content_metadata_json",
+            column_definition="TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="merged_chunk_ids_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="planner_used",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="clean_question",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="clarified_question",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="search_query",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="query_terms_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="planner_notes_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
         connection.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts
@@ -56,6 +134,17 @@ def init_db(active_engine=None) -> None:
             )
             """
         )
+
+
+def _ensure_column(connection, table_name: str, column_name: str, column_definition: str) -> None:
+    """Add a SQLite column when opening an older local database."""
+
+    columns = connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+    if any(column[1] == column_name for column in columns):
+        return
+    connection.exec_driver_sql(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+    )
 
 
 def get_session() -> Generator[Session, None, None]:
