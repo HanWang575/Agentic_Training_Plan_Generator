@@ -8,6 +8,7 @@ def build_answer_prompt(
     evidence_context: str,
     safety_mode: str,
     safety_flags: list[dict],
+    memory_context: str | None = None,
 ) -> str:
     """Build the live answer-generation prompt.
 
@@ -19,6 +20,17 @@ def build_answer_prompt(
     Returns:
         str: grounded prompt for the answer model.
     """
+
+    memory_section = ""
+    if memory_context:
+        memory_section = (
+            "\n\nUser memory context (personalization only):\n"
+            f"{memory_context}\n\n"
+            "Memory rules:\n"
+            "- Use memory only to personalize framing, constraints, and follow-up suggestions.\n"
+            "- Do not treat memory as evidence for scientific claims.\n"
+            "- If memory conflicts with evidence or raises a safety concern, say so cautiously.\n"
+        )
 
     return (
         "You are the Evidence-Based Q&A Assistant for a personal trainer AI.\n"
@@ -42,6 +54,7 @@ def build_answer_prompt(
         f"Safety flags: {json.dumps(safety_flags, ensure_ascii=False)}\n\n"
         f"Question:\n{question}\n\n"
         f"Evidence context:\n{evidence_context}\n\n"
+        f"{memory_section}"
         "Output requirements:\n"
         "- Use exactly these section headers.\n"
         "- Keep all claims traceable to the evidence context.\n"

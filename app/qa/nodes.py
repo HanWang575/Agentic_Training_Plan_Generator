@@ -265,6 +265,7 @@ class AnswerGenerator:
                         safety_mode=state.get("safety_mode", "normal"),
                         safety_flags=state.get("safety_flags", []),
                         max_tokens=self.settings.answer_max_tokens,
+                        memory_context=state.get("memory_context_rendered"),
                     )
                 )
                 return {"draft_answer": answer, "insufficient_evidence": False}

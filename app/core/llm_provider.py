@@ -19,6 +19,7 @@ class AnswerRequest:
     safety_mode: str
     safety_flags: list[dict]
     max_tokens: int
+    memory_context: str | None = None
 
 
 @dataclass(slots=True)
@@ -147,6 +148,7 @@ class OpenAIProvider:
             evidence_context=request.evidence_context,
             safety_mode=request.safety_mode,
             safety_flags=request.safety_flags,
+            memory_context=request.memory_context,
         )
         client = self._require_chat_client()
         if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:

@@ -95,6 +95,18 @@ def init_db(active_engine=None) -> None:
         _ensure_column(
             connection,
             table_name="answer_traces",
+            column_name="user_id",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="conversation_id",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
             column_name="clean_question",
             column_definition="TEXT",
         )
@@ -120,6 +132,18 @@ def init_db(active_engine=None) -> None:
             connection,
             table_name="answer_traces",
             column_name="planner_notes_json",
+            column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="memory_context_json",
+            column_definition="TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
+            table_name="answer_traces",
+            column_name="memory_debug_ids_json",
             column_definition="TEXT NOT NULL DEFAULT '[]'",
         )
         connection.exec_driver_sql(

@@ -188,8 +188,10 @@ Expected result:
 
 ```text
 Personal Coach Evidence-Based Q&A Assistant
-12
+55
 ```
+
+The route count includes the User Profile And Memory routes when that block is installed.
 
 ### 5. Start The Backend
 

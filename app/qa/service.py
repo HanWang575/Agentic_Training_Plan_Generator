@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.errors import NotFoundError
 from app.core.llm_provider import OpenAIProvider
 from app.knowledge.service import KnowledgeService
+from app.memory.service import MemoryService
 from app.qa.graph import run_langgraph_or_nodes
 from app.qa.nodes import (
     AnswerGenerator,
@@ -35,6 +36,7 @@ class QAService:
         settings: Settings,
         knowledge_service: KnowledgeService | None = None,
         llm_provider: OpenAIProvider | None = None,
+        memory_service: MemoryService | None = None,
     ):
         self.session = session
         self.settings = settings
@@ -44,8 +46,18 @@ class QAService:
             settings=settings,
             llm_provider=self.llm_provider,
         )
+        self.memory_service = memory_service
 
-    def ask(self, question: str, topic_hint: str | None = None, debug: bool = False) -> AskQuestionResponse:
+    def ask(
+        self,
+        question: str,
+        topic_hint: str | None = None,
+        debug: bool = False,
+        user_id: str | None = None,
+        conversation_id: str | None = None,
+        include_memory: bool = False,
+        memory_debug: bool = False,
+    ) -> AskQuestionResponse:
         """Run the Q&A workflow.
 
         Parameters:
@@ -57,10 +69,22 @@ class QAService:
         """
 
         started = time.perf_counter()
+        memory_payload, memory_errors = self._prepare_memory_context(
+            question=question,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            include_memory=include_memory,
+            memory_debug=memory_debug,
+        )
         initial_state: QAState = {
             "question": question,
             "topic_hint": topic_hint,
-            "errors": [],
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "memory_context_rendered": memory_payload.get("rendered_context", ""),
+            "memory_context_payload": memory_payload,
+            "memory_debug_ids": memory_payload.get("memory_ids", []),
+            "errors": memory_errors,
             "timings": {},
         }
         nodes = [
@@ -77,10 +101,15 @@ class QAService:
         state = run_langgraph_or_nodes(initial_state, nodes)
         total_latency_ms = int((time.perf_counter() - started) * 1000)
         trace_id = self._store_trace(state, total_latency_ms)
+        self._store_assistant_message(
+            conversation_id=conversation_id,
+            answer=state.get("final_answer", ""),
+            trace_id=trace_id,
+        )
         citations = state.get("citations", [])
         safety_flags = state.get("safety_flags", [])
         debug_payload = None
-        if debug:
+        if debug or memory_debug:
             debug_payload = {
                 "planner_used": state.get("planner_used"),
                 "clean_question": state.get("clean_question"),
@@ -97,6 +126,8 @@ class QAService:
                 ],
                 "returned_citation_chunk_ids": [citation.chunk_id for citation in citations],
                 "semantic_error": state.get("semantic_error"),
+                "memory_context": state.get("memory_context_payload", {}),
+                "memory_debug_ids": state.get("memory_debug_ids", []),
                 "errors": state.get("errors", []),
                 "timings": state.get("timings", {}),
             }
@@ -110,6 +141,76 @@ class QAService:
             debug=debug_payload,
         )
 
+    def _prepare_memory_context(
+        self,
+        question: str,
+        user_id: str | None,
+        conversation_id: str | None,
+        include_memory: bool,
+        memory_debug: bool,
+    ) -> tuple[dict, list[str]]:
+        """Fetch optional memory context and log the user turn when possible."""
+
+        errors: list[str] = []
+        if self.memory_service and user_id and conversation_id:
+            try:
+                self.memory_service.ensure_conversation(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    title="Q&A chat",
+                    topic="qa",
+                )
+                self.memory_service.append_message(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=question,
+                    source_block="qa",
+                )
+            except Exception as exc:
+                errors.append(f"Memory message append failed: {exc}")
+
+        if not include_memory:
+            return {}, errors
+        if not user_id:
+            errors.append("include_memory=true was ignored because user_id was not provided.")
+            return {}, errors
+        if self.memory_service is None:
+            errors.append("include_memory=true was ignored because MemoryService is unavailable.")
+            return {}, errors
+        try:
+            context = self.memory_service.get_memory_context(
+                user_id=user_id,
+                query=question,
+                conversation_id=conversation_id,
+                task_type="qa",
+                include_debug=memory_debug,
+            )
+            return context.model_dump(mode="json"), errors
+        except Exception as exc:
+            errors.append(f"Memory context retrieval failed: {exc}")
+            return {}, errors
+
+    def _store_assistant_message(
+        self,
+        conversation_id: str | None,
+        answer: str,
+        trace_id: str,
+    ) -> None:
+        """Best-effort logging of the assistant answer into working memory."""
+
+        if not self.memory_service or not conversation_id:
+            return
+        try:
+            self.memory_service.append_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=answer,
+                source_block="qa",
+                qa_trace_id=trace_id,
+            )
+        except Exception:
+            return
+
     def get_trace(self, trace_id: str) -> AnswerTraceOut:
         """Load one stored answer trace with citations and safety flags."""
 
@@ -122,6 +223,8 @@ class QAService:
             trace_id=trace.trace_id,
             question=trace.question,
             topic_hint=trace.topic_hint,
+            user_id=trace.user_id,
+            conversation_id=trace.conversation_id,
             safety_mode=trace.safety_mode,
             planner_used=trace.planner_used,
             clean_question=trace.clean_question,
@@ -137,6 +240,8 @@ class QAService:
             total_latency_ms=trace.total_latency_ms,
             error=trace.error,
             timings=json.loads(trace.timings_json or "{}"),
+            memory_context=json.loads(trace.memory_context_json or "{}"),
+            memory_debug_ids=json.loads(trace.memory_debug_ids_json or "[]"),
             citations=[
                 CitationOut(
                     source_id=item.source_id,
@@ -168,6 +273,8 @@ class QAService:
                 trace_id=trace_id,
                 question=state.get("question", ""),
                 topic_hint=state.get("topic_hint"),
+                user_id=state.get("user_id"),
+                conversation_id=state.get("conversation_id"),
                 safety_mode=state.get("safety_mode", "normal"),
                 planner_used=state.get("planner_used"),
                 clean_question=state.get("clean_question"),
@@ -188,6 +295,8 @@ class QAService:
                     [chunk.chunk_id for chunk in state.get("context_results", [])]
                 ),
                 answer=state.get("final_answer", ""),
+                memory_context_json=json.dumps(state.get("memory_context_payload", {})),
+                memory_debug_ids_json=json.dumps(state.get("memory_debug_ids", [])),
                 total_latency_ms=total_latency_ms,
                 error="; ".join(errors) if errors else None,
                 timings_json=json.dumps(state.get("timings", {})),

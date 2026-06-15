@@ -13,6 +13,10 @@ class AskQuestionRequest(BaseModel):
     question: str = Field(min_length=1)
     topic_hint: str | None = None
     debug: bool = False
+    user_id: str | None = None
+    conversation_id: str | None = None
+    include_memory: bool = False
+    memory_debug: bool = False
 
 
 class CitationOut(BaseModel):
@@ -42,6 +46,8 @@ class AnswerTraceOut(BaseModel):
     trace_id: str
     question: str
     topic_hint: str | None
+    user_id: str | None = None
+    conversation_id: str | None = None
     safety_mode: str
     planner_used: str | None = None
     clean_question: str | None = None
@@ -57,6 +63,8 @@ class AnswerTraceOut(BaseModel):
     total_latency_ms: int
     error: str | None
     timings: dict[str, int]
+    memory_context: dict[str, Any] = Field(default_factory=dict)
+    memory_debug_ids: list[str] = Field(default_factory=list)
     citations: list[CitationOut]
     safety_flags: list[dict[str, str]]
 
@@ -83,6 +91,11 @@ class QAState(TypedDict, total=False):
     evidence_context: str
     draft_answer: str
     final_answer: str
+    memory_context_rendered: str
+    memory_context_payload: dict[str, Any]
+    memory_debug_ids: list[str]
+    user_id: str | None
+    conversation_id: str | None
     context_citations: list[CitationOut]
     citations: list[CitationOut]
     trace_id: str

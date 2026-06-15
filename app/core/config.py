@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     sqlite_path: Path = Path("data/app.sqlite")
     chroma_path: Path = Path("data/chroma")
     chroma_collection: str = "qa_approved_chunks_v1"
+    memory_chroma_collection: str = "user_memory_episodes_v1"
 
     upload_dir: Path = Path("data/uploads")
     rag_corpus_dir: Path = Path("RAG_corpus")
@@ -84,6 +85,11 @@ class Settings(BaseSettings):
     hybrid_rrf_k: int = 60
     embedding_batch_size: int = 10
     maximum_upload_bytes: int = 100 * 1024 * 1024
+
+    memory_context_max_tokens: int = 34000
+    memory_non_plan_max_tokens: int = 24000
+    memory_plan_summary_max_tokens: int = 1000
+    memory_plan_full_max_tokens: int = 10000
 
     @property
     def api_base_url(self) -> str:

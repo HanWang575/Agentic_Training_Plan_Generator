@@ -1,5 +1,6 @@
 """Minimal Streamlit UI for local review, chat, and trace inspection."""
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,24 @@ from app.ui.formatting import answer_to_markdown, citations_to_rows
 
 settings = get_settings()
 API_BASE_URL = settings.api_base_url
+
+
+def _clean_id_input(value: str | None) -> str:
+    """Accept IDs pasted raw or with surrounding JSON/string quotes."""
+
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, str):
+        return parsed.strip()
+    quote_pairs = {('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")}
+    while len(text) >= 2 and (text[0], text[-1]) in quote_pairs:
+        text = text[1:-1].strip()
+    return text
 
 
 def _source_label(source: dict) -> str:
@@ -351,13 +370,18 @@ def _render_trace_response(payload: dict) -> None:
 st.set_page_config(page_title="Evidence Q&A", layout="wide")
 st.title("Evidence-Based Q&A Assistant")
 
-tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace"])
+tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace", "Memory"])
 
 
 with tabs[0]:
     st.subheader("Ask")
     question = st.text_area("Question", height=120)
     topic_hint = st.text_input("Topic hint")
+    qa_user_id = _clean_id_input(st.text_input("Memory user ID", value=""))
+    qa_conversation_id = _clean_id_input(st.text_input("Memory conversation ID", value=""))
+    st.caption("Use an existing memory conversation ID or type a new one; Q&A will create it when a memory user ID is provided.")
+    include_memory = st.checkbox("Include memory context", value=False)
+    memory_debug = st.checkbox("Show memory debug", value=False)
     debug = st.checkbox("Show debug trace", value=True)
     if st.button("Preview retrieval"):
         response = httpx.post(
@@ -369,7 +393,15 @@ with tabs[0]:
     if st.button("Ask", type="primary"):
         response = httpx.post(
             f"{API_BASE_URL}/api/qa/ask",
-            json={"question": question, "topic_hint": topic_hint or None, "debug": True},
+            json={
+                "question": question,
+                "topic_hint": topic_hint or None,
+                "debug": True,
+                "user_id": qa_user_id or None,
+                "conversation_id": qa_conversation_id or None,
+                "include_memory": include_memory,
+                "memory_debug": memory_debug,
+            },
             timeout=120,
         )
         response.raise_for_status()
@@ -501,8 +533,277 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("Trace Lookup")
-    trace_id = st.text_input("Trace ID")
+    trace_id = _clean_id_input(st.text_input("Trace ID"))
     if st.button("Load trace") and trace_id:
         response = httpx.get(f"{API_BASE_URL}/api/qa/traces/{trace_id}", timeout=30)
         response.raise_for_status()
         _render_trace_response(response.json())
+
+
+with tabs[5]:
+    st.subheader("User Memory")
+    memory_user_id = _clean_id_input(st.text_input("User ID", value="usr_local"))
+    display_name = st.text_input("Display name")
+    timezone_name = st.text_input("Timezone", value="UTC")
+    delete_user_confirm = st.checkbox("Confirm delete current user and all memory rows", value=False)
+    user_col1, user_col2, user_col3 = st.columns(3)
+    if user_col1.button("Create or update user"):
+        response = httpx.post(
+            f"{API_BASE_URL}/api/memory/users",
+            json={
+                "user_id": memory_user_id,
+                "display_name": display_name or None,
+                "timezone": timezone_name or "UTC",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if user_col2.button("Show existing user IDs"):
+        response = httpx.get(f"{API_BASE_URL}/api/memory/users", timeout=30)
+        response.raise_for_status()
+        users = response.json()
+        st.json([user["user_id"] for user in users])
+    if user_col3.button("Delete current user and memories"):
+        if not delete_user_confirm:
+            st.warning("Check the confirmation box before deleting the current user.")
+        else:
+            response = httpx.delete(f"{API_BASE_URL}/api/memory/users/{memory_user_id}", timeout=30)
+            response.raise_for_status()
+            st.json(response.json())
+
+    st.markdown("#### Conversations")
+    conversation_title = st.text_input("New conversation title")
+    if st.button("Create memory conversation"):
+        response = httpx.post(
+            f"{API_BASE_URL}/api/memory/conversations",
+            json={"user_id": memory_user_id, "title": conversation_title or None},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    conversation_id_to_show = _clean_id_input(st.text_input("Conversation ID to show"))
+    conversation_id_to_delete = _clean_id_input(st.text_input("Conversation ID to delete"))
+    conversation_col1, conversation_col2, conversation_col3 = st.columns(3)
+    if conversation_col1.button("Show existing conversations"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/conversations",
+            params={"user_id": memory_user_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if conversation_col2.button("Show conversation content"):
+        if not conversation_id_to_show:
+            st.warning("Enter a conversation ID first.")
+        else:
+            response = httpx.get(
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_show}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+    if conversation_col3.button("Delete conversation"):
+        if not conversation_id_to_delete:
+            st.warning("Enter a conversation ID first.")
+        else:
+            response = httpx.delete(
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_delete}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+
+    st.markdown("#### Profile")
+    profile_json = st.text_area(
+        "Profile JSON",
+        value='{"primary_training_goal": "build strength"}',
+        height=100,
+    )
+    profile_extension_mode = st.checkbox("Profile extension mode", value=False)
+    if st.button("Save profile fields"):
+        response = httpx.patch(
+            f"{API_BASE_URL}/api/memory/profile/{memory_user_id}",
+            json={
+                "fields": json.loads(profile_json or "{}"),
+                "extension_mode": profile_extension_mode,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    profile_field_id_to_delete = _clean_id_input(st.text_input("Profile field ID to delete"))
+    profile_col1, profile_col2, profile_col3 = st.columns(3)
+    if profile_col1.button("Load profile"):
+        response = httpx.get(f"{API_BASE_URL}/api/memory/profile/{memory_user_id}", timeout=30)
+        response.raise_for_status()
+        st.json(response.json())
+    if profile_col2.button("Show profile keys"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/keys/profile",
+            params={"user_id": memory_user_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if profile_col3.button("Delete profile entry"):
+        if not profile_field_id_to_delete:
+            st.warning("Enter a profile field ID first.")
+        else:
+            response = httpx.delete(
+                f"{API_BASE_URL}/api/memory/profile-fields/{profile_field_id_to_delete}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+
+    st.markdown("#### Recent Status")
+    status_json = st.text_area(
+        "Recent status JSON",
+        value='{"sleep_duration_hours": 7}',
+        height=100,
+    )
+    status_extension_mode = st.checkbox("Recent status extension mode", value=False)
+    if st.button("Save recent status"):
+        response = httpx.patch(
+            f"{API_BASE_URL}/api/memory/recent-status/users/{memory_user_id}",
+            json={
+                "statuses": json.loads(status_json or "{}"),
+                "extension_mode": status_extension_mode,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    recent_status_id_to_delete = _clean_id_input(st.text_input("Recent status ID to delete"))
+    status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+    if status_col1.button("Load current recent status"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/recent-status/current",
+            params={"user_id": memory_user_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if status_col2.button("Show recent status keys"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/keys/recent-status",
+            params={"user_id": memory_user_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if status_col3.button("Load expiring status"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/recent-status/expiring",
+            params={"user_id": memory_user_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if status_col4.button("Delete recent status entry"):
+        if not recent_status_id_to_delete:
+            st.warning("Enter a recent status ID first.")
+        else:
+            response = httpx.delete(
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_delete}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+
+    st.markdown("#### Context")
+    memory_query = st.text_input("Memory query", value="How should I train today?")
+    memory_conversation_id = _clean_id_input(st.text_input("Conversation ID", placeholder="Optional"))
+    if st.button("Build memory context"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/context",
+            params={
+                "user_id": memory_user_id,
+                "query": memory_query,
+                "conversation_id": memory_conversation_id or None,
+                "memory_debug": True,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if st.button("Search episodes"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/episodes/search",
+            params={"user_id": memory_user_id, "query": memory_query},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+
+    st.markdown("#### Review Queues")
+    memory_item_status = st.selectbox(
+        "Memory item status",
+        ["any", "candidate", "approved", "rejected"],
+    )
+    memory_item_review_id = _clean_id_input(st.text_input("Memory item ID to review"))
+    memory_item_review_note = st.text_input("Memory item review note")
+    col1, col2, col3 = st.columns(3)
+    if col1.button("Load memory items"):
+        memory_item_params = {"user_id": memory_user_id}
+        if memory_item_status != "any":
+            memory_item_params["status"] = memory_item_status
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/items",
+            params=memory_item_params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if col2.button("Approve memory item"):
+        if not memory_item_review_id:
+            st.warning("Enter a candidate memory item ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/items/{memory_item_review_id}/approve",
+                json={"review_note": memory_item_review_note or None},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+    if col3.button("Reject memory item"):
+        if not memory_item_review_id:
+            st.warning("Enter a candidate memory item ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/items/{memory_item_review_id}/reject",
+                json={"review_note": memory_item_review_note or None},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+
+    key_proposal_review_status = st.selectbox(
+        "Key proposal status",
+        ["any", "pending", "approved", "rejected"],
+    )
+    key_proposal_id_to_approve = _clean_id_input(st.text_input("Key proposal ID to approve"))
+    proposal_col1, proposal_col2 = st.columns(2)
+    if proposal_col1.button("Load key proposals"):
+        key_proposal_params = {"user_id": memory_user_id}
+        if key_proposal_review_status != "any":
+            key_proposal_params["review_status"] = key_proposal_review_status
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/key-proposals",
+            params=key_proposal_params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if proposal_col2.button("Approve key proposal"):
+        if not key_proposal_id_to_approve:
+            st.warning("Enter a key proposal ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/key-proposals/{key_proposal_id_to_approve}/approve",
+                json={},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())

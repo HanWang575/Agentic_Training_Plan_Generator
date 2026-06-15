@@ -21,6 +21,10 @@ def ask_question(
         question=request.question,
         topic_hint=request.topic_hint,
         debug=request.debug,
+        user_id=request.user_id,
+        conversation_id=request.conversation_id,
+        include_memory=request.include_memory,
+        memory_debug=request.memory_debug,
     )
 
 
