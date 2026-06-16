@@ -171,3 +171,105 @@ def test_qa_auto_creates_supplied_memory_conversation_and_reuses_working_memory(
     assert "Short answer:" in provider.seen_memory_contexts[-1]
     assert "Can you connect that to my recovery?" in provider.seen_memory_contexts[-1]
     session.close()
+
+
+def test_qa_auto_generates_blank_memory_conversation_id(tmp_path: Path):
+    """A memory user without a conversation ID should still get working memory."""
+
+    settings = Settings(
+        _env_file=None,
+        sqlite_path=tmp_path / "app.sqlite",
+        upload_dir=tmp_path / "uploads",
+        chroma_path=tmp_path / "chroma",
+        openai_api_key=None,
+    )
+    engine = create_app_engine(settings)
+    init_db(engine)
+    session = Session(engine)
+    provider = FakeProvider()
+    memory = MemoryService(session=session, settings=settings, llm_provider=provider)
+    memory.create_user("usr_test")
+    qa = QAService(
+        session=session,
+        settings=settings,
+        knowledge_service=FakeKnowledgeService(),
+        llm_provider=provider,
+        memory_service=memory,
+    )
+
+    first = qa.ask(
+        "What should I eat after lifting?",
+        topic_hint="nutrition",
+        debug=True,
+        user_id="usr_test",
+        conversation_id=None,
+        include_memory=False,
+        memory_debug=True,
+    )
+    second = qa.ask(
+        "Can you connect that to my recovery?",
+        topic_hint="nutrition",
+        debug=True,
+        user_id="usr_test",
+        conversation_id=first.conversation_id,
+        include_memory=True,
+        memory_debug=True,
+    )
+
+    assert first.conversation_id is not None
+    assert first.conversation_id.startswith("conv_")
+    assert second.conversation_id == first.conversation_id
+    assert [item.conversation_id for item in memory.list_conversations("usr_test")] == [
+        first.conversation_id
+    ]
+    assert qa.get_trace(first.trace_id).conversation_id == first.conversation_id
+    detail = memory.get_conversation_detail(first.conversation_id)
+    assert [message.role for message in detail.messages] == ["user", "assistant", "user", "assistant"]
+    assert "What should I eat after lifting?" in provider.seen_memory_contexts[-1]
+    assert "Can you connect that to my recovery?" in provider.seen_memory_contexts[-1]
+    session.close()
+
+
+def test_qa_reopens_closed_memory_conversation_id(tmp_path: Path):
+    """Chat reuse of a closed memory conversation ID should reopen and continue it."""
+
+    settings = Settings(
+        _env_file=None,
+        sqlite_path=tmp_path / "app.sqlite",
+        upload_dir=tmp_path / "uploads",
+        chroma_path=tmp_path / "chroma",
+        openai_api_key=None,
+    )
+    engine = create_app_engine(settings)
+    init_db(engine)
+    session = Session(engine)
+    provider = FakeProvider()
+    memory = MemoryService(session=session, settings=settings, llm_provider=provider)
+    memory.create_user("usr_test")
+    memory.create_conversation("usr_test", conversation_id="250pt")
+    memory.append_message("250pt", role="user", content="My goal is build muscle.")
+    memory.close_conversation("250pt")
+    qa = QAService(
+        session=session,
+        settings=settings,
+        knowledge_service=FakeKnowledgeService(),
+        llm_provider=provider,
+        memory_service=memory,
+    )
+
+    response = qa.ask(
+        "How should I continue?",
+        topic_hint="nutrition",
+        debug=True,
+        user_id="usr_test",
+        conversation_id="250pt",
+        include_memory=True,
+        memory_debug=True,
+    )
+    detail = memory.get_conversation_detail("250pt")
+
+    assert response.conversation_id == "250pt"
+    assert detail.conversation.status == "open"
+    assert [message.role for message in detail.messages] == ["user", "user", "assistant"]
+    assert qa.get_trace(response.trace_id).conversation_id == "250pt"
+    session.close()

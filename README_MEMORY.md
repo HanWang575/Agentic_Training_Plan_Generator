@@ -8,6 +8,8 @@ The block stores local, inspectable personalization data for the personal traine
 
 - `app/memory/`
   - Memory key catalogs, typed API schemas, graph-compatible nodes, and the service layer.
+- `app/memory/prompts.py`
+  - JSON-only prompts for LLM-backed memory routing, summarization, extraction, key review, and compaction.
 - `app/api/routes_memory.py`
   - FastAPI routes under `/api/memory`.
 - `app/storage/models.py`
@@ -28,18 +30,22 @@ The block stores local, inspectable personalization data for the personal traine
 - Local SQLite source of truth at `data/app.sqlite`.
 - User creation and memory-backed conversations.
 - Append-message API for working memory.
-- Deterministic rolling summary when conversations become long.
-- Conversation close API that writes one episode idempotently.
-- Candidate memory extraction for common training facts.
+- Token-based working-memory window: when unsummarized conversation turns exceed the working-memory budget, the oldest turns are folded into the rolling summary until the live raw window is about 30% of that budget.
+- Pre-summary memory extraction: before old working-memory turns are folded into the rolling summary, the same user turns are processed into reviewable candidate memory items so useful profile/status facts are not hidden by summarization.
+- LLM-backed rolling summary for oversized working-memory windows, with deterministic fallback.
+- Conversation close API that writes one episode idempotently, updates the episode after reopened conversations add new turns, and extracts candidates only from newly unprocessed messages.
+- Lazy one-hour inactivity closure for open conversations when they are next listed or reused.
+- LLM-backed episode summaries, completed-plan episodes, and candidate memory extraction, with deterministic fallbacks.
 - Human review flow for candidate memory items.
 - Approved profile fields and active recent status retrieval.
-- Recent-status default expiration and expiry listing.
+- Recent-status default expiration, expiry reminders, renewal, and audit listing.
 - Extendable profile/status key proposals.
 - Debug listing for users and conversations.
 - Explicit delete routes for user-owned memory, conversations, profile entries, and recent-status entries.
 - Active plan progress tracking with append-only events.
 - Xunji import storage and simple training-session normalization.
 - Compact memory context retrieval for Q&A and future blocks.
+- LLM-backed active-plan context routing and context compaction, with deterministic fallback.
 - Optional Chroma episode indexing when embeddings are configured.
 - MCP tools that call the same `MemoryService` methods.
 
@@ -68,7 +74,7 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-The memory block can be tested without LLM or embedding API keys. Episode semantic search and episode Chroma indexing only run when embeddings are configured.
+The memory block uses the same configured chat model as the Q&A LLM nodes when `LLM_*` or `OPENAI_API_KEY` settings are available. It can still be tested without LLM or embedding API keys because memory LLM nodes fall back to deterministic behavior. Episode semantic search and episode Chroma indexing only run when embeddings are configured.
 
 ## Step-By-Step Tutorial: Test The Memory Block
 
@@ -89,7 +95,7 @@ Expected result: no output and exit code `0`.
 Expected result:
 
 ```text
-13 passed
+25 passed
 ```
 
 ### 3. Run The Full Suite
@@ -101,7 +107,7 @@ Expected result:
 Expected result:
 
 ```text
-69 passed
+84 passed
 ```
 
 ### 4. Verify The API App Imports
@@ -222,6 +228,49 @@ Check statuses close to expiry:
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/api/memory/recent-status/expiring?user_id=usr_local"
 ```
+
+Expected behavior:
+
+- Rows within 2 hours of `valid_until` are returned in `reminders`.
+- Each reminder includes `status_key`, `value`, `source`, `current_valid_until`, a prompt, and `suggested_valid_until` when renewing that same value is reasonable.
+- Daily observations such as `sleep_duration_hours` do not get a renewal suggestion; record a fresh value instead.
+
+Expire a status without deleting its audit row:
+
+```powershell
+$expire = @{
+  reason = "no longer true"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/memory/recent-status/YOUR_STATUS_ID/expire" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $expire
+```
+
+Renew a status by setting a new `valid_until`:
+
+```powershell
+$renew = @{
+  valid_until = "2026-06-17T12:00:00Z"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/memory/recent-status/YOUR_STATUS_ID/valid-until" `
+  -Method Patch `
+  -ContentType "application/json" `
+  -Body $renew
+```
+
+Review active and expired status rows:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/memory/recent-status/current?user_id=usr_local&include_expired=true"
+```
+
+If you do not respond before `valid_until`, the row is hidden from normal memory context the next time recent status is read, but remains available through the audit listing.
 
 ### 9. Create A Conversation And Append Messages
 
@@ -411,7 +460,7 @@ Invoke-RestMethod `
 
 ### 14. Test Memory Together With Q&A
 
-Use the `conversation_id` from step 9:
+Use the `conversation_id` from step 9, or omit `conversation_id` to let Q&A create a new `conv_...` memory conversation automatically when `user_id` is provided:
 
 ```powershell
 $ask = @{
@@ -436,7 +485,7 @@ Expected behavior:
 - Q&A still retrieves approved evidence through the Q&A knowledge block.
 - `debug.memory_context` shows the compact memory payload.
 - `debug.memory_debug_ids` lists memory rows used.
-- The Q&A trace stores `user_id`, `conversation_id`, memory context, and memory IDs.
+- The response and Q&A trace store `user_id`, `conversation_id`, memory context, and memory IDs.
 - The conversation receives a user message and an assistant message with `source_block="qa"`.
 
 If no approved evidence exists, Q&A still returns its normal insufficient-evidence answer. Memory context does not replace evidence.
@@ -509,8 +558,8 @@ http://localhost:8501
 
 Use:
 
-- `Memory`: create a user, show existing user IDs, delete a user and its memory rows, create/list/show/delete memory conversations, edit profile fields, show profile keys, delete profile entries by ID, edit recent status, load current recent status, show recent-status keys, delete recent-status entries by ID, build full memory context, search episodes, filter memory items by status, approve or reject candidate memory items, load key proposals by status, approve key proposals, and inspect review queues.
-- `Chat`: provide memory user/conversation IDs, enable memory context, and ask Q&A requests that include memory. If the memory conversation ID does not exist yet and a memory user ID is provided, Q&A creates that conversation before logging the turn.
+- `Memory`: create a user, show existing user IDs, delete a user and its memory rows, create/list/show/delete memory conversations, edit profile fields, show profile keys, delete profile entries by ID, edit recent status, load current recent status, show recent-status keys, load expiry reminders, expire or renew recent-status entries, load recent-status audit rows, delete recent-status entries by ID, build full memory context, search episodes, filter memory items by status, approve or reject candidate memory items, load key proposals by status, approve key proposals, and inspect review queues.
+- `Chat`: provide a memory user ID, optionally leave the memory conversation ID blank to auto-create one, enable memory context when needed, and ask Q&A requests that include memory. If a memory conversation ID is provided but does not exist yet, Q&A creates that conversation before logging the turn. If the ID belongs to a closed conversation, Q&A reopens it and continues logging new turns.
 
 ## MCP Tools
 

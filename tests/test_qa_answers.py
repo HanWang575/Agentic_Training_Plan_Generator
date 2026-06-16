@@ -235,6 +235,36 @@ def test_citation_checker_returns_only_citations_used_in_answer():
     ]
 
 
+def test_citation_checker_moves_numeric_citations_before_punctuation():
+    """Inline numeric citations should read naturally before sentence punctuation."""
+
+    checker = CitationChecker()
+    result = checker(
+        {
+            "draft_answer": (
+                "Short answer:\n"
+                "The template needs restraint with assistance work.[2]\n\n"
+                "Evidence used:\n"
+                "2. [src_a / chk_a] Strength Template, page 4"
+            ),
+            "citations": [
+                CitationOut(
+                    source_id="src_a",
+                    chunk_id="chk_a",
+                    title="Strength Template",
+                    page_or_section="page 4",
+                )
+            ],
+            "insufficient_evidence": False,
+            "errors": [],
+            "timings": {},
+        }
+    )
+
+    assert "assistance work [2]." in result["final_answer"]
+    assert "assistance work.[2]" not in result["final_answer"]
+
+
 def test_citation_checker_accepts_citations_from_final_context_chunks():
     """A marker is supported when its chunk was actually sent to the LLM."""
 

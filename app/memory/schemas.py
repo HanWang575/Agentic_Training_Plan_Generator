@@ -50,6 +50,7 @@ class ConversationOut(BaseModel):
     title: str | None = None
     topic: str | None = None
     rolling_summary: str = ""
+    rolling_summary_until_message_id: str | None = None
     closure_reason: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -249,10 +250,31 @@ class RecentStatusValidUntilRequest(BaseModel):
     valid_until: datetime
 
 
+class RecentStatusExpireRequest(BaseModel):
+    """Expire one recent status while keeping it for audit."""
+
+    reason: str | None = None
+
+
+class RecentStatusExpiryReminder(BaseModel):
+    """User-facing reminder for a recent status close to expiration."""
+
+    status_id: str
+    status_key: str
+    value: Any = None
+    value_text: str
+    source: str
+    current_valid_until: datetime
+    suggested_valid_until: datetime | None = None
+    prompt: str
+    status: RecentStatusOut
+
+
 class ExpiringRecentStatusResponse(BaseModel):
     """Statuses that are close to expiry."""
 
     statuses: list[RecentStatusOut] = Field(default_factory=list)
+    reminders: list[RecentStatusExpiryReminder] = Field(default_factory=list)
 
 
 class MemoryItemApproveRequest(BaseModel):
@@ -396,6 +418,7 @@ class MemoryWorkflowState(TypedDict, total=False):
     user_id: str
     conversation_id: str | None
     task_type: str
+    topic_hint: str | None
     incoming_message: str
     latest_user_query: str
     conversation_status: str
@@ -409,6 +432,9 @@ class MemoryWorkflowState(TypedDict, total=False):
     profile_fields: list[ProfileFieldOut]
     recent_status_items: list[RecentStatusOut]
     plan_context_level: str
+    plan_context_router_used: str
+    plan_context_rationale: str
+    plan_context_confidence: float
     active_plan_progress: PlanProgressOut | None
     training_log_summary: TrainingLogSummaryResponse | None
     retrieved_episodes: list[EpisodeOut]

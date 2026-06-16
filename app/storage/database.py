@@ -64,6 +64,12 @@ def init_db(active_engine=None) -> None:
         )
         _ensure_column(
             connection,
+            table_name="source_documents",
+            column_name="parser_options_json",
+            column_definition="TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
             table_name="knowledge_chunks",
             column_name="quality_warnings_json",
             column_definition="TEXT NOT NULL DEFAULT '[]'",
@@ -145,6 +151,12 @@ def init_db(active_engine=None) -> None:
             table_name="answer_traces",
             column_name="memory_debug_ids_json",
             column_definition="TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            table_name="conversations",
+            column_name="rolling_summary_until_message_id",
+            column_definition="TEXT",
         )
         connection.exec_driver_sql(
             """

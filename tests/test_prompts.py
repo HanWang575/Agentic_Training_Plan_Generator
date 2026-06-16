@@ -18,6 +18,10 @@ def test_answer_prompt_requests_explanatory_grounded_style():
     assert "Write like a thoughtful coach-educator" in prompt
     assert "Avoid one-line, dry answers" in prompt
     assert "Do not invent citations" in prompt
+    assert "Use Arabic-number citations" in prompt
+    assert "write 'text [2].', not 'text.[2]'" in prompt
+    assert "Do not repeatedly say phrases like" in prompt
+    assert "Evidence used:\n1. [source_id / chunk_id] title, page/section" in prompt
 
 
 def test_query_planner_prompt_requests_json_and_query_expansion():

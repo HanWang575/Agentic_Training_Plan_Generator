@@ -2,11 +2,21 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 import json
 import re
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
+from app.memory.prompts import (
+    build_completed_plan_episode_prompt,
+    build_episode_summary_prompt,
+    build_memory_context_compactor_prompt,
+    build_memory_extractor_prompt,
+    build_memory_key_proposal_prompt,
+    build_memory_plan_router_prompt,
+    build_rolling_summary_prompt,
+)
 from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
 
 
@@ -39,6 +49,114 @@ class QueryPlanResult:
     search_query: str
     query_terms: list[str]
     notes: list[str]
+
+
+@dataclass(slots=True)
+class MemoryPlanRouteRequest:
+    """Input shape for LLM-based active-plan context routing."""
+
+    latest_user_query: str
+    task_type: str
+    active_plan_exists: bool
+    topic_hint: str | None = None
+    conversation_summary: str = ""
+
+
+@dataclass(slots=True)
+class MemoryPlanRouteResult:
+    """Output shape for LLM-based active-plan context routing."""
+
+    plan_context_level: str
+    rationale: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class MemoryRollingSummaryRequest:
+    """Input shape for LLM rolling-summary updates."""
+
+    existing_summary: str
+    messages: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class MemoryEpisodeSummaryRequest:
+    """Input shape for LLM episodic summaries."""
+
+    title: str | None
+    topic: str | None
+    rolling_summary: str
+    messages: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class MemoryEpisodeSummaryResult:
+    """Output shape for LLM episodic summaries."""
+
+    summary: str
+    topics: list[str]
+    importance: float
+
+
+@dataclass(slots=True)
+class MemoryExtractionRequest:
+    """Input shape for LLM memory extraction."""
+
+    message: dict[str, Any]
+    profile_keys: list[str]
+    recent_status_keys: list[str]
+
+
+@dataclass(slots=True)
+class MemoryExtractionResult:
+    """Output shape for LLM memory extraction."""
+
+    items: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class MemoryKeyProposalRequest:
+    """Input shape for LLM key-equivalence review."""
+
+    target_type: str
+    proposed_key: str
+    example_value: Any
+    reason: str
+    existing_keys: list[str]
+
+
+@dataclass(slots=True)
+class MemoryKeyProposalResult:
+    """Output shape for LLM key-equivalence review."""
+
+    duplicate_decision: str
+    nearest_existing_keys: list[str]
+    canonical_key: str
+    reason: str
+
+
+@dataclass(slots=True)
+class MemoryCompactionRequest:
+    """Input shape for LLM memory-context compaction."""
+
+    sections: dict[str, str]
+    section_caps: dict[str, int]
+    max_tokens: int
+
+
+@dataclass(slots=True)
+class MemoryCompactionResult:
+    """Output shape for LLM memory-context compaction."""
+
+    sections: dict[str, str]
+    compaction_report: dict[str, Any]
+
+
+@dataclass(slots=True)
+class CompletedPlanEpisodeRequest:
+    """Input shape for LLM completed-plan episodic summaries."""
+
+    plan_payload: dict[str, Any]
 
 
 class OpenAIProvider:
@@ -150,22 +268,7 @@ class OpenAIProvider:
             safety_flags=request.safety_flags,
             memory_context=request.memory_context,
         )
-        client = self._require_chat_client()
-        if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:
-            response = client.responses.create(
-                model=self.settings.active_chat_model,
-                input=prompt,
-                max_output_tokens=request.max_tokens,
-            )
-            return response.output_text
-
-        response = client.chat.completions.create(
-            model=self.settings.active_chat_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=request.max_tokens,
-        )
-        content = response.choices[0].message.content
-        return content or ""
+        return self._generate_chat_text(prompt, max_tokens=request.max_tokens)
 
     def generate_query_plan(self, request: QueryPlanRequest) -> QueryPlanResult:
         """Generate a retrieval-oriented query plan from the user's question."""
@@ -174,21 +277,7 @@ class OpenAIProvider:
             question=request.question,
             topic_hint=request.topic_hint,
         )
-        client = self._require_chat_client()
-        if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:
-            response = client.responses.create(
-                model=self.settings.active_chat_model,
-                input=prompt,
-                max_output_tokens=500,
-            )
-            raw_text = response.output_text or ""
-        else:
-            response = client.chat.completions.create(
-                model=self.settings.active_chat_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-            )
-            raw_text = response.choices[0].message.content or ""
+        raw_text = self._generate_chat_text(prompt, max_tokens=500)
         payload = _parse_json_object(raw_text)
         return QueryPlanResult(
             clean_question=str(payload.get("clean_question", "")).strip(),
@@ -206,6 +295,153 @@ class OpenAIProvider:
             ],
         )
 
+    def generate_memory_plan_route(self, request: MemoryPlanRouteRequest) -> MemoryPlanRouteResult:
+        """Generate the active-plan context routing decision for memory context."""
+
+        prompt = build_memory_plan_router_prompt(
+            latest_user_query=request.latest_user_query,
+            task_type=request.task_type,
+            topic_hint=request.topic_hint,
+            conversation_summary=request.conversation_summary,
+            active_plan_exists=request.active_plan_exists,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=350))
+        level = str(payload.get("plan_context_level", "")).strip().lower()
+        if level not in {"none", "summary", "full"}:
+            raise ValueError(f"Invalid plan_context_level from LLM: {level}")
+        return MemoryPlanRouteResult(
+            plan_context_level=level,
+            rationale=str(payload.get("rationale", "")).strip(),
+            confidence=_clamp_float(payload.get("confidence"), default=0.0),
+        )
+
+    def generate_memory_rolling_summary(self, request: MemoryRollingSummaryRequest) -> str:
+        """Generate an updated rolling conversation summary."""
+
+        prompt = build_rolling_summary_prompt(
+            existing_summary=request.existing_summary,
+            messages=request.messages,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=900))
+        summary = str(payload.get("rolling_summary", "")).strip()
+        if not summary:
+            raise ValueError("RollingSummaryUpdater returned an empty summary.")
+        return summary
+
+    def generate_memory_episode_summary(
+        self,
+        request: MemoryEpisodeSummaryRequest,
+    ) -> MemoryEpisodeSummaryResult:
+        """Generate a permanent episodic summary for a closed conversation."""
+
+        prompt = build_episode_summary_prompt(
+            title=request.title,
+            topic=request.topic,
+            rolling_summary=request.rolling_summary,
+            messages=request.messages,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=1000))
+        summary = str(payload.get("summary", "")).strip()
+        if not summary:
+            raise ValueError("EpisodeSummarizer returned an empty summary.")
+        return MemoryEpisodeSummaryResult(
+            summary=summary,
+            topics=_string_list(payload.get("topics", [])) or ["general"],
+            importance=_clamp_float(payload.get("importance"), default=0.5),
+        )
+
+    def generate_memory_candidates(self, request: MemoryExtractionRequest) -> MemoryExtractionResult:
+        """Generate reviewable candidate memory items from one message."""
+
+        prompt = build_memory_extractor_prompt(
+            message=request.message,
+            profile_keys=request.profile_keys,
+            recent_status_keys=request.recent_status_keys,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=1400))
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            raise ValueError("MemoryExtractor returned a non-list items field.")
+        return MemoryExtractionResult(items=[item for item in items if isinstance(item, dict)])
+
+    def review_memory_key_proposal(self, request: MemoryKeyProposalRequest) -> MemoryKeyProposalResult:
+        """Review whether a proposed key duplicates an approved memory key."""
+
+        prompt = build_memory_key_proposal_prompt(
+            target_type=request.target_type,
+            proposed_key=request.proposed_key,
+            example_value=request.example_value,
+            reason=request.reason,
+            existing_keys=request.existing_keys,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=500))
+        decision = str(payload.get("duplicate_decision", "not_duplicate")).strip().lower()
+        if decision not in {"not_duplicate", "equivalent", "duplicate"}:
+            decision = "not_duplicate"
+        return MemoryKeyProposalResult(
+            duplicate_decision=decision,
+            nearest_existing_keys=_string_list(payload.get("nearest_existing_keys", []))[:5],
+            canonical_key=str(payload.get("canonical_key", "")).strip(),
+            reason=str(payload.get("reason", "")).strip(),
+        )
+
+    def compact_memory_context(self, request: MemoryCompactionRequest) -> MemoryCompactionResult:
+        """Compact memory context sections with an LLM when deterministic trimming is too lossy."""
+
+        prompt = build_memory_context_compactor_prompt(
+            sections=request.sections,
+            section_caps=request.section_caps,
+            max_tokens=request.max_tokens,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=2200))
+        sections = payload.get("sections", {})
+        if not isinstance(sections, dict):
+            raise ValueError("MemoryContextCompactor returned a non-object sections field.")
+        report = payload.get("compaction_report", {})
+        if not isinstance(report, dict):
+            report = {}
+        return MemoryCompactionResult(
+            sections={str(key): str(value) for key, value in sections.items()},
+            compaction_report=report,
+        )
+
+    def generate_completed_plan_episode(
+        self,
+        request: CompletedPlanEpisodeRequest,
+    ) -> MemoryEpisodeSummaryResult:
+        """Generate an episodic summary for a completed training plan."""
+
+        prompt = build_completed_plan_episode_prompt(request.plan_payload)
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=900))
+        summary = str(payload.get("summary", "")).strip()
+        if not summary:
+            raise ValueError("CompletedPlanEpisodeWriter returned an empty summary.")
+        return MemoryEpisodeSummaryResult(
+            summary=summary,
+            topics=_string_list(payload.get("topics", [])) or ["training_plan", "plan_completion"],
+            importance=_clamp_float(payload.get("importance"), default=0.75),
+        )
+
+    def _generate_chat_text(self, prompt: str, max_tokens: int) -> str:
+        """Generate text with the configured chat model."""
+
+        client = self._require_chat_client()
+        if self.settings.normalized_llm_model_type == "openai" and not self.settings.active_chat_base_url:
+            response = client.responses.create(
+                model=self.settings.active_chat_model,
+                input=prompt,
+                max_output_tokens=max_tokens,
+            )
+            return response.output_text or ""
+
+        response = client.chat.completions.create(
+            model=self.settings.active_chat_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        content = response.choices[0].message.content
+        return content or ""
+
 
 def _parse_json_object(text: str) -> dict:
     """Extract one JSON object from a model response."""
@@ -219,3 +455,21 @@ def _parse_json_object(text: str) -> dict:
     if not match:
         raise ValueError("Query planner did not return a JSON object.")
     return json.loads(match.group(0))
+
+
+def _string_list(value: Any) -> list[str]:
+    """Return a clean string list from a JSON payload value."""
+
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _clamp_float(value: Any, default: float) -> float:
+    """Parse and clamp a float to the inclusive 0..1 range."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(1.0, parsed))

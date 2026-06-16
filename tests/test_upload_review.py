@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.knowledge.indexing import KeywordIndexer
+from app.knowledge.schemas import ParsedDocument, ParsedTextBlock
 from app.knowledge.service import KnowledgeService
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import Citation, KnowledgeChunk, SourceDocument
@@ -54,6 +55,65 @@ def test_create_pending_upload_returns_queued_source_before_parsing(tmp_path: Pa
     assert source.parser_status == "queued"
     assert source.parser_progress == 0.0
     assert source.parser_progress_message == "Queued for parsing."
+    session.close()
+
+
+def test_upload_stores_marker_ocr_parser_option(tmp_path: Path):
+    """Upload-specific Marker OCR choice should be visible in source summaries."""
+
+    _, session, service = _make_service(tmp_path)
+    source_path = tmp_path / "ocr_choice.txt"
+    source_path.write_text("OCR option storage test.", encoding="utf-8")
+
+    source_id = service.create_pending_upload(
+        source_path,
+        title="OCR Choice",
+        topic_tags=["test"],
+        marker_force_ocr=True,
+    )
+    summary = service.get_source_summary(source_id)
+    source = session.get(SourceDocument, source_id)
+
+    assert summary.parser_options == {"marker_force_ocr": True}
+    assert source is not None
+    assert source.parser_options_json == '{"marker_force_ocr": true}'
+    session.close()
+
+
+def test_parse_pending_source_applies_marker_ocr_override(monkeypatch, tmp_path: Path):
+    """Stored parser options should override Settings for a single source parse."""
+
+    settings, session, service = _make_service(tmp_path)
+    settings.marker_force_ocr = False
+    source_path = tmp_path / "ocr_override.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n% test placeholder")
+    captured = {}
+
+    def fake_parse_document(file_path, title=None, settings=None, progress_callback=None):
+        captured["marker_force_ocr"] = settings.marker_force_ocr
+        if progress_callback is not None:
+            progress_callback(0.5, "Fake parser halfway.")
+        return ParsedDocument(
+            title=title or file_path.stem,
+            source_type="pdf",
+            blocks=[ParsedTextBlock(text="Parsed with per-upload OCR settings.")],
+            parser_warnings=[f"force_ocr={settings.marker_force_ocr}"],
+        )
+
+    monkeypatch.setattr("app.knowledge.service.parse_document", fake_parse_document)
+    source_id = service.create_pending_upload(
+        source_path,
+        title="OCR Override",
+        topic_tags=["test"],
+        marker_force_ocr=True,
+    )
+
+    result = service.parse_pending_source(source_id)
+
+    assert captured["marker_force_ocr"] is True
+    assert result.parser_status == "parsed"
+    assert result.parser_options == {"marker_force_ocr": True}
+    assert result.parser_warnings == ["force_ocr=True"]
     session.close()
 
 

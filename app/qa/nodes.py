@@ -371,6 +371,7 @@ class CitationChecker:
             ]
             if "- None" in answer and not cited_pairs:
                 filtered_citations = []
+            answer = _normalize_numeric_citation_punctuation(answer)
 
             return {
                 "final_answer": answer,
@@ -503,6 +504,12 @@ def _answer_says_insufficient(answer: str) -> bool:
 
     normalized = answer.lower()
     return "insufficient evidence" in normalized or "not enough approved evidence" in normalized
+
+
+def _normalize_numeric_citation_punctuation(answer: str) -> str:
+    """Move inline numeric citation markers before terminal punctuation."""
+
+    return re.sub(r"([.!?])\s*((?:\[\d+(?:\s*,\s*\d+)*\])+)", r" \2\1", answer)
 
 
 def _fallback_answer_from_evidence(state: QAState, provider_error: str) -> str:

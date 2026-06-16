@@ -85,6 +85,7 @@ class SourceSummary(BaseModel):
     parser_progress_message: str | None = None
     parser_error: str | None = None
     parser_warnings: list[str] = Field(default_factory=list)
+    parser_options: dict[str, Any] = Field(default_factory=dict)
     topic_tags: list[str] = Field(default_factory=list)
     chunk_count: int = 0
 

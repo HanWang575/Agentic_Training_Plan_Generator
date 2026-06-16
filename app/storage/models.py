@@ -38,6 +38,7 @@ class SourceDocument(SQLModel, table=True):
     parser_progress_message: Optional[str] = None
     parser_error: Optional[str] = None
     parser_warnings_json: str = "[]"
+    parser_options_json: str = "{}"
 
 
 class KnowledgeChunk(SQLModel, table=True):
@@ -138,6 +139,7 @@ class Conversation(SQLModel, table=True):
     title: Optional[str] = None
     topic: Optional[str] = None
     rolling_summary: str = ""
+    rolling_summary_until_message_id: Optional[str] = Field(default=None, index=True)
     closure_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

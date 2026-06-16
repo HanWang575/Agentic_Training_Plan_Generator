@@ -69,7 +69,7 @@ class QAService:
         """
 
         started = time.perf_counter()
-        memory_payload, memory_errors = self._prepare_memory_context(
+        memory_payload, memory_errors, resolved_conversation_id = self._prepare_memory_context(
             question=question,
             user_id=user_id,
             conversation_id=conversation_id,
@@ -80,7 +80,7 @@ class QAService:
             "question": question,
             "topic_hint": topic_hint,
             "user_id": user_id,
-            "conversation_id": conversation_id,
+            "conversation_id": resolved_conversation_id,
             "memory_context_rendered": memory_payload.get("rendered_context", ""),
             "memory_context_payload": memory_payload,
             "memory_debug_ids": memory_payload.get("memory_ids", []),
@@ -102,7 +102,7 @@ class QAService:
         total_latency_ms = int((time.perf_counter() - started) * 1000)
         trace_id = self._store_trace(state, total_latency_ms)
         self._store_assistant_message(
-            conversation_id=conversation_id,
+            conversation_id=resolved_conversation_id,
             answer=state.get("final_answer", ""),
             trace_id=trace_id,
         )
@@ -138,6 +138,7 @@ class QAService:
             safety_note=_safety_note(safety_flags),
             insufficient_evidence=state.get("insufficient_evidence", False),
             trace_id=trace_id,
+            conversation_id=resolved_conversation_id,
             debug=debug_payload,
         )
 
@@ -148,20 +149,22 @@ class QAService:
         conversation_id: str | None,
         include_memory: bool,
         memory_debug: bool,
-    ) -> tuple[dict, list[str]]:
+    ) -> tuple[dict, list[str], str | None]:
         """Fetch optional memory context and log the user turn when possible."""
 
         errors: list[str] = []
-        if self.memory_service and user_id and conversation_id:
+        resolved_conversation_id = (conversation_id or "").strip() or None
+        if self.memory_service and user_id:
             try:
-                self.memory_service.ensure_conversation(
+                conversation = self.memory_service.create_conversation(
                     user_id=user_id,
-                    conversation_id=conversation_id,
+                    conversation_id=resolved_conversation_id,
                     title="Q&A chat",
                     topic="qa",
                 )
+                resolved_conversation_id = conversation.conversation_id
                 self.memory_service.append_message(
-                    conversation_id=conversation_id,
+                    conversation_id=resolved_conversation_id,
                     role="user",
                     content=question,
                     source_block="qa",
@@ -170,25 +173,25 @@ class QAService:
                 errors.append(f"Memory message append failed: {exc}")
 
         if not include_memory:
-            return {}, errors
+            return {}, errors, resolved_conversation_id
         if not user_id:
             errors.append("include_memory=true was ignored because user_id was not provided.")
-            return {}, errors
+            return {}, errors, resolved_conversation_id
         if self.memory_service is None:
             errors.append("include_memory=true was ignored because MemoryService is unavailable.")
-            return {}, errors
+            return {}, errors, resolved_conversation_id
         try:
             context = self.memory_service.get_memory_context(
                 user_id=user_id,
                 query=question,
-                conversation_id=conversation_id,
+                conversation_id=resolved_conversation_id,
                 task_type="qa",
                 include_debug=memory_debug,
             )
-            return context.model_dump(mode="json"), errors
+            return context.model_dump(mode="json"), errors, resolved_conversation_id
         except Exception as exc:
             errors.append(f"Memory context retrieval failed: {exc}")
-            return {}, errors
+            return {}, errors, resolved_conversation_id
 
     def _store_assistant_message(
         self,

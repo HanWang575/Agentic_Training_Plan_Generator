@@ -71,7 +71,7 @@ def _review_sources_with_progress(source_ids: list[str], action: str, review_not
     return {"results": results, "failed": failed}
 
 
-def _upload_rag_corpus_with_progress() -> dict:
+def _upload_rag_corpus_with_progress(marker_force_ocr: bool | None = None) -> dict:
     """Upload RAG_corpus files one at a time with visible progress."""
 
     plan_response = httpx.get(f"{API_BASE_URL}/api/knowledge/upload/rag-corpus/plan", timeout=60)
@@ -91,7 +91,10 @@ def _upload_rag_corpus_with_progress() -> dict:
         try:
             response = httpx.post(
                 f"{API_BASE_URL}/api/knowledge/upload/rag-corpus/file",
-                params={"relative_path": item["relative_path"]},
+                params={
+                    "relative_path": item["relative_path"],
+                    "marker_force_ocr": marker_force_ocr,
+                },
                 timeout=300,
             )
             response.raise_for_status()
@@ -128,11 +131,18 @@ def _poll_source_until_parsed(source_id: str, poll_seconds: float = 1.0) -> dict
         time.sleep(poll_seconds)
 
 
-def _upload_source_with_progress(uploaded_file, title: str, topic_tags: str) -> dict:
+def _upload_source_with_progress(
+    uploaded_file,
+    title: str,
+    topic_tags: str,
+    marker_force_ocr: bool | None = None,
+) -> dict:
     """Upload one source through the async endpoint and show parse progress."""
 
     files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
     data = {"title": title, "topic_tags": topic_tags}
+    if marker_force_ocr is not None:
+        data["marker_force_ocr"] = "true" if marker_force_ocr else "false"
     response = httpx.post(
         f"{API_BASE_URL}/api/knowledge/upload/async",
         files=files,
@@ -342,6 +352,9 @@ def _render_qa_response(payload: dict, show_debug: bool) -> None:
     trace_id = payload.get("trace_id")
     if trace_id:
         st.caption(f"Trace ID: {trace_id}")
+    conversation_id = payload.get("conversation_id")
+    if conversation_id:
+        st.caption(f"Memory conversation ID: {conversation_id}")
 
     _render_query_planner_view(payload, source=f"chat_{trace_id or 'latest'}")
     _render_retrieved_chunks_viewer(payload, source=f"chat_{trace_id or 'latest'}")
@@ -378,8 +391,17 @@ with tabs[0]:
     question = st.text_area("Question", height=120)
     topic_hint = st.text_input("Topic hint")
     qa_user_id = _clean_id_input(st.text_input("Memory user ID", value=""))
-    qa_conversation_id = _clean_id_input(st.text_input("Memory conversation ID", value=""))
-    st.caption("Use an existing memory conversation ID or type a new one; Q&A will create it when a memory user ID is provided.")
+    if (
+        not st.session_state.get("qa_memory_conversation_id")
+        and st.session_state.get("last_qa_memory_conversation_id")
+    ):
+        st.session_state["qa_memory_conversation_id"] = st.session_state[
+            "last_qa_memory_conversation_id"
+        ]
+    qa_conversation_id = _clean_id_input(
+        st.text_input("Memory conversation ID", key="qa_memory_conversation_id")
+    )
+    st.caption("Leave blank to auto-create a memory conversation when a memory user ID is provided.")
     include_memory = st.checkbox("Include memory context", value=False)
     memory_debug = st.checkbox("Show memory debug", value=False)
     debug = st.checkbox("Show debug trace", value=True)
@@ -405,7 +427,13 @@ with tabs[0]:
             timeout=120,
         )
         response.raise_for_status()
-        _render_qa_response(response.json(), show_debug=debug)
+        payload = response.json()
+        resolved_conversation_id = payload.get("conversation_id")
+        if resolved_conversation_id:
+            st.session_state["last_qa_memory_conversation_id"] = resolved_conversation_id
+            if not qa_conversation_id:
+                st.info(f"Created memory conversation: {resolved_conversation_id}")
+        _render_qa_response(payload, show_debug=debug)
 
 
 with tabs[1]:
@@ -413,10 +441,11 @@ with tabs[1]:
     uploaded_file = st.file_uploader("Source file", type=["pdf", "epub", "md", "txt", "json"])
     upload_title = st.text_input("Title", placeholder="Auto from file name")
     upload_tags = st.text_input("Topic tags, comma separated", placeholder="Optional")
+    upload_marker_ocr = st.checkbox("Use Marker OCR preprocessing for PDF upload", value=False)
     if st.button("Upload") and uploaded_file is not None:
-        st.json(_upload_source_with_progress(uploaded_file, upload_title, upload_tags))
+        st.json(_upload_source_with_progress(uploaded_file, upload_title, upload_tags, upload_marker_ocr))
     if st.button("Upload RAG_corpus"):
-        st.json(_upload_rag_corpus_with_progress())
+        st.json(_upload_rag_corpus_with_progress(upload_marker_ocr))
 
 
 with tabs[2]:
@@ -573,18 +602,12 @@ with tabs[5]:
             st.json(response.json())
 
     st.markdown("#### Conversations")
-    conversation_title = st.text_input("New conversation title")
-    if st.button("Create memory conversation"):
-        response = httpx.post(
-            f"{API_BASE_URL}/api/memory/conversations",
-            json={"user_id": memory_user_id, "title": conversation_title or None},
-            timeout=30,
-        )
-        response.raise_for_status()
-        st.json(response.json())
     conversation_id_to_show = _clean_id_input(st.text_input("Conversation ID to show"))
     conversation_id_to_delete = _clean_id_input(st.text_input("Conversation ID to delete"))
-    conversation_col1, conversation_col2, conversation_col3 = st.columns(3)
+    conversation_id_to_close = _clean_id_input(st.text_input("Conversation ID to close"))
+    conversation_close_reason = st.text_input("Conversation close reason", value="user_closed")
+    conversation_extract_candidates = st.checkbox("Extract candidates when closing conversation", value=True)
+    conversation_col1, conversation_col2, conversation_col3, conversation_col4 = st.columns(4)
     if conversation_col1.button("Show existing conversations"):
         response = httpx.get(
             f"{API_BASE_URL}/api/memory/conversations",
@@ -609,6 +632,20 @@ with tabs[5]:
         else:
             response = httpx.delete(
                 f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_delete}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+    if conversation_col4.button("Close conversation"):
+        if not conversation_id_to_close:
+            st.warning("Enter a conversation ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_close}/close",
+                json={
+                    "closure_reason": conversation_close_reason or "user_closed",
+                    "extract_candidates": conversation_extract_candidates,
+                },
                 timeout=30,
             )
             response.raise_for_status()
@@ -676,7 +713,10 @@ with tabs[5]:
         response.raise_for_status()
         st.json(response.json())
     recent_status_id_to_delete = _clean_id_input(st.text_input("Recent status ID to delete"))
-    status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+    recent_status_id_to_expire = _clean_id_input(st.text_input("Recent status ID to expire"))
+    recent_status_id_to_renew = _clean_id_input(st.text_input("Recent status ID to renew"))
+    recent_status_new_valid_until = st.text_input("New recent status valid_until", placeholder="2026-06-17T12:00:00Z")
+    status_col1, status_col2, status_col3, status_col4, status_col5, status_col6, status_col7 = st.columns(7)
     if status_col1.button("Load current recent status"):
         response = httpx.get(
             f"{API_BASE_URL}/api/memory/recent-status/current",
@@ -711,6 +751,36 @@ with tabs[5]:
             )
             response.raise_for_status()
             st.json(response.json())
+    if status_col5.button("Expire recent status"):
+        if not recent_status_id_to_expire:
+            st.warning("Enter a recent status ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_expire}/expire",
+                json={"reason": "user_expired_from_memory_tab"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+    if status_col6.button("Renew recent status"):
+        if not recent_status_id_to_renew or not recent_status_new_valid_until:
+            st.warning("Enter a recent status ID and new valid_until first.")
+        else:
+            response = httpx.patch(
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_renew}/valid-until",
+                json={"valid_until": recent_status_new_valid_until},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.json(response.json())
+    if status_col7.button("Load status audit"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/recent-status/current",
+            params={"user_id": memory_user_id, "include_expired": True},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
 
     st.markdown("#### Context")
     memory_query = st.text_input("Memory query", value="How should I train today?")

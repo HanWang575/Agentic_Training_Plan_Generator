@@ -27,6 +27,7 @@ from app.memory.schemas import (
     ProfilePatchRequest,
     ProfilePatchResponse,
     ProfileResponse,
+    RecentStatusExpireRequest,
     RecentStatusOut,
     RecentStatusPatchRequest,
     RecentStatusPatchResponse,
@@ -292,11 +293,12 @@ def patch_profile(
 @router.get("/recent-status/current", response_model=list[RecentStatusOut])
 def list_current_recent_status(
     user_id: str,
+    include_expired: bool = False,
     service: MemoryService = Depends(memory_service_dependency),
 ) -> list[RecentStatusOut]:
-    """Return current active recent status rows."""
+    """Return current active or audit recent status rows."""
 
-    return service.list_recent_status(user_id=user_id, include_expired=False)
+    return service.list_recent_status(user_id=user_id, include_expired=include_expired)
 
 
 @router.delete("/recent-status/{status_id}", response_model=MemoryDeleteResponse)
@@ -451,6 +453,20 @@ def update_recent_status_valid_until(
 
     try:
         return service.update_recent_status_valid_until(status_id, request.valid_until)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/recent-status/{status_id}/expire", response_model=RecentStatusOut)
+def expire_recent_status(
+    status_id: str,
+    request: RecentStatusExpireRequest,
+    service: MemoryService = Depends(memory_service_dependency),
+) -> RecentStatusOut:
+    """Expire one recent status while keeping it for audit."""
+
+    try:
+        return service.expire_recent_status(status_id, reason=request.reason)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

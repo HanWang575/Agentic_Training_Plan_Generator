@@ -427,8 +427,7 @@ timings
 A conversation should be considered closed when one of these conditions is met:
 
 - The user explicitly closes it, starts a new topic/thread, or asks to end the conversation.
-- The conversation has been inactive for more than 1 hours after a normal Q&A or check-in task.
-- The conversation has been inactive for more than 1 day even if no explicit close action happened.
+- The conversation has been inactive for more than 1 hour even if no explicit close action happened.
 - A plan review, plan update, training check-in, or import-review workflow reaches a clear final state.
 
 Do not close a conversation while it still has pending memory approvals, unresolved safety issues, or an active multi-step workflow waiting for user input. Closing should be idempotent: running close twice should not create duplicate episodes or duplicate memory candidates.

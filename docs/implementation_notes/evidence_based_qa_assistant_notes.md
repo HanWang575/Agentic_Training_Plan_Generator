@@ -11,7 +11,10 @@ This file records implementation assumptions and instruction gaps without changi
 - Added Chroma vector indexing and retrieval hooks through an OpenAI provider adapter.
 - Added parsers for `.pdf`, `.epub`, `.md`, `.txt`, and `.json`.
 - Added upload, pending review, approval, rejection, source listing, search, ask, and trace APIs.
+- Added per-upload Marker OCR preprocessing selection. Upload APIs accept `marker_force_ocr`, queued sources store that parser option, and the parser applies it for that source without changing global `.env` settings.
 - Added a node-based Q&A workflow with input validation, safety classification, query planning, retrieval, RRF merging, context building, answer generation, citation checking, and trace logging.
+- Adjusted the answer-generation prompt to reduce repetitive explicit references to "evidence" in user-facing prose. The prompt now asks for natural inline Arabic-number citations while keeping `[source_id / chunk_id]` markers in the `Evidence used` section for the existing citation checker.
+- Normalized final answer punctuation for inline numeric citations so `text.[2]` is rendered as `text [2].` before display.
 - Added MCP tools that call the same services as the backend.
 - Added a thin Streamlit UI that calls backend APIs.
 
@@ -28,3 +31,4 @@ This file records implementation assumptions and instruction gaps without changi
 - The full optional dependency install is slow in this environment because large packages such as Chroma download at low bandwidth. Focused tests were run with the smaller dependency subset they require.
 - DashScope / Aliyun embeddings are supported through OpenAI-compatible `EMBED_*` settings. A live smoke test with `EMBED_MODEL_TYPE=dashscope`, `EMBED_MODEL_NAME=text-embedding-v3`, and `EMBED_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1` successfully uploaded, approved, indexed, and searched a one-chunk test source.
 - Aihubmix chat generation is supported through OpenAI-compatible `LLM_*` settings. When `LLM_API_KEY` or `LLM_BASE_URL` is present, answer generation uses `LLM_MODEL_ID` and `LLM_BASE_URL` through chat completions while embeddings continue to use `EMBED_*`.
+- Marker OCR preprocessing is treated as a parse-time option and only affects newly uploaded or re-uploaded PDFs. Existing parsed sources are not reparsed automatically when the option changes.

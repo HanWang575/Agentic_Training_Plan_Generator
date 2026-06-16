@@ -49,6 +49,7 @@ def upload_source(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     topic_tags: str | None = Form(default=None),
+    marker_force_ocr: bool | None = Form(default=None),
     service: KnowledgeService = Depends(_service_dependency),
     settings: Settings = Depends(get_settings),
 ) -> UploadResult:
@@ -64,7 +65,12 @@ def upload_source(
     try:
         if temp_path.stat().st_size > settings.maximum_upload_bytes:
             raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
-        return service.upload_file(temp_path, title=inferred_title, topic_tags=tags)
+        return service.upload_file(
+            temp_path,
+            title=inferred_title,
+            topic_tags=tags,
+            marker_force_ocr=marker_force_ocr,
+        )
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -75,6 +81,7 @@ def upload_source_async(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     topic_tags: str | None = Form(default=None),
+    marker_force_ocr: bool | None = Form(default=None),
     service: KnowledgeService = Depends(_service_dependency),
     settings: Settings = Depends(get_settings),
 ) -> UploadResult:
@@ -90,7 +97,12 @@ def upload_source_async(
     try:
         if temp_path.stat().st_size > settings.maximum_upload_bytes:
             raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
-        source_id = service.create_pending_upload(temp_path, title=inferred_title, topic_tags=tags)
+        source_id = service.create_pending_upload(
+            temp_path,
+            title=inferred_title,
+            topic_tags=tags,
+            marker_force_ocr=marker_force_ocr,
+        )
         background_tasks.add_task(_parse_upload_in_background, source_id)
         return service.get_source_summary(source_id, result_type=UploadResult)
     finally:
@@ -99,12 +111,13 @@ def upload_source_async(
 
 @router.post("/upload/rag-corpus", response_model=BulkUploadResult)
 def upload_rag_corpus(
+    marker_force_ocr: bool | None = None,
     service: KnowledgeService = Depends(_service_dependency),
     settings: Settings = Depends(get_settings),
 ) -> BulkUploadResult:
     """Upload all supported files from the configured `RAG_corpus` folder."""
 
-    return service.upload_rag_corpus(settings.rag_corpus_dir)
+    return service.upload_rag_corpus(settings.rag_corpus_dir, marker_force_ocr=marker_force_ocr)
 
 
 @router.get("/upload/rag-corpus/plan", response_model=CorpusPlanResult)
@@ -120,13 +133,18 @@ def plan_rag_corpus_upload(
 @router.post("/upload/rag-corpus/file", response_model=UploadResult)
 def upload_one_rag_corpus_file(
     relative_path: str,
+    marker_force_ocr: bool | None = None,
     service: KnowledgeService = Depends(_service_dependency),
     settings: Settings = Depends(get_settings),
 ) -> UploadResult:
     """Upload one supported file from `RAG_corpus` by relative path."""
 
     try:
-        return service.upload_one_rag_corpus_file(relative_path, settings.rag_corpus_dir)
+        return service.upload_one_rag_corpus_file(
+            relative_path,
+            settings.rag_corpus_dir,
+            marker_force_ocr=marker_force_ocr,
+        )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

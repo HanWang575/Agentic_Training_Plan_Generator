@@ -14,8 +14,16 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.core.errors import NotFoundError
-from app.core.llm_provider import OpenAIProvider
+from app.core.llm_provider import (
+    CompletedPlanEpisodeRequest,
+    MemoryEpisodeSummaryRequest,
+    MemoryExtractionRequest,
+    MemoryKeyProposalRequest,
+    MemoryRollingSummaryRequest,
+    OpenAIProvider,
+)
 from app.memory.catalogs import (
+    DAILY_STATUS_KEYS,
     PROFILE_FIELD_KEYS,
     RECENT_STATUS_KEYS,
     default_valid_until,
@@ -43,6 +51,7 @@ from app.memory.schemas import (
     ProfilePatchResponse,
     ProfileResponse,
     RecentStatusOut,
+    RecentStatusExpiryReminder,
     RecentStatusPatchResponse,
     TrainingLogImportRequest,
     TrainingLogImportResponse,
@@ -65,6 +74,12 @@ from app.storage.models import (
     UserAccount,
     utc_now,
 )
+
+
+WORKING_MEMORY_TOKEN_BUDGET = MemoryContextCompactor.DEFAULT_SECTION_CAPS["working_memory"]
+WORKING_MEMORY_TARGET_RATIO = 0.3
+CONVERSATION_INACTIVE_CLOSE_AFTER = timedelta(hours=1)
+INACTIVE_CLOSURE_REASON = "inactive_timeout"
 
 
 class MemoryService:
@@ -168,6 +183,7 @@ class MemoryService:
     def list_conversations(self, user_id: str | None = None) -> list[ConversationOut]:
         """Return memory conversations for selection and debugging."""
 
+        self._close_inactive_conversations(user_id=user_id)
         statement = select(Conversation)
         if user_id:
             statement = statement.where(Conversation.user_id == user_id)
@@ -191,6 +207,12 @@ class MemoryService:
         if existing is not None:
             if existing.user_id != user_id:
                 raise ValueError("Conversation ID belongs to another user.")
+            if self._conversation_is_inactive(existing, now):
+                self._close_conversation(existing, INACTIVE_CLOSURE_REASON, extract_candidates=True)
+                self.session.refresh(existing)
+            if existing.status == "closed":
+                self._reopen_conversation(existing)
+                self.session.refresh(existing)
             if title is not None:
                 existing.title = title
             if topic is not None:
@@ -230,6 +252,13 @@ class MemoryService:
         if conversation is not None:
             if conversation.user_id != user_id:
                 raise ValueError("Conversation ID belongs to another user.")
+            now = utc_now()
+            if self._conversation_is_inactive(conversation, now):
+                self._close_conversation(conversation, INACTIVE_CLOSURE_REASON, extract_candidates=True)
+                self.session.refresh(conversation)
+            if conversation.status == "closed":
+                self._reopen_conversation(conversation)
+                self.session.refresh(conversation)
             return _conversation_out(conversation)
         return self.create_conversation(
             user_id=user_id,
@@ -287,6 +316,13 @@ class MemoryService:
         """Append one message and update deterministic working-memory summary if needed."""
 
         conversation = self._get_conversation(conversation_id)
+        now = utc_now()
+        if self._conversation_is_inactive(conversation, now):
+            self._close_conversation(conversation, INACTIVE_CLOSURE_REASON, extract_candidates=True)
+            self.session.refresh(conversation)
+        if conversation.status == "closed":
+            self._reopen_conversation(conversation)
+            self.session.refresh(conversation)
         message = ConversationMessage(
             message_id=f"msg_{uuid4().hex[:12]}",
             conversation_id=conversation_id,
@@ -308,6 +344,13 @@ class MemoryService:
         """Return one conversation with all saved messages in order."""
 
         conversation = self._get_conversation(conversation_id)
+        if self._conversation_is_inactive(conversation):
+            self._close_conversation(
+                conversation,
+                INACTIVE_CLOSURE_REASON,
+                extract_candidates=True,
+            )
+            conversation = self._get_conversation(conversation_id)
         messages = self._conversation_messages(conversation_id)
         return ConversationDetailOut(
             conversation=_conversation_out(conversation),
@@ -324,6 +367,9 @@ class MemoryService:
         """Build memory context scoped to one conversation."""
 
         conversation = self._get_conversation(conversation_id)
+        if self._conversation_is_inactive(conversation):
+            self._close_conversation(conversation, INACTIVE_CLOSURE_REASON, extract_candidates=True)
+            conversation = self._get_conversation(conversation_id)
         return self.get_memory_context(
             user_id=conversation.user_id,
             query=query,
@@ -341,9 +387,20 @@ class MemoryService:
         """Close a conversation idempotently and create one episode."""
 
         conversation = self._get_conversation(conversation_id)
-        existing_episode = self.session.exec(
-            select(Episode).where(Episode.conversation_id == conversation_id)
-        ).first()
+        return self._close_conversation(
+            conversation,
+            closure_reason=closure_reason,
+            extract_candidates=extract_candidates,
+        )
+
+    def _close_conversation(
+        self,
+        conversation: Conversation,
+        closure_reason: str,
+        extract_candidates: bool,
+    ) -> ConversationCloseResponse:
+        """Close one conversation and create or refresh its episode and candidates."""
+
         if conversation.status != "closed":
             conversation.status = "closed"
             conversation.closed_at = utc_now()
@@ -351,18 +408,59 @@ class MemoryService:
             conversation.closure_reason = closure_reason
             self.session.add(conversation)
             self.session.commit()
+            self.session.refresh(conversation)
 
-        if existing_episode is None:
-            messages = self._conversation_messages(conversation_id)
-            existing_episode = self._create_episode_from_conversation(conversation, messages)
+        messages = self._conversation_messages(conversation.conversation_id)
+        existing_episode = self.session.exec(
+            select(Episode).where(Episode.conversation_id == conversation.conversation_id)
+        ).first()
+        episode = self._upsert_episode_from_conversation(conversation, messages, existing_episode)
         candidates = []
         if extract_candidates:
-            candidates = self._extract_candidates_for_episode(conversation, existing_episode)
+            candidates = self._extract_candidates_for_episode(conversation, episode)
         return ConversationCloseResponse(
             conversation=_conversation_out(conversation),
-            episode=_episode_out(existing_episode),
+            episode=_episode_out(episode),
             candidate_memory_items=[_memory_item_out(item) for item in candidates],
         )
+
+    def _reopen_conversation(self, conversation: Conversation) -> None:
+        """Reopen a closed conversation before a new turn is appended."""
+
+        if conversation.status != "closed":
+            return
+        conversation.status = "open"
+        conversation.closed_at = None
+        conversation.closure_reason = None
+        conversation.updated_at = utc_now()
+        self.session.add(conversation)
+        self.session.commit()
+
+    def _close_inactive_conversations(self, user_id: str | None = None) -> None:
+        """Lazily close open conversations inactive for more than one hour."""
+
+        now = utc_now()
+        statement = select(Conversation).where(Conversation.status == "open")
+        if user_id:
+            statement = statement.where(Conversation.user_id == user_id)
+        conversations = self.session.exec(statement).all()
+        for conversation in conversations:
+            if self._conversation_is_inactive(conversation, now):
+                self._close_conversation(
+                    conversation,
+                    closure_reason=INACTIVE_CLOSURE_REASON,
+                    extract_candidates=True,
+                )
+
+    def _conversation_is_inactive(
+        self,
+        conversation: Conversation,
+        now: datetime | None = None,
+    ) -> bool:
+        if conversation.status != "open":
+            return False
+        active_now = _ensure_aware(now or utc_now())
+        return _ensure_aware(conversation.updated_at) < active_now - CONVERSATION_INACTIVE_CLOSE_AFTER
 
     def search_episodes(
         self,
@@ -679,7 +777,11 @@ class MemoryService:
             item.expiration_reminder_status = "due"
             self.session.add(item)
         self.session.commit()
-        return ExpiringRecentStatusResponse(statuses=[_recent_status_out(item) for item in expiring])
+        reminders = [_recent_status_expiry_reminder(item, active_now) for item in expiring]
+        return ExpiringRecentStatusResponse(
+            statuses=[reminder.status for reminder in reminders],
+            reminders=reminders,
+        )
 
     def list_recent_status(self, user_id: str, include_expired: bool = False) -> list[RecentStatusOut]:
         """Return recent status rows for API, MCP, or debug views."""
@@ -723,6 +825,21 @@ class MemoryService:
         status.expiration_reminder_status = "renewed"
         status.expired_at = None
         status.updated_at = utc_now()
+        self.session.add(status)
+        self.session.commit()
+        return _recent_status_out(status)
+
+    def expire_recent_status(self, status_id: str, reason: str | None = None) -> RecentStatusOut:
+        """Expire one recent status without deleting it from audit storage."""
+
+        status = self.session.get(RecentStatus, status_id)
+        if status is None:
+            raise NotFoundError(f"Recent status not found: {status_id}")
+        now = utc_now()
+        status.review_status = "expired"
+        status.expired_at = now
+        status.updated_at = now
+        status.expiration_reminder_status = "expired_by_user"
         self.session.add(status)
         self.session.commit()
         return _recent_status_out(status)
@@ -900,19 +1017,27 @@ class MemoryService:
         started = time.perf_counter()
         errors: list[str] = []
         active_plan = self.get_active_plan(user_id)
+        conversation_summary = ""
+        if conversation_id:
+            try:
+                conversation_summary = self._get_conversation(conversation_id).rolling_summary
+            except Exception as exc:
+                errors.append(f"Conversation summary retrieval failed: {exc}")
         router_state = run_langgraph_or_nodes(
             {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "task_type": task_type,
                 "latest_user_query": query,
+                "rolling_summary": conversation_summary,
                 "active_plan_progress": active_plan,
-                "errors": [],
+                "errors": errors,
                 "timings": {},
             },
-            [PlanContextRouter()],
+            [PlanContextRouter(self.llm_provider)],
         )
         plan_context_level = router_state.get("plan_context_level", "none")
+        errors = router_state.get("errors", errors)
         sections, memory_ids = self._build_context_sections(
             user_id=user_id,
             query=query,
@@ -950,10 +1075,12 @@ class MemoryService:
                 MemoryContextCompactor(
                     max_tokens=context_max_tokens,
                     section_caps=section_caps,
+                    llm_provider=self.llm_provider,
                 )
             ],
         )
         context = compacted_state.get("memory_context", context)
+        errors = compacted_state.get("errors", errors)
         trace = MemoryTrace(
             trace_id=f"mtr_{uuid4().hex[:12]}",
             user_id=user_id,
@@ -974,6 +1101,9 @@ class MemoryService:
                 "memory_trace_id": trace.trace_id,
                 "memory_ids": memory_ids,
                 "errors": errors,
+                "plan_context_router_used": router_state.get("plan_context_router_used"),
+                "plan_context_rationale": router_state.get("plan_context_rationale"),
+                "plan_context_confidence": router_state.get("plan_context_confidence"),
                 "section_token_estimates": {
                     key: estimate_tokens(value) for key, value in context.sections.items()
                 },
@@ -1005,11 +1135,11 @@ class MemoryService:
             try:
                 conversation = self._get_conversation(conversation_id)
                 sections["rolling_summary"] = conversation.rolling_summary
-                messages = self._conversation_messages(conversation_id)[-12:]
-                sections["working_memory"] = "\n".join(
-                    f"[{item.message_id} | {item.created_at.isoformat()} | {item.role}] {item.content}"
-                    for item in messages
+                messages = self._live_working_memory_messages(
+                    conversation,
+                    self._conversation_messages(conversation_id),
                 )
+                sections["working_memory"] = _render_working_memory_messages(messages)
                 memory_ids.extend(item.message_id for item in messages)
             except Exception as exc:
                 errors.append(f"Working memory retrieval failed: {exc}")
@@ -1084,40 +1214,116 @@ class MemoryService:
     def _update_rolling_summary_if_needed(self, conversation_id: str) -> None:
         conversation = self._get_conversation(conversation_id)
         messages = self._conversation_messages(conversation_id)
-        if len(messages) <= 16:
+        live_messages = self._live_working_memory_messages(conversation, messages)
+        live_tokens = estimate_tokens(_render_working_memory_messages(live_messages))
+        if live_tokens <= WORKING_MEMORY_TOKEN_BUDGET:
             return
-        older = messages[:-12]
-        summary_lines = [
-            conversation.rolling_summary.strip(),
-            "Earlier conversation summary:",
-            *_summarize_messages_deterministically(older),
-        ]
-        conversation.rolling_summary = "\n".join(line for line in summary_lines if line).strip()
+        target_tokens = max(1, int(WORKING_MEMORY_TOKEN_BUDGET * WORKING_MEMORY_TARGET_RATIO))
+        drop_count = len(live_messages)
+        for index in range(len(live_messages)):
+            remaining = live_messages[index + 1 :]
+            if estimate_tokens(_render_working_memory_messages(remaining)) <= target_tokens:
+                drop_count = index + 1
+                break
+        older = live_messages[:drop_count]
+        if not older:
+            return
+        try:
+            self._extract_candidates_for_messages(conversation, older, episode=None)
+        except Exception:
+            return
+        try:
+            conversation.rolling_summary = self.llm_provider.generate_memory_rolling_summary(
+                MemoryRollingSummaryRequest(
+                    existing_summary=conversation.rolling_summary,
+                    messages=_message_payloads(older),
+                )
+            )
+        except Exception:
+            summary_lines = [
+                conversation.rolling_summary.strip(),
+                "Earlier conversation summary:",
+                *_summarize_messages_deterministically(older),
+            ]
+            conversation.rolling_summary = "\n".join(line for line in summary_lines if line).strip()
+        conversation.rolling_summary_until_message_id = older[-1].message_id
         conversation.updated_at = utc_now()
         self.session.add(conversation)
         self.session.commit()
+
+    def _live_working_memory_messages(
+        self,
+        conversation: Conversation,
+        messages: list[ConversationMessage],
+    ) -> list[ConversationMessage]:
+        """Return raw messages not yet covered by the rolling summary."""
+
+        cursor = conversation.rolling_summary_until_message_id
+        if cursor:
+            for index, message in enumerate(messages):
+                if message.message_id == cursor:
+                    return messages[index + 1 :]
+        if conversation.rolling_summary and len(messages) > 12:
+            return messages[-12:]
+        return messages
 
     def _create_episode_from_conversation(
         self,
         conversation: Conversation,
         messages: list[ConversationMessage],
     ) -> Episode:
-        summary = _summarize_episode(conversation, messages)
-        topics = _infer_topics(" ".join(item.content for item in messages))
+        return self._upsert_episode_from_conversation(conversation, messages, existing_episode=None)
+
+    def _upsert_episode_from_conversation(
+        self,
+        conversation: Conversation,
+        messages: list[ConversationMessage],
+        existing_episode: Episode | None,
+    ) -> Episode:
         source_message_ids = [item.message_id for item in messages]
-        episode = Episode(
-            episode_id=f"eps_{uuid4().hex[:12]}",
-            user_id=conversation.user_id,
-            conversation_id=conversation.conversation_id,
-            source_type="conversation",
-            title=conversation.title or conversation.topic,
-            summary=summary,
-            topics_json=_json_dumps(topics),
-            importance=_episode_importance(summary),
-            source_message_ids_json=_json_dumps(source_message_ids),
-            started_at=messages[0].created_at if messages else conversation.created_at,
-            ended_at=messages[-1].created_at if messages else conversation.updated_at,
-        )
+        if existing_episode is not None:
+            existing_message_ids = _json_loads(existing_episode.source_message_ids_json, default=[])
+            if existing_message_ids == source_message_ids:
+                return existing_episode
+        try:
+            summary_result = self.llm_provider.generate_memory_episode_summary(
+                MemoryEpisodeSummaryRequest(
+                    title=conversation.title,
+                    topic=conversation.topic,
+                    rolling_summary=conversation.rolling_summary,
+                    messages=_message_payloads(messages),
+                )
+            )
+            summary = summary_result.summary
+            topics = summary_result.topics
+            importance = summary_result.importance
+        except Exception:
+            summary = _summarize_episode(conversation, messages)
+            topics = _infer_topics(" ".join(item.content for item in messages))
+            importance = _episode_importance(summary)
+        if existing_episode is None:
+            episode = Episode(
+                episode_id=f"eps_{uuid4().hex[:12]}",
+                user_id=conversation.user_id,
+                conversation_id=conversation.conversation_id,
+                source_type="conversation",
+                title=conversation.title or conversation.topic,
+                summary=summary,
+                topics_json=_json_dumps(topics),
+                importance=importance,
+                source_message_ids_json=_json_dumps(source_message_ids),
+                started_at=messages[0].created_at if messages else conversation.created_at,
+                ended_at=messages[-1].created_at if messages else conversation.updated_at,
+            )
+        else:
+            episode = existing_episode
+            episode.title = conversation.title or conversation.topic
+            episode.summary = summary
+            episode.topics_json = _json_dumps(topics)
+            episode.importance = importance
+            episode.source_message_ids_json = _json_dumps(source_message_ids)
+            episode.started_at = messages[0].created_at if messages else conversation.created_at
+            episode.ended_at = messages[-1].created_at if messages else conversation.updated_at
         self.session.add(episode)
         self.session.commit()
         self._try_index_episode(episode)
@@ -1128,27 +1334,132 @@ class MemoryService:
         conversation: Conversation,
         episode: Episode,
     ) -> list[MemoryItem]:
-        existing = self.session.exec(
-            select(MemoryItem).where(MemoryItem.source_episode_id == episode.episode_id)
+        return self._extract_candidates_for_messages(
+            conversation,
+            self._conversation_messages(conversation.conversation_id),
+            episode=episode,
+        )
+
+    def _extract_candidates_for_messages(
+        self,
+        conversation: Conversation,
+        messages: list[ConversationMessage],
+        episode: Episode | None,
+    ) -> list[MemoryItem]:
+        """Extract reviewable candidates for messages that have not been processed yet."""
+
+        user_messages = [message for message in messages if message.role in {"user", "human"}]
+        message_ids = {message.message_id for message in user_messages}
+        if not message_ids:
+            return []
+        existing_items = self.session.exec(
+            select(MemoryItem).where(MemoryItem.source_conversation_id == conversation.conversation_id)
         ).all()
-        if existing:
-            return existing
+        existing_for_messages = []
+        processed_message_ids: set[str] = set()
+        changed = False
+        for item in existing_items:
+            item_message_ids = set(_json_loads(item.source_message_ids_json, default=[]))
+            if not item_message_ids.intersection(message_ids):
+                continue
+            existing_for_messages.append(item)
+            processed_message_ids.update(item_message_ids.intersection(message_ids))
+            if episode is not None and item.source_episode_id is None:
+                item.source_episode_id = episode.episode_id
+                item.updated_at = utc_now()
+                self.session.add(item)
+                changed = True
+
         candidates = []
-        for message in self._conversation_messages(conversation.conversation_id):
-            if message.role not in {"user", "human"}:
+        for message in user_messages:
+            if message.message_id in processed_message_ids:
                 continue
             candidates.extend(self._extract_candidates_from_message(conversation, episode, message))
         for item in candidates:
             self.session.add(item)
-        self.session.commit()
+        if candidates or changed:
+            self.session.commit()
+        for item in candidates:
+            if item.target_type and item.memory_key and not self._is_key_allowed(
+                item.user_id,
+                item.target_type,
+                item.memory_key,
+            ):
+                self._create_key_proposal(
+                    user_id=item.user_id,
+                    target_type=item.target_type,
+                    proposed_key=item.memory_key,
+                    example_value=_json_loads(item.value_json),
+                    reason="LLM memory extraction proposed a useful key outside the approved catalog.",
+                    source_memory_id=item.memory_id,
+                )
+        return existing_for_messages + candidates
+
+    def _extract_candidates_with_llm(
+        self,
+        conversation: Conversation,
+        episode: Episode | None,
+        message: ConversationMessage,
+    ) -> list[MemoryItem] | None:
+        if not hasattr(self.llm_provider, "generate_memory_candidates"):
+            return None
+        result = self.llm_provider.generate_memory_candidates(
+            MemoryExtractionRequest(
+                message=_message_payload(message),
+                profile_keys=self._allowed_keys("ProfileField", conversation.user_id),
+                recent_status_keys=self._allowed_keys("RecentStatus", conversation.user_id),
+            )
+        )
+        candidates = []
+        for raw_item in result.items:
+            target_type = _normalize_target_type(str(raw_item.get("target_type", "")))
+            if target_type not in {"ProfileField", "RecentStatus"}:
+                continue
+            memory_key = normalize_key(str(raw_item.get("memory_key", "")))
+            if not memory_key:
+                continue
+            value = raw_item.get("value")
+            if value in ({}, None, ""):
+                value = raw_item.get("text") or message.content
+            category = str(raw_item.get("category") or "").strip().lower()
+            if not category:
+                category = "profile" if target_type == "ProfileField" else "recent_status"
+            text = str(raw_item.get("text") or f"{memory_key}: {_stringify_value(value)}").strip()
+            expires_at = (
+                default_valid_until(memory_key, message.created_at)
+                if target_type == "RecentStatus"
+                else None
+            )
+            candidates.append(
+                self._candidate_item(
+                    conversation,
+                    episode,
+                    message,
+                    category=category,
+                    target_type=target_type,
+                    key=memory_key,
+                    value=value,
+                    text=text,
+                    confidence=_safe_confidence(raw_item.get("confidence"), default=0.65),
+                    safety_relevant=bool(raw_item.get("safety_relevant", False)),
+                    expires_at=expires_at,
+                )
+            )
         return candidates
 
     def _extract_candidates_from_message(
         self,
         conversation: Conversation,
-        episode: Episode,
+        episode: Episode | None,
         message: ConversationMessage,
     ) -> list[MemoryItem]:
+        try:
+            llm_candidates = self._extract_candidates_with_llm(conversation, episode, message)
+            if llm_candidates is not None:
+                return _dedupe_candidates(llm_candidates)
+        except Exception:
+            pass
+
         text = message.content.strip()
         candidates: list[MemoryItem] = []
 
@@ -1267,7 +1578,7 @@ class MemoryService:
     def _candidate_item(
         self,
         conversation: Conversation,
-        episode: Episode,
+        episode: Episode | None,
         message: ConversationMessage,
         category: str,
         target_type: str,
@@ -1290,7 +1601,7 @@ class MemoryService:
             status="candidate",
             safety_relevant=safety_relevant,
             source_conversation_id=conversation.conversation_id,
-            source_episode_id=episode.episode_id,
+            source_episode_id=episode.episode_id if episode is not None else None,
             source_message_ids_json=_json_dumps([message.message_id]),
             expires_at=expires_at,
         )
@@ -1483,6 +1794,27 @@ class MemoryService:
             return existing
         catalog = PROFILE_FIELD_KEYS if target_type == "ProfileField" else RECENT_STATUS_KEYS
         nearest = difflib.get_close_matches(normalized, sorted(catalog), n=5, cutoff=0.55)
+        duplicate_decision = "not_duplicate"
+        review_status = "pending"
+        try:
+            review = self.llm_provider.review_memory_key_proposal(
+                MemoryKeyProposalRequest(
+                    target_type=target_type,
+                    proposed_key=normalized,
+                    example_value=example_value,
+                    reason=reason,
+                    existing_keys=self._allowed_keys(target_type, user_id),
+                )
+            )
+            if review.nearest_existing_keys:
+                nearest = review.nearest_existing_keys[:5]
+            if review.reason:
+                reason = review.reason
+            duplicate_decision = review.duplicate_decision
+            if duplicate_decision in {"duplicate", "equivalent"}:
+                review_status = "rejected"
+        except Exception:
+            pass
         proposal = MemoryKeyProposal(
             proposal_id=f"mkp_{uuid4().hex[:12]}",
             user_id=user_id,
@@ -1491,7 +1823,9 @@ class MemoryService:
             example_value_json=_json_dumps(example_value),
             reason=reason,
             nearest_existing_keys_json=_json_dumps(nearest),
+            duplicate_decision=duplicate_decision,
             source_memory_id=source_memory_id,
+            review_status=review_status,
         )
         self.session.add(proposal)
         self.session.commit()
@@ -1577,18 +1911,28 @@ class MemoryService:
         ).first()
         if existing:
             return
-        summary = (
-            f"Completed training plan {plan.plan_id} version {plan.version}. "
-            f"Progress: {plan.plan_progress_json}. Feedback: {plan.feedback_json}."
-        )
+        try:
+            summary_result = self.llm_provider.generate_completed_plan_episode(
+                CompletedPlanEpisodeRequest(plan_payload=_plan_progress_out(plan).model_dump(mode="json"))
+            )
+            summary = summary_result.summary
+            topics = summary_result.topics
+            importance = summary_result.importance
+        except Exception:
+            summary = (
+                f"Completed training plan {plan.plan_id} version {plan.version}. "
+                f"Progress: {plan.plan_progress_json}. Feedback: {plan.feedback_json}."
+            )
+            topics = ["training_plan", "plan_completion"]
+            importance = 0.75
         episode = Episode(
             episode_id=f"eps_{uuid4().hex[:12]}",
             user_id=plan.user_id,
             source_type="plan_completion",
             title=plan.plan_id,
             summary=summary,
-            topics_json=_json_dumps(["training_plan", "plan_completion"]),
-            importance=0.75,
+            topics_json=_json_dumps(topics),
+            importance=importance,
             started_at=plan.created_at,
             ended_at=plan.completed_at or plan.updated_at,
         )
@@ -1674,6 +2018,7 @@ def _conversation_out(conversation: Conversation) -> ConversationOut:
         title=conversation.title,
         topic=conversation.topic,
         rolling_summary=conversation.rolling_summary,
+        rolling_summary_until_message_id=conversation.rolling_summary_until_message_id,
         closure_reason=conversation.closure_reason,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
@@ -1772,6 +2117,41 @@ def _recent_status_out(item: RecentStatus) -> RecentStatusOut:
         updated_at=_ensure_aware(item.updated_at),
         expired_at=_ensure_aware(item.expired_at) if item.expired_at else None,
     )
+
+
+def _recent_status_expiry_reminder(item: RecentStatus, now: datetime) -> RecentStatusExpiryReminder:
+    status = _recent_status_out(item)
+    suggested_valid_until = _suggested_recent_status_valid_until(item.status_key, now)
+    if suggested_valid_until is None:
+        prompt = (
+            f"{item.status_key} expires at {status.valid_until.isoformat()}. "
+            "Expire this status, or record a fresh recent-status value if it is still relevant."
+        )
+    else:
+        prompt = (
+            f"{item.status_key} expires at {status.valid_until.isoformat()}. "
+            "Expire it if it is no longer true, or renew it with the suggested valid_until if it still applies."
+        )
+    return RecentStatusExpiryReminder(
+        status_id=item.status_id,
+        status_key=item.status_key,
+        value=_json_loads(item.value_json),
+        value_text=item.value_text,
+        source=item.source,
+        current_valid_until=status.valid_until,
+        suggested_valid_until=suggested_valid_until,
+        prompt=prompt,
+        status=status,
+    )
+
+
+def _suggested_recent_status_valid_until(status_key: str, now: datetime) -> datetime | None:
+    """Return a renewal suggestion when extending the same status is reasonable."""
+
+    normalized_key = normalize_key(status_key)
+    if normalized_key in DAILY_STATUS_KEYS:
+        return None
+    return default_valid_until(normalized_key, _ensure_aware(now))
 
 
 def _key_proposal_out(item: MemoryKeyProposal) -> KeyProposalOut:
@@ -1884,6 +2264,36 @@ def _recent_status_sort_key(row: RecentStatus) -> tuple[datetime, datetime, str]
         _ensure_aware(row.updated_at),
         row.status_id,
     )
+
+
+def _message_payload(message: ConversationMessage) -> dict[str, Any]:
+    return {
+        "message_id": message.message_id,
+        "role": message.role,
+        "content": message.content,
+        "created_at": message.created_at.isoformat(),
+        "source_block": message.source_block,
+        "qa_trace_id": message.qa_trace_id,
+    }
+
+
+def _message_payloads(messages: list[ConversationMessage]) -> list[dict[str, Any]]:
+    return [_message_payload(message) for message in messages]
+
+
+def _render_working_memory_messages(messages: list[ConversationMessage]) -> str:
+    return "\n".join(
+        f"[{item.message_id} | {item.created_at.isoformat()} | {item.role}] {item.content}"
+        for item in messages
+    )
+
+
+def _safe_confidence(value: Any, default: float = 0.65) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(1.0, parsed))
 
 
 def _summarize_messages_deterministically(messages: list[ConversationMessage]) -> list[str]:

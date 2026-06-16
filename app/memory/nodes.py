@@ -1,5 +1,6 @@
 """Small deterministic memory workflow nodes."""
 
+from app.core.llm_provider import MemoryCompactionRequest, MemoryPlanRouteRequest
 from app.memory.schemas import MemoryWorkflowState
 
 
@@ -36,20 +37,44 @@ SUMMARY_PLAN_TERMS = {
 class PlanContextRouter:
     """Route a request to none, summary, or full active-plan context."""
 
+    def __init__(self, llm_provider=None):
+        self.llm_provider = llm_provider
+
     def __call__(self, state: MemoryWorkflowState) -> MemoryWorkflowState:
         """Input: latest query and active-plan flag. Output: plan context level."""
 
-        query = state.get("latest_user_query", "").lower()
         active_plan_exists = bool(state.get("active_plan_progress"))
         if not active_plan_exists:
             return {"plan_context_level": "none"}
-        if state.get("task_type") in {"program_generator", "plan_review"}:
-            return {"plan_context_level": "full"}
-        if any(term in query for term in FULL_PLAN_TERMS):
-            return {"plan_context_level": "full"}
-        if any(term in query for term in SUMMARY_PLAN_TERMS):
-            return {"plan_context_level": "summary"}
-        return {"plan_context_level": "none"}
+        errors = list(state.get("errors", []))
+        if self.llm_provider and hasattr(self.llm_provider, "generate_memory_plan_route"):
+            try:
+                result = self.llm_provider.generate_memory_plan_route(
+                    MemoryPlanRouteRequest(
+                        latest_user_query=state.get("latest_user_query", ""),
+                        task_type=state.get("task_type", "qa"),
+                        topic_hint=state.get("topic_hint"),
+                        conversation_summary=state.get("rolling_summary", ""),
+                        active_plan_exists=active_plan_exists,
+                    )
+                )
+                return {
+                    "plan_context_level": result.plan_context_level,
+                    "plan_context_rationale": result.rationale,
+                    "plan_context_confidence": result.confidence,
+                    "plan_context_router_used": "llm",
+                    "errors": errors,
+                }
+            except Exception as exc:
+                errors.append(f"PlanContextRouter LLM fallback used: {exc}")
+        return {
+            "plan_context_level": _deterministic_plan_context_level(
+                query=state.get("latest_user_query", ""),
+                task_type=state.get("task_type", "qa"),
+            ),
+            "plan_context_router_used": "fallback",
+            "errors": errors,
+        }
 
 
 def estimate_tokens(text: str) -> int:
@@ -106,9 +131,15 @@ class MemoryContextCompactor:
         "active_plan_progress",
     ]
 
-    def __init__(self, max_tokens: int = 34000, section_caps: dict[str, int] | None = None):
+    def __init__(
+        self,
+        max_tokens: int = 34000,
+        section_caps: dict[str, int] | None = None,
+        llm_provider=None,
+    ):
         self.max_tokens = max_tokens
         self.section_caps = section_caps or dict(self.DEFAULT_SECTION_CAPS)
+        self.llm_provider = llm_provider
 
     def __call__(self, state: MemoryWorkflowState) -> MemoryWorkflowState:
         """Input: memory_context sections. Output: compacted memory_context."""
@@ -116,6 +147,7 @@ class MemoryContextCompactor:
         memory_context = state.get("memory_context")
         if memory_context is None:
             return {}
+        original_sections = dict(memory_context.sections)
         sections = dict(memory_context.sections)
         report: dict[str, dict] = {}
         for section_name, cap in self.section_caps.items():
@@ -155,11 +187,42 @@ class MemoryContextCompactor:
                 sections[section_name] = compacted
                 total = _section_token_total(sections)
 
+        errors = list(state.get("errors", []))
+        if report and self.llm_provider and hasattr(self.llm_provider, "compact_memory_context"):
+            try:
+                result = self.llm_provider.compact_memory_context(
+                    MemoryCompactionRequest(
+                        sections=original_sections,
+                        section_caps=self.section_caps,
+                        max_tokens=self.max_tokens,
+                    )
+                )
+                candidate_sections = {
+                    name: result.sections.get(name, sections.get(name, ""))
+                    for name in original_sections
+                }
+                candidate_sections, llm_trim_report = _enforce_compacted_section_limits(
+                    candidate_sections,
+                    section_caps=self.section_caps,
+                    max_tokens=self.max_tokens,
+                )
+                sections = candidate_sections
+                report = {
+                    **result.compaction_report,
+                    **{
+                        name: {"reason": "llm_post_trim", **details}
+                        for name, details in llm_trim_report.items()
+                    },
+                }
+                report.setdefault("_strategy", {"reason": "llm_compaction"})
+            except Exception as exc:
+                errors.append(f"MemoryContextCompactor LLM fallback used: {exc}")
+
         memory_context.sections = sections
         memory_context.rendered_context = render_sections(sections)
         memory_context.token_estimate = _section_token_total(sections)
         memory_context.compaction_report = report
-        return {"memory_context": memory_context, "compaction_report": report}
+        return {"memory_context": memory_context, "compaction_report": report, "errors": errors}
 
 
 def render_sections(sections: dict[str, str]) -> str:
@@ -175,3 +238,57 @@ def render_sections(sections: dict[str, str]) -> str:
 def _section_token_total(sections: dict[str, str]) -> int:
     return sum(estimate_tokens(text) for text in sections.values())
 
+
+def _deterministic_plan_context_level(query: str, task_type: str) -> str:
+    query = query.lower()
+    if task_type in {"program_generator", "plan_review"}:
+        return "full"
+    if any(term in query for term in FULL_PLAN_TERMS):
+        return "full"
+    if any(term in query for term in SUMMARY_PLAN_TERMS):
+        return "summary"
+    return "none"
+
+
+def _enforce_compacted_section_limits(
+    sections: dict[str, str],
+    section_caps: dict[str, int],
+    max_tokens: int,
+) -> tuple[dict[str, str], dict[str, dict]]:
+    report: dict[str, dict] = {}
+    cleaned = dict(sections)
+    for section_name, cap in section_caps.items():
+        if section_name not in cleaned:
+            continue
+        compacted, changed = trim_to_token_budget(
+            cleaned[section_name],
+            cap,
+            keep_newest=section_name == "working_memory",
+        )
+        if changed:
+            report[section_name] = {
+                "before_tokens": estimate_tokens(cleaned[section_name]),
+                "after_tokens": estimate_tokens(compacted),
+            }
+            cleaned[section_name] = compacted
+
+    total = _section_token_total(cleaned)
+    for section_name in MemoryContextCompactor.GLOBAL_COMPACTION_ORDER:
+        if total <= max_tokens:
+            break
+        if not cleaned.get(section_name):
+            continue
+        target = max(100, estimate_tokens(cleaned[section_name]) // 2)
+        compacted, changed = trim_to_token_budget(
+            cleaned[section_name],
+            target,
+            keep_newest=section_name == "working_memory",
+        )
+        if changed:
+            report[section_name] = {
+                "before_tokens": estimate_tokens(cleaned[section_name]),
+                "after_tokens": estimate_tokens(compacted),
+            }
+            cleaned[section_name] = compacted
+            total = _section_token_total(cleaned)
+    return cleaned, report

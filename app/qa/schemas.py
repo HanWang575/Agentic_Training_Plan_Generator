@@ -37,6 +37,7 @@ class AskQuestionResponse(BaseModel):
     safety_note: str | None = None
     insufficient_evidence: bool = False
     trace_id: str
+    conversation_id: str | None = None
     debug: dict[str, Any] | None = None
 
 

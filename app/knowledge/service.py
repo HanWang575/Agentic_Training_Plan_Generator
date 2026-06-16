@@ -50,6 +50,7 @@ class KnowledgeService:
         source_file_path: Path,
         title: str | None,
         topic_tags: list[str] | None,
+        marker_force_ocr: bool | None = None,
     ) -> UploadResult:
         """Parse and store an uploaded file as pending review.
 
@@ -61,7 +62,12 @@ class KnowledgeService:
             UploadResult: source metadata and chunk count.
         """
 
-        source_id = self.create_pending_upload(source_file_path, title=title, topic_tags=topic_tags)
+        source_id = self.create_pending_upload(
+            source_file_path,
+            title=title,
+            topic_tags=topic_tags,
+            marker_force_ocr=marker_force_ocr,
+        )
         self.parse_pending_source(source_id)
         return self._summary_for_source(source_id, result_type=UploadResult)
 
@@ -70,11 +76,13 @@ class KnowledgeService:
         source_file_path: Path,
         title: str | None,
         topic_tags: list[str] | None,
+        marker_force_ocr: bool | None = None,
     ) -> str:
         """Copy one file into upload storage and register a queued source."""
 
         source_id = f"src_{uuid4().hex[:12]}"
         tags = topic_tags or []
+        parser_options = _parser_options(marker_force_ocr=marker_force_ocr)
         source_dir = self.settings.upload_dir / source_id
         source_dir.mkdir(parents=True, exist_ok=True)
         stored_path = source_dir / source_file_path.name
@@ -90,6 +98,7 @@ class KnowledgeService:
             parser_status="queued",
             parser_progress=0.0,
             parser_progress_message="Queued for parsing.",
+            parser_options_json=json.dumps(parser_options),
         )
         self.session.add(source)
         self.session.commit()
@@ -102,11 +111,12 @@ class KnowledgeService:
         stored_path = Path(source.file_path)
         tags = json.loads(source.topic_tags_json or "[]")
         self._set_parse_progress(source, 0.02, "Preparing parser...")
+        effective_settings = _settings_with_parser_options(self.settings, source.parser_options_json)
         try:
             parsed = parse_document(
                 stored_path,
                 title=source.title,
-                settings=self.settings,
+                settings=effective_settings,
                 progress_callback=lambda progress, message: self._set_parse_progress(
                     source,
                     max(0.02, min(0.9, progress * 0.9)),
@@ -155,7 +165,11 @@ class KnowledgeService:
             self.session.commit()
         return self._summary_for_source(source_id, result_type=UploadResult)
 
-    def upload_rag_corpus(self, corpus_dir: Path | None = None) -> BulkUploadResult:
+    def upload_rag_corpus(
+        self,
+        corpus_dir: Path | None = None,
+        marker_force_ocr: bool | None = None,
+    ) -> BulkUploadResult:
         """Upload every supported source file from a local RAG corpus folder.
 
         Parameters:
@@ -174,7 +188,13 @@ class KnowledgeService:
         skipped = list(plan.skipped)
         for item in plan.files:
             try:
-                uploaded.append(self.upload_one_rag_corpus_file(item.relative_path, root))
+                uploaded.append(
+                    self.upload_one_rag_corpus_file(
+                        item.relative_path,
+                        root,
+                        marker_force_ocr=marker_force_ocr,
+                    )
+                )
             except Exception as exc:
                 skipped.append({"path": item.relative_path, "reason": str(exc)})
 
@@ -231,6 +251,7 @@ class KnowledgeService:
         self,
         relative_path: str,
         corpus_dir: Path | None = None,
+        marker_force_ocr: bool | None = None,
     ) -> UploadResult:
         """Upload one supported source from `RAG_corpus`.
 
@@ -253,6 +274,7 @@ class KnowledgeService:
             source_path,
             title=_title_from_file_name(source_path),
             topic_tags=_tags_from_corpus_path(source_path, root),
+            marker_force_ocr=marker_force_ocr,
         )
 
     def approve_source(self, source_id: str, review_note: str | None = None) -> ReviewResult:
@@ -727,6 +749,7 @@ class KnowledgeService:
             parser_progress_message=source.parser_progress_message,
             parser_error=source.parser_error,
             parser_warnings=json.loads(source.parser_warnings_json or "[]"),
+            parser_options=json.loads(source.parser_options_json or "{}"),
             topic_tags=json.loads(source.topic_tags_json or "[]"),
             chunk_count=chunk_count,
         )
@@ -745,6 +768,30 @@ def _title_from_file_name(source_path: Path) -> str:
     """Input: source file path. Output: readable title from the file name."""
 
     return source_path.stem.strip() or source_path.name
+
+
+def _parser_options(marker_force_ocr: bool | None = None) -> dict:
+    """Return upload-specific parser options to persist with one source."""
+
+    options = {}
+    if marker_force_ocr is not None:
+        options["marker_force_ocr"] = bool(marker_force_ocr)
+    return options
+
+
+def _settings_with_parser_options(settings: Settings, parser_options_json: str) -> Settings:
+    """Return settings with per-source parser overrides applied."""
+
+    try:
+        options = json.loads(parser_options_json or "{}")
+    except json.JSONDecodeError:
+        options = {}
+    updates = {}
+    if "marker_force_ocr" in options:
+        updates["marker_force_ocr"] = bool(options["marker_force_ocr"])
+    if not updates:
+        return settings
+    return settings.model_copy(update=updates)
 
 
 def _tags_from_corpus_path(source_path: Path, corpus_root: Path) -> list[str]:

@@ -1,12 +1,22 @@
 """User Profile and Memory service behavior."""
 
+import json
 from datetime import timedelta
 from pathlib import Path
 
 from sqlmodel import Session, select
 
 from app.core.config import Settings
+from app.core.llm_provider import (
+    MemoryCompactionResult,
+    MemoryEpisodeSummaryResult,
+    MemoryExtractionResult,
+    MemoryKeyProposalResult,
+    MemoryPlanRouteResult,
+)
+from app.memory.nodes import MemoryContextCompactor, estimate_tokens
 from app.memory.schemas import MemoryItemApproveRequest, PlanProgressPatchRequest, TrainingLogImportRequest
+from app.memory.schemas import MemoryContextOut
 from app.memory.service import MemoryService
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import (
@@ -37,6 +47,66 @@ def _make_service(tmp_path: Path):
     init_db(engine)
     session = Session(engine)
     return session, MemoryService(session=session, settings=settings)
+
+
+class FakeMemoryLLMProvider:
+    """Fake memory LLM provider for graph-node tests."""
+
+    def generate_memory_plan_route(self, request):
+        return MemoryPlanRouteResult(
+            plan_context_level="summary",
+            rationale="LLM judged this as mildly training related.",
+            confidence=0.9,
+        )
+
+    def generate_memory_rolling_summary(self, request):
+        return "LLM rolling summary: user reported accumulating fatigue and schedule limits."
+
+    def generate_memory_episode_summary(self, request):
+        return MemoryEpisodeSummaryResult(
+            summary="LLM episode summary: user wants strength and has limited time today.",
+            topics=["strength", "schedule"],
+            importance=0.72,
+        )
+
+    def generate_memory_candidates(self, request):
+        return MemoryExtractionResult(
+            items=[
+                {
+                    "category": "profile",
+                    "target_type": "ProfileField",
+                    "memory_key": "primary_training_goal",
+                    "text": "User wants to build strength.",
+                    "value": "build strength",
+                    "confidence": 0.88,
+                    "safety_relevant": False,
+                },
+                {
+                    "category": "recent_status",
+                    "target_type": "RecentStatus",
+                    "memory_key": "available_training_time_today",
+                    "text": "User has 35 minutes to train today.",
+                    "value": 35,
+                    "confidence": 0.84,
+                    "safety_relevant": False,
+                },
+            ]
+        )
+
+    def review_memory_key_proposal(self, request):
+        return MemoryKeyProposalResult(
+            duplicate_decision="duplicate",
+            nearest_existing_keys=["exercise_preferences"],
+            canonical_key="exercise_preferences",
+            reason="The proposed key duplicates an existing exercise preference key.",
+        )
+
+    def generate_completed_plan_episode(self, request):
+        return MemoryEpisodeSummaryResult(
+            summary="LLM completed-plan summary: plan_alpha was completed with useful adherence feedback.",
+            topics=["training_plan", "plan_completion", "adherence"],
+            importance=0.8,
+        )
 
 
 def test_manual_profile_and_recent_status_appear_in_context(tmp_path: Path):
@@ -226,6 +296,85 @@ def test_context_uses_latest_profile_and_recent_status_value_per_key(tmp_path: P
     session.close()
 
 
+def test_recent_status_expiry_reminders_include_review_fields_and_suggestion(tmp_path: Path):
+    """Near-expiry statuses should ask the user to expire or renew with a suggested date."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    now = utc_now()
+    observed = now - timedelta(days=6, hours=23)
+    status = service.update_recent_status(
+        "usr_test",
+        {"joint_pain": "mild right knee pain"},
+        observed_at=observed,
+    ).statuses[0]
+
+    response = service.list_expiring_recent_status("usr_test", within_hours=2, now=now)
+    reminder = response.reminders[0]
+
+    assert response.statuses[0].status_id == status.status_id
+    assert response.statuses[0].expiration_reminder_status == "due"
+    assert reminder.status_id == status.status_id
+    assert reminder.status_key == "joint_pain"
+    assert reminder.value == "mild right knee pain"
+    assert reminder.source == "manual"
+    assert reminder.current_valid_until == status.valid_until
+    assert reminder.suggested_valid_until == now + timedelta(days=7)
+    assert "Expire it if it is no longer true" in reminder.prompt
+    session.close()
+
+
+def test_recent_status_expire_and_renew_actions_keep_audit_storage(tmp_path: Path):
+    """The user can expire or renew a reminder without deleting the status row."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    pain = service.update_recent_status("usr_test", {"joint_pain": "resolved knee pain"}).statuses[0]
+    sleep = service.update_recent_status("usr_test", {"sleep_duration_hours": 6}).statuses[0]
+
+    expired = service.expire_recent_status(pain.status_id)
+    renewed_until = utc_now() + timedelta(days=2)
+    renewed = service.update_recent_status_valid_until(sleep.status_id, renewed_until)
+    context = service.get_memory_context("usr_test", query="How should I train today?")
+    audit_statuses = service.list_recent_status("usr_test", include_expired=True)
+
+    assert expired.review_status == "expired"
+    assert expired.expiration_reminder_status == "expired_by_user"
+    assert expired.expired_at is not None
+    assert renewed.review_status == "approved"
+    assert renewed.expiration_reminder_status == "renewed"
+    assert renewed.expired_at is None
+    assert "joint_pain" not in context.sections["recent_status"]
+    assert sleep.status_id in context.memory_ids
+    assert {item.status_id for item in audit_statuses} == {pain.status_id, sleep.status_id}
+    session.close()
+
+
+def test_recent_status_hides_after_expiry_without_user_response(tmp_path: Path):
+    """Expired statuses should leave normal context while remaining available for audit."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    observed = utc_now() - timedelta(days=1, hours=1)
+    status = service.update_recent_status(
+        "usr_test",
+        {"sleep_duration_hours": 5},
+        observed_at=observed,
+    ).statuses[0]
+
+    context = service.get_memory_context("usr_test", query="How should I train today?")
+    active_statuses = service.list_recent_status("usr_test")
+    audit_statuses = service.list_recent_status("usr_test", include_expired=True)
+    audit_status = audit_statuses[0]
+
+    assert "sleep_duration_hours" not in context.sections["recent_status"]
+    assert active_statuses == []
+    assert audit_status.status_id == status.status_id
+    assert audit_status.review_status == "expired"
+    assert audit_status.expired_at == status.valid_until
+    session.close()
+
+
 def test_close_conversation_creates_episode_and_reviewable_candidates(tmp_path: Path):
     """Closing should create one episode and candidate memories, then approval writes profile/status."""
 
@@ -264,6 +413,169 @@ def test_close_conversation_creates_episode_and_reviewable_candidates(tmp_path: 
     session.close()
 
 
+def test_inactive_conversation_auto_closes_and_creates_episode(tmp_path: Path):
+    """Open conversations older than the inactivity threshold should close lazily."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="Idle check-in")
+    service.append_message(
+        conversation.conversation_id,
+        role="user",
+        content="My goal is build muscle. I slept 5 hours.",
+    )
+    row = session.get(Conversation, conversation.conversation_id)
+    row.updated_at = utc_now() - timedelta(hours=1, minutes=5)
+    session.add(row)
+    session.commit()
+
+    listed = service.list_conversations("usr_test")
+    episode = session.exec(
+        select(Episode).where(Episode.conversation_id == conversation.conversation_id)
+    ).first()
+    candidates = service.list_memory_items("usr_test", status="candidate")
+
+    assert listed[0].status == "closed"
+    assert listed[0].closure_reason == "inactive_timeout"
+    assert episode is not None
+    assert {"primary_training_goal", "sleep_duration_hours"} <= {
+        item.memory_key for item in candidates
+    }
+    session.close()
+
+
+def test_reopened_conversation_updates_episode_and_extracts_new_messages_only(tmp_path: Path):
+    """Reusing a closed conversation should reopen it, then refresh the existing episode on close."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="Reusable chat", conversation_id="conv_reuse")
+    service.append_message(
+        conversation.conversation_id,
+        role="user",
+        content="My goal is build muscle.",
+    )
+    first_close = service.close_conversation(conversation.conversation_id)
+    first_episode_id = first_close.episode.episode_id
+    first_candidate_ids = {item.memory_id for item in first_close.candidate_memory_items}
+
+    reopened = service.create_conversation("usr_test", conversation_id="conv_reuse")
+    service.append_message(
+        conversation.conversation_id,
+        role="user",
+        content="My bench press 1RM is 100 kg.",
+    )
+    open_detail = service.get_conversation_detail(conversation.conversation_id)
+    second_close = service.close_conversation(conversation.conversation_id)
+    final_detail = service.get_conversation_detail(conversation.conversation_id)
+    all_candidates = service.list_memory_items("usr_test", status="candidate")
+
+    assert reopened.status == "open"
+    assert open_detail.conversation.status == "open"
+    assert second_close.episode.episode_id == first_episode_id
+    assert len(second_close.episode.source_message_ids) == 2
+    assert "bench press" in second_close.episode.summary.lower()
+    assert {"primary_training_goal", "bench_press_1rm_kg"} <= {
+        item.memory_key for item in second_close.candidate_memory_items
+    }
+    assert first_candidate_ids <= {item.memory_id for item in second_close.candidate_memory_items}
+    assert len([item for item in all_candidates if item.memory_key == "primary_training_goal"]) == 1
+    assert len([item for item in all_candidates if item.memory_key == "bench_press_1rm_kg"]) == 1
+    assert final_detail.conversation.status == "closed"
+    session.close()
+
+
+def test_llm_memory_nodes_create_summary_episode_and_candidates(tmp_path: Path):
+    """LLM-backed memory nodes should replace deterministic summaries/extraction when available."""
+
+    settings = Settings(
+        _env_file=None,
+        sqlite_path=tmp_path / "app.sqlite",
+        upload_dir=tmp_path / "uploads",
+        chroma_path=tmp_path / "chroma",
+        openai_api_key=None,
+    )
+    engine = create_app_engine(settings)
+    init_db(engine)
+    session = Session(engine)
+    service = MemoryService(session=session, settings=settings, llm_provider=FakeMemoryLLMProvider())
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="LLM close")
+    long_context = " ".join(["strength schedule limit"] * 90)
+    for index in range(17):
+        service.append_message(
+            conversation.conversation_id,
+            role="user",
+            content=(
+                f"Turn {index}: I want strength and only have 35 minutes today. "
+                f"{long_context}"
+            ),
+        )
+
+    detail_before_close = service.get_conversation_detail(conversation.conversation_id)
+    closed = service.close_conversation(conversation.conversation_id)
+    keys = {item.memory_key for item in closed.candidate_memory_items}
+
+    assert detail_before_close.conversation.rolling_summary.startswith("LLM rolling summary")
+    assert detail_before_close.conversation.rolling_summary_until_message_id is not None
+    assert closed.episode.summary.startswith("LLM episode summary")
+    assert closed.episode.topics == ["strength", "schedule"]
+    assert closed.episode.importance == 0.72
+    assert {"primary_training_goal", "available_training_time_today"} <= keys
+    session.close()
+
+
+def test_working_memory_window_summarizes_oldest_messages_by_token_budget(tmp_path: Path):
+    """Oversized working memory should persist a summary cursor and keep only a small live window."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="Long chat")
+    long_tail = " ".join(["readiness recovery strength"] * 160)
+    saved_messages = []
+    for index in range(6):
+        saved_messages.append(
+            service.append_message(
+                conversation.conversation_id,
+                role="user",
+                content=f"Turn {index}: My goal is build strength. I slept 5 hours. {long_tail}",
+            )
+        )
+
+    detail = service.get_conversation_detail(conversation.conversation_id)
+    pre_close_items = service.list_memory_items("usr_test", status="candidate")
+    context = service.get_memory_context(
+        "usr_test",
+        conversation_id=conversation.conversation_id,
+        query="What should I do next?",
+    )
+    working_memory = context.sections["working_memory"]
+
+    assert len(detail.messages) == 6
+    assert detail.conversation.rolling_summary
+    assert detail.conversation.rolling_summary_until_message_id is not None
+    assert estimate_tokens(working_memory) <= 1800
+    assert "Turn 0:" not in working_memory
+    assert "Turn 5:" in working_memory
+    assert {"primary_training_goal", "sleep_duration_hours"} <= {
+        item.memory_key for item in pre_close_items
+    }
+    assert any(item.source_episode_id is None for item in pre_close_items)
+    assert saved_messages[0].message_id not in context.memory_ids
+    assert saved_messages[-1].message_id in context.memory_ids
+
+    closed = service.close_conversation(conversation.conversation_id)
+    post_close_items = service.list_memory_items("usr_test", status="candidate")
+    pre_close_ids = {item.memory_id for item in pre_close_items}
+    linked_pre_close_items = [
+        item for item in post_close_items if item.memory_id in pre_close_ids
+    ]
+
+    assert pre_close_ids <= {item.memory_id for item in closed.candidate_memory_items}
+    assert all(item.source_episode_id == closed.episode.episode_id for item in linked_pre_close_items)
+    session.close()
+
+
 def test_key_proposal_allows_explicit_extension_mode(tmp_path: Path):
     """Unknown keys are rejected unless extension mode creates and approves a proposal."""
 
@@ -284,6 +596,35 @@ def test_key_proposal_allows_explicit_extension_mode(tmp_path: Path):
     assert "primary_training_goal" in service.list_profile_keys("usr_test")
     assert "favorite_barbell" in service.list_profile_keys("usr_test")
     assert "sleep_duration_hours" in service.list_recent_status_keys("usr_test")
+    session.close()
+
+
+def test_llm_key_proposal_detector_marks_duplicates(tmp_path: Path):
+    """The LLM key detector can reject duplicate/equivalent custom keys."""
+
+    settings = Settings(
+        _env_file=None,
+        sqlite_path=tmp_path / "app.sqlite",
+        upload_dir=tmp_path / "uploads",
+        chroma_path=tmp_path / "chroma",
+        openai_api_key=None,
+    )
+    engine = create_app_engine(settings)
+    init_db(engine)
+    session = Session(engine)
+    service = MemoryService(session=session, settings=settings, llm_provider=FakeMemoryLLMProvider())
+    service.create_user("usr_test")
+
+    response = service.update_profile(
+        "usr_test",
+        {"favorite_lifts": ["squat"]},
+        extension_mode=True,
+    )
+    proposal = response.key_proposals[0]
+
+    assert proposal.duplicate_decision == "duplicate"
+    assert proposal.review_status == "rejected"
+    assert proposal.nearest_existing_keys == ["exercise_preferences"]
     session.close()
 
 
@@ -314,6 +655,80 @@ def test_plan_context_router_and_progress_events(tmp_path: Path):
     assert none_context.plan_context_level == "none"
     assert none_context.sections["active_plan_progress"] == ""
     session.close()
+
+
+def test_llm_plan_router_and_completed_plan_episode_writer(tmp_path: Path):
+    """Plan routing and completed-plan episodic summary should use LLM nodes when available."""
+
+    settings = Settings(
+        _env_file=None,
+        sqlite_path=tmp_path / "app.sqlite",
+        upload_dir=tmp_path / "uploads",
+        chroma_path=tmp_path / "chroma",
+        openai_api_key=None,
+    )
+    engine = create_app_engine(settings)
+    init_db(engine)
+    session = Session(engine)
+    service = MemoryService(session=session, settings=settings, llm_provider=FakeMemoryLLMProvider())
+    service.create_user("usr_test")
+    service.patch_plan_progress(
+        "plan_alpha",
+        PlanProgressPatchRequest(
+            user_id="usr_test",
+            planned_sessions=[{"session_id": "s1", "title": "Upper body"}],
+            event_type="plan_created",
+        ),
+    )
+
+    context = service.get_memory_context(
+        "usr_test",
+        query="What does creatine do?",
+        include_debug=True,
+    )
+    service.patch_plan_progress(
+        "plan_alpha",
+        PlanProgressPatchRequest(
+            user_id="usr_test",
+            status="completed",
+            event_type="plan_completed",
+            feedback="Good adherence overall.",
+        ),
+    )
+    episode = session.exec(
+        select(Episode).where(Episode.source_type == "plan_completion")
+    ).one()
+
+    assert context.plan_context_level == "summary"
+    assert context.debug["plan_context_router_used"] == "llm"
+    assert context.debug["plan_context_confidence"] == 0.9
+    assert episode.summary.startswith("LLM completed-plan summary")
+    assert json.loads(episode.topics_json) == ["training_plan", "plan_completion", "adherence"]
+    session.close()
+
+
+def test_llm_memory_context_compactor_runs_after_deterministic_trigger():
+    """The compactor should call the LLM compactor when deterministic caps are exceeded."""
+
+    class FakeCompactorProvider:
+        def compact_memory_context(self, request):
+            return MemoryCompactionResult(
+                sections={"working_memory": "[msg_1 | recent] compacted working memory"},
+                compaction_report={"working_memory": {"reason": "llm_compaction"}},
+            )
+
+    context = MemoryContextOut(
+        user_id="usr_test",
+        sections={"working_memory": "\n".join(f"[msg_{index}] long line " * 20 for index in range(8))},
+    )
+    result = MemoryContextCompactor(
+        max_tokens=50,
+        section_caps={"working_memory": 30},
+        llm_provider=FakeCompactorProvider(),
+    )({"memory_context": context, "errors": [], "timings": {}})
+
+    assert result["memory_context"].sections["working_memory"] == "[msg_1 | recent] compacted working memory"
+    assert result["compaction_report"]["working_memory"]["reason"] == "llm_compaction"
 
 
 def test_xunji_import_is_idempotent_and_summarized(tmp_path: Path):

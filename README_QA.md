@@ -132,7 +132,7 @@ MARKER_TIMEOUT_SECONDS=1800
 
 Marker output is converted into semantic blocks before chunking. Prose is chunked section-first with LangChain header and recursive splitters. Table and figure chunks include `content_type` plus metadata such as `table_footnote`, `table_format`, `image_alt_text`, and `image_path`. Small tables and figures also carry nearby paragraph context into the final chunk text.
 
-Keep OCR off first because it is slower. If a PDF still has badly recognized words after Marker parsing, try `MARKER_FORCE_OCR=true`, restart the backend, remove the old source, upload the PDF again, and approve the new source.
+Keep OCR off first because it is slower. `MARKER_FORCE_OCR` remains the default for uploads, but the Streamlit `Upload` tab also has `Use Marker OCR preprocessing for PDF upload` so you can turn OCR on for a single upload without editing `.env`. API callers can pass `marker_force_ocr=true` with `/api/knowledge/upload`, `/api/knowledge/upload/async`, `/api/knowledge/upload/rag-corpus`, or `/api/knowledge/upload/rag-corpus/file`. Parser responses include `parser_options` so you can confirm the OCR choice stored for that source.
 
 If the full install is slow because of large optional packages such as Chroma and Streamlit, you can still run the focused tests with this smaller dependency set:
 
@@ -173,7 +173,7 @@ python -m pytest -q
 Expected result:
 
 ```text
-17 passed
+84 passed
 ```
 
 These tests verify the current core behavior without needing an OpenAI API key.
@@ -188,7 +188,7 @@ Expected result:
 
 ```text
 Personal Coach Evidence-Based Q&A Assistant
-55
+56
 ```
 
 The route count includes the User Profile And Memory routes when that block is installed.
@@ -260,6 +260,15 @@ curl.exe -X POST "http://127.0.0.1:8000/api/knowledge/upload" `
 
 If you omit `title`, the app uses the uploaded file name, such as `protein_note`.
 
+For one PDF upload with Marker OCR preprocessing enabled:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/api/knowledge/upload" `
+  -F "file=@tmp\my_scan.pdf" `
+  -F "topic_tags=nutrition" `
+  -F "marker_force_ocr=true"
+```
+
 Expected behavior:
 
 - The response contains a `source_id`.
@@ -267,6 +276,7 @@ Expected behavior:
 - `parser_status` is `parsed`.
 - PDF uploads may include `parser_warnings` when the parser repaired or still detected suspicious line wrapping or character-split text.
 - With `PDF_PARSER=marker`, table and figure chunks keep their `content_type` and metadata for retrieval/debug inspection.
+- `parser_options.marker_force_ocr` shows the per-upload OCR choice when one was provided.
 - `chunk_count` is at least `1`.
 
 ### 7B. Upload The Whole RAG_corpus Folder
@@ -286,7 +296,7 @@ Expected behavior:
 - Each uploaded source tag comes from its folder under `RAG_corpus`, such as `sports_nutrition`.
 - Uploaded sources are still `pending_review`; approve them before asking questions that need them.
 
-The Streamlit `Upload` tab uses a file-by-file import path for this same folder, so it can show a progress bar while uploading large corpora.
+The Streamlit `Upload` tab uses a file-by-file import path for this same folder, so it can show a progress bar while uploading large corpora. Its Marker OCR checkbox is also applied to each uploaded RAG_corpus PDF.
 
 ### 8. Confirm Pending Sources Are Not Searchable
 
@@ -556,7 +566,7 @@ http://localhost:8501
 UI tabs:
 
 - `Chat`: ask questions, preview retrieval, and read answers as formatted Markdown with a citation table. The `View retrieved chunks` expander shows the full text for citation chunks, merged chunks, and final chunks, including parse quality warnings when a chunk still looks suspicious.
-- `Upload`: upload a source file or import all supported files from `RAG_corpus` with progress.
+- `Upload`: upload a source file or import all supported files from `RAG_corpus` with progress, with an optional per-upload Marker OCR preprocessing checkbox for PDFs.
 - `Review`: approve/reject one source, selected sources, or all reviewable sources with progress.
 - `Sources`: inspect source status, remove approved sources, and remove rejected history records.
 - `Trace`: load a trace by ID and inspect the full text behind citation, merged, and final chunk IDs.
