@@ -8,16 +8,14 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.core.llm_provider import (
-    MemoryCompactionResult,
     MemoryEpisodeSummaryResult,
     MemoryExtractionResult,
     MemoryKeyProposalResult,
     MemoryPlanRouteResult,
 )
-from app.memory.nodes import MemoryContextCompactor, estimate_tokens
+from app.memory.nodes import estimate_tokens
 from app.memory.schemas import MemoryItemApproveRequest, PlanProgressPatchRequest, TrainingLogImportRequest
-from app.memory.schemas import MemoryContextOut
-from app.memory.service import MemoryService
+from app.memory.service import MemoryService, ROLLING_SUMMARY_TARGET_RATIO, ROLLING_SUMMARY_TOKEN_BUDGET
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import (
     Conversation,
@@ -110,7 +108,7 @@ class FakeMemoryLLMProvider:
 
 
 def test_manual_profile_and_recent_status_appear_in_context(tmp_path: Path):
-    """Manual approved memory should be retrievable as compact context."""
+    """Manual approved memory should be retrievable as memory context."""
 
     session, service = _make_service(tmp_path)
     service.create_user("usr_test", display_name="Alex", timezone_name="Asia/Shanghai")
@@ -576,6 +574,80 @@ def test_working_memory_window_summarizes_oldest_messages_by_token_budget(tmp_pa
     session.close()
 
 
+def test_rolling_summary_self_compression_drops_oldest_content(tmp_path: Path):
+    """Oversized rolling summaries should be capped by dropping oldest lines."""
+
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="Rolling summary cap")
+    row = session.get(Conversation, conversation.conversation_id)
+    row.rolling_summary = "\n".join(
+        f"old summary line {index}: " + "old context " * 30
+        for index in range(180)
+    )
+    session.add(row)
+    session.commit()
+
+    long_tail = " ".join(["newest fallback marker recovery strength"] * 900)
+    service.append_message(
+        conversation.conversation_id,
+        role="user",
+        content=f"Newest fallback content marker. {long_tail}",
+    )
+
+    detail = service.get_conversation_detail(conversation.conversation_id)
+    summary = detail.conversation.rolling_summary
+    target_tokens = int(ROLLING_SUMMARY_TOKEN_BUDGET * ROLLING_SUMMARY_TARGET_RATIO)
+
+    assert estimate_tokens(summary) <= target_tokens
+    assert "old summary line 0" not in summary
+    assert "Newest fallback content marker" in summary
+    assert detail.conversation.rolling_summary_until_message_id is not None
+    session.close()
+
+
+def test_rolling_summary_self_compression_prefers_llm_rewrite(tmp_path: Path):
+    """When available, LLM compression should rewrite oversized rolling summaries."""
+
+    class RollingSummaryCompressionProvider(FakeMemoryLLMProvider):
+        def __init__(self):
+            self.compression_requests = []
+
+        def generate_memory_rolling_summary(self, request):
+            return "\n".join(
+                f"oversized llm summary line {index}: " + "too much context " * 30
+                for index in range(180)
+            )
+
+        def generate_memory_rolling_summary_compression(self, request):
+            self.compression_requests.append(request)
+            return "LLM compressed rolling summary: user wants strength and reported limited sleep."
+
+    session, service = _make_service(tmp_path)
+    provider = RollingSummaryCompressionProvider()
+    service.llm_provider = provider
+    service.create_user("usr_test")
+    conversation = service.create_conversation("usr_test", title="LLM summary compression")
+    long_tail = " ".join(["readiness recovery strength"] * 900)
+
+    service.append_message(
+        conversation.conversation_id,
+        role="user",
+        content=f"My goal is build strength. I slept 5 hours. {long_tail}",
+    )
+
+    detail = service.get_conversation_detail(conversation.conversation_id)
+    summary = detail.conversation.rolling_summary
+    target_tokens = int(ROLLING_SUMMARY_TOKEN_BUDGET * ROLLING_SUMMARY_TARGET_RATIO)
+
+    assert provider.compression_requests
+    assert provider.compression_requests[0].target_tokens == target_tokens
+    assert summary == "LLM compressed rolling summary: user wants strength and reported limited sleep."
+    assert estimate_tokens(summary) <= target_tokens
+    assert detail.conversation.rolling_summary_until_message_id is not None
+    session.close()
+
+
 def test_key_proposal_allows_explicit_extension_mode(tmp_path: Path):
     """Unknown keys are rejected unless extension mode creates and approves a proposal."""
 
@@ -707,28 +779,30 @@ def test_llm_plan_router_and_completed_plan_episode_writer(tmp_path: Path):
     session.close()
 
 
-def test_llm_memory_context_compactor_runs_after_deterministic_trigger():
-    """The compactor should call the LLM compactor when deterministic caps are exceeded."""
+def test_oversized_memory_context_sections_warn_without_trimming(tmp_path: Path):
+    """Oversized memory sections should warn the user without mutating context text."""
 
-    class FakeCompactorProvider:
-        def compact_memory_context(self, request):
-            return MemoryCompactionResult(
-                sections={"working_memory": "[msg_1 | recent] compacted working memory"},
-                compaction_report={"working_memory": {"reason": "llm_compaction"}},
-            )
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    long_preference = " ".join(["prefers slow tempo strength training"] * 1200)
+    service.update_profile("usr_test", {"exercise_preferences": long_preference})
 
-    context = MemoryContextOut(
-        user_id="usr_test",
-        sections={"working_memory": "\n".join(f"[msg_{index}] long line " * 20 for index in range(8))},
+    context = service.get_memory_context(
+        "usr_test",
+        query="How should I train today?",
+        include_debug=True,
     )
-    result = MemoryContextCompactor(
-        max_tokens=50,
-        section_caps={"working_memory": 30},
-        llm_provider=FakeCompactorProvider(),
-    )({"memory_context": context, "errors": [], "timings": {}})
+    profile_warning = next(
+        warning
+        for warning in context.budget_warnings
+        if warning["type"] == "section_budget_exceeded" and warning["section"] == "profile"
+    )
 
-    assert result["memory_context"].sections["working_memory"] == "[msg_1 | recent] compacted working memory"
-    assert result["compaction_report"]["working_memory"]["reason"] == "llm_compaction"
+    assert long_preference in context.sections["profile"]
+    assert profile_warning["token_estimate"] > profile_warning["token_budget"]
+    assert "was not compacted" in profile_warning["message"]
+    assert context.debug["budget_warnings"] == context.budget_warnings
+    session.close()
 
 
 def test_xunji_import_is_idempotent_and_summarized(tmp_path: Path):

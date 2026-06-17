@@ -11,10 +11,10 @@ from app.core.errors import ConfigurationError
 from app.memory.prompts import (
     build_completed_plan_episode_prompt,
     build_episode_summary_prompt,
-    build_memory_context_compactor_prompt,
     build_memory_extractor_prompt,
     build_memory_key_proposal_prompt,
     build_memory_plan_router_prompt,
+    build_rolling_summary_compression_prompt,
     build_rolling_summary_prompt,
 )
 from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
@@ -80,6 +80,14 @@ class MemoryRollingSummaryRequest:
 
 
 @dataclass(slots=True)
+class MemoryRollingSummaryCompressionRequest:
+    """Input shape for LLM rolling-summary self-compression."""
+
+    rolling_summary: str
+    target_tokens: int
+
+
+@dataclass(slots=True)
 class MemoryEpisodeSummaryRequest:
     """Input shape for LLM episodic summaries."""
 
@@ -133,23 +141,6 @@ class MemoryKeyProposalResult:
     nearest_existing_keys: list[str]
     canonical_key: str
     reason: str
-
-
-@dataclass(slots=True)
-class MemoryCompactionRequest:
-    """Input shape for LLM memory-context compaction."""
-
-    sections: dict[str, str]
-    section_caps: dict[str, int]
-    max_tokens: int
-
-
-@dataclass(slots=True)
-class MemoryCompactionResult:
-    """Output shape for LLM memory-context compaction."""
-
-    sections: dict[str, str]
-    compaction_report: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -328,6 +319,22 @@ class OpenAIProvider:
             raise ValueError("RollingSummaryUpdater returned an empty summary.")
         return summary
 
+    def generate_memory_rolling_summary_compression(
+        self,
+        request: MemoryRollingSummaryCompressionRequest,
+    ) -> str:
+        """Rewrite an oversized rolling summary to its target budget."""
+
+        prompt = build_rolling_summary_compression_prompt(
+            rolling_summary=request.rolling_summary,
+            target_tokens=request.target_tokens,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=max(300, request.target_tokens)))
+        summary = str(payload.get("rolling_summary", "")).strip()
+        if not summary:
+            raise ValueError("RollingSummaryCompressor returned an empty summary.")
+        return summary
+
     def generate_memory_episode_summary(
         self,
         request: MemoryEpisodeSummaryRequest,
@@ -383,26 +390,6 @@ class OpenAIProvider:
             nearest_existing_keys=_string_list(payload.get("nearest_existing_keys", []))[:5],
             canonical_key=str(payload.get("canonical_key", "")).strip(),
             reason=str(payload.get("reason", "")).strip(),
-        )
-
-    def compact_memory_context(self, request: MemoryCompactionRequest) -> MemoryCompactionResult:
-        """Compact memory context sections with an LLM when deterministic trimming is too lossy."""
-
-        prompt = build_memory_context_compactor_prompt(
-            sections=request.sections,
-            section_caps=request.section_caps,
-            max_tokens=request.max_tokens,
-        )
-        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=2200))
-        sections = payload.get("sections", {})
-        if not isinstance(sections, dict):
-            raise ValueError("MemoryContextCompactor returned a non-object sections field.")
-        report = payload.get("compaction_report", {})
-        if not isinstance(report, dict):
-            report = {}
-        return MemoryCompactionResult(
-            sections={str(key): str(value) for key, value in sections.items()},
-            compaction_report=report,
         )
 
     def generate_completed_plan_episode(

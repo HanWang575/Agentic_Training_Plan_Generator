@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import Column, String
 from sqlmodel import Field, SQLModel
 
 
@@ -323,7 +324,7 @@ class TrainingSession(SQLModel, table=True):
 
 
 class MemoryTrace(SQLModel, table=True):
-    """Debug trace for memory retrieval and context compaction."""
+    """Debug trace for memory retrieval and budget warnings."""
 
     __tablename__ = "memory_traces"
 
@@ -334,7 +335,10 @@ class MemoryTrace(SQLModel, table=True):
     query: str = ""
     plan_context_level: str = "none"
     retrieved_memory_ids_json: str = "[]"
-    compaction_report_json: str = "{}"
+    budget_warnings_json: str = Field(
+        default="{}",
+        sa_column=Column("compaction_report_json", String, default="{}"),
+    )
     errors_json: str = "[]"
     created_at: datetime = Field(default_factory=utc_now)
     total_latency_ms: int = 0

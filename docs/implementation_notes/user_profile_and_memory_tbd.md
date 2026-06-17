@@ -2,13 +2,13 @@
 
 This file records unresolved design and implementation questions for the User Profile And Memory block. It is intentionally separate from the architecture outline and implementation notes.
 
-## 1. MemoryContextCompactor Inefficiency
+## 1. Memory Context Budget Strategy
 
 Current concern:
 
-- `MemoryContextCompactor` is mainly a final prompt-payload guardrail.
-- It assembles a fresh `MemoryContextOut`, then trims or asks the LLM compactor to compact oversized sections.
-- This can be inefficient if large sections repeatedly exceed budget, because the same or similar source content may be compacted again across turns.
+- Final prompt-stage memory context trimming has been removed from the current implementation.
+- `MemoryService` now assembles the full `MemoryContextOut` and returns `budget_warnings` when any section or the whole context exceeds its configured token budget.
+- Warnings make oversize context visible to the user, but they do not solve the underlying problem of keeping large memory sections concise.
 
 Current mitigations already added:
 
@@ -18,10 +18,9 @@ Current mitigations already added:
 
 Still TBD:
 
-- Decide whether `MemoryContextCompactor` should remain only a last-resort prompt guardrail or also maintain reusable cached compacted sections.
-- Decide whether compaction results should be deterministic-only for predictability, LLM-backed for quality, or hybrid with cache keys.
-- Decide how to measure repeated compaction cost in normal chat usage.
-- Decide whether each memory section needs its own persistent summary/checkpoint strategy rather than relying on final prompt compaction.
+- Decide whether each memory section needs its own persistent summary/checkpoint strategy.
+- Decide how users should resolve repeated section-budget warnings in normal chat usage.
+- Decide whether very large profile, recent-status, episode, or training-log sections should have section-specific retrieval/ranking limits before prompt assembly.
 
 ## 2. Incomplete Episodic Memory Design
 

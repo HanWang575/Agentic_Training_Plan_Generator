@@ -26,6 +26,14 @@ def _make_service(tmp_path: Path):
     return settings, session, KnowledgeService(session=session, settings=settings)
 
 
+def test_default_upload_cap_is_400_mb():
+    """The default source upload cap should allow files up to 400 MB."""
+
+    settings = Settings(_env_file=None)
+
+    assert settings.maximum_upload_bytes == 400 * 1024 * 1024
+
+
 def test_upload_creates_pending_source_and_chunks(tmp_path: Path):
     """A text upload is parsed and saved as pending_review, not approved."""
 

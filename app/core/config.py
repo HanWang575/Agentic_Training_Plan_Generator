@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     answer_max_tokens: int = 1000
     hybrid_rrf_k: int = 60
     embedding_batch_size: int = 10
-    maximum_upload_bytes: int = 100 * 1024 * 1024
+    maximum_upload_bytes: int = 400 * 1024 * 1024
 
     memory_context_max_tokens: int = 34000
     memory_non_plan_max_tokens: int = 24000

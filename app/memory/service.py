@@ -19,6 +19,7 @@ from app.core.llm_provider import (
     MemoryEpisodeSummaryRequest,
     MemoryExtractionRequest,
     MemoryKeyProposalRequest,
+    MemoryRollingSummaryCompressionRequest,
     MemoryRollingSummaryRequest,
     OpenAIProvider,
 )
@@ -30,7 +31,13 @@ from app.memory.catalogs import (
     normalize_key,
 )
 from app.memory.graph import run_langgraph_or_nodes
-from app.memory.nodes import MemoryContextCompactor, PlanContextRouter, render_sections, estimate_tokens
+from app.memory.nodes import (
+    MEMORY_SECTION_TOKEN_BUDGETS,
+    PlanContextRouter,
+    build_memory_budget_warnings,
+    estimate_tokens,
+    render_sections,
+)
 from app.memory.schemas import (
     ConversationCloseResponse,
     ConversationDetailOut,
@@ -76,8 +83,10 @@ from app.storage.models import (
 )
 
 
-WORKING_MEMORY_TOKEN_BUDGET = MemoryContextCompactor.DEFAULT_SECTION_CAPS["working_memory"]
+WORKING_MEMORY_TOKEN_BUDGET = MEMORY_SECTION_TOKEN_BUDGETS["working_memory"]
 WORKING_MEMORY_TARGET_RATIO = 0.3
+ROLLING_SUMMARY_TOKEN_BUDGET = MEMORY_SECTION_TOKEN_BUDGETS["rolling_summary"]
+ROLLING_SUMMARY_TARGET_RATIO = 0.5
 CONVERSATION_INACTIVE_CLOSE_AFTER = timedelta(hours=1)
 INACTIVE_CLOSURE_REASON = "inactive_timeout"
 
@@ -1011,7 +1020,7 @@ class MemoryService:
         task_type: str = "qa",
         include_debug: bool = False,
     ) -> MemoryContextOut:
-        """Retrieve and compact memory context for Q&A or future blocks."""
+        """Retrieve memory context for Q&A or future blocks."""
 
         self._ensure_user(user_id)
         started = time.perf_counter()
@@ -1046,18 +1055,7 @@ class MemoryService:
             active_plan=active_plan,
             errors=errors,
         )
-        context = MemoryContextOut(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            task_type=task_type,
-            plan_context_level=plan_context_level,
-            active_plan_exists=active_plan is not None,
-            rendered_context=render_sections(sections),
-            sections=sections,
-            memory_ids=memory_ids,
-            token_estimate=sum(estimate_tokens(text) for text in sections.values()),
-        )
-        section_caps = dict(MemoryContextCompactor.DEFAULT_SECTION_CAPS)
+        section_caps = dict(MEMORY_SECTION_TOKEN_BUDGETS)
         if plan_context_level == "none":
             section_caps["active_plan_progress"] = 0
             context_max_tokens = self.settings.memory_non_plan_max_tokens
@@ -1069,18 +1067,23 @@ class MemoryService:
         else:
             section_caps["active_plan_progress"] = self.settings.memory_plan_full_max_tokens
             context_max_tokens = self.settings.memory_context_max_tokens
-        compacted_state = run_langgraph_or_nodes(
-            {"memory_context": context, "errors": errors, "timings": {}},
-            [
-                MemoryContextCompactor(
-                    max_tokens=context_max_tokens,
-                    section_caps=section_caps,
-                    llm_provider=self.llm_provider,
-                )
-            ],
+        budget_warnings = build_memory_budget_warnings(
+            sections=sections,
+            section_caps=section_caps,
+            max_tokens=context_max_tokens,
         )
-        context = compacted_state.get("memory_context", context)
-        errors = compacted_state.get("errors", errors)
+        context = MemoryContextOut(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            task_type=task_type,
+            plan_context_level=plan_context_level,
+            active_plan_exists=active_plan is not None,
+            rendered_context=render_sections(sections),
+            sections=sections,
+            memory_ids=memory_ids,
+            token_estimate=sum(estimate_tokens(text) for text in sections.values()),
+            budget_warnings=budget_warnings,
+        )
         trace = MemoryTrace(
             trace_id=f"mtr_{uuid4().hex[:12]}",
             user_id=user_id,
@@ -1089,7 +1092,7 @@ class MemoryService:
             query=query,
             plan_context_level=plan_context_level,
             retrieved_memory_ids_json=_json_dumps(memory_ids),
-            compaction_report_json=_json_dumps(context.compaction_report),
+            budget_warnings_json=_json_dumps(budget_warnings),
             errors_json=_json_dumps(errors),
             total_latency_ms=int((time.perf_counter() - started) * 1000),
         )
@@ -1104,6 +1107,9 @@ class MemoryService:
                 "plan_context_router_used": router_state.get("plan_context_router_used"),
                 "plan_context_rationale": router_state.get("plan_context_rationale"),
                 "plan_context_confidence": router_state.get("plan_context_confidence"),
+                "memory_context_token_budget": context_max_tokens,
+                "section_token_budgets": section_caps,
+                "budget_warnings": budget_warnings,
                 "section_token_estimates": {
                     key: estimate_tokens(value) for key, value in context.sections.items()
                 },
@@ -1119,7 +1125,7 @@ class MemoryService:
         active_plan: PlanProgressOut | None,
         errors: list[str],
     ) -> tuple[dict[str, str], list[str]]:
-        """Assemble memory context sections before compaction."""
+        """Assemble memory context sections."""
 
         sections = {
             "rolling_summary": "",
@@ -1246,10 +1252,34 @@ class MemoryService:
                 *_summarize_messages_deterministically(older),
             ]
             conversation.rolling_summary = "\n".join(line for line in summary_lines if line).strip()
+        self._compress_rolling_summary_if_needed(conversation)
         conversation.rolling_summary_until_message_id = older[-1].message_id
         conversation.updated_at = utc_now()
         self.session.add(conversation)
         self.session.commit()
+
+    def _compress_rolling_summary_if_needed(self, conversation: Conversation) -> None:
+        """Keep the persisted rolling summary under its own section budget."""
+
+        if estimate_tokens(conversation.rolling_summary) <= ROLLING_SUMMARY_TOKEN_BUDGET:
+            return
+        target_tokens = max(1, int(ROLLING_SUMMARY_TOKEN_BUDGET * ROLLING_SUMMARY_TARGET_RATIO))
+        compressed_summary = ""
+        if self.llm_provider and hasattr(self.llm_provider, "generate_memory_rolling_summary_compression"):
+            try:
+                compressed_summary = self.llm_provider.generate_memory_rolling_summary_compression(
+                    MemoryRollingSummaryCompressionRequest(
+                        rolling_summary=conversation.rolling_summary,
+                        target_tokens=target_tokens,
+                    )
+                )
+            except Exception:
+                compressed_summary = ""
+        if not compressed_summary:
+            compressed_summary = conversation.rolling_summary
+        if estimate_tokens(compressed_summary) > target_tokens:
+            compressed_summary = _keep_newest_summary_lines(compressed_summary, target_tokens)
+        conversation.rolling_summary = compressed_summary
 
     def _live_working_memory_messages(
         self,
@@ -2304,6 +2334,27 @@ def _summarize_messages_deterministically(messages: list[ConversationMessage]) -
             content = f"{content[:177]}..."
         lines.append(f"- {message.role}: {content}")
     return lines
+
+
+def _keep_newest_summary_lines(text: str, target_tokens: int) -> str:
+    """Drop oldest summary lines until the newest content fits the target."""
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return text[-target_tokens * 4 :].strip()
+
+    selected: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        cost = estimate_tokens(line)
+        if not selected and cost > target_tokens:
+            return line[-target_tokens * 4 :].strip()
+        if selected and total + cost > target_tokens:
+            break
+        selected.append(line)
+        total += cost
+    selected.reverse()
+    return "\n".join(selected).strip()
 
 
 def _summarize_episode(conversation: Conversation, messages: list[ConversationMessage]) -> str:

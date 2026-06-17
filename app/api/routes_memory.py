@@ -162,7 +162,7 @@ def get_conversation_context(
     memory_debug: bool = False,
     service: MemoryService = Depends(memory_service_dependency),
 ) -> MemoryContextOut:
-    """Retrieve compact memory context for one conversation."""
+    """Retrieve memory context for one conversation."""
 
     try:
         return service.get_conversation_context(
@@ -184,7 +184,7 @@ def get_memory_context(
     memory_debug: bool = False,
     service: MemoryService = Depends(memory_service_dependency),
 ) -> MemoryContextOut:
-    """Retrieve compact memory context for a user, with optional conversation scope."""
+    """Retrieve memory context for a user, with optional conversation scope."""
 
     try:
         return service.get_memory_context(

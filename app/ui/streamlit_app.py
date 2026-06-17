@@ -355,6 +355,9 @@ def _render_qa_response(payload: dict, show_debug: bool) -> None:
     conversation_id = payload.get("conversation_id")
     if conversation_id:
         st.caption(f"Memory conversation ID: {conversation_id}")
+    memory_context = (payload.get("debug") or {}).get("memory_context") or {}
+    for warning in memory_context.get("budget_warnings", []):
+        st.warning(warning.get("message", str(warning)))
 
     _render_query_planner_view(payload, source=f"chat_{trace_id or 'latest'}")
     _render_retrieved_chunks_viewer(payload, source=f"chat_{trace_id or 'latest'}")
@@ -602,9 +605,7 @@ with tabs[5]:
             st.json(response.json())
 
     st.markdown("#### Conversations")
-    conversation_id_to_show = _clean_id_input(st.text_input("Conversation ID to show"))
-    conversation_id_to_delete = _clean_id_input(st.text_input("Conversation ID to delete"))
-    conversation_id_to_close = _clean_id_input(st.text_input("Conversation ID to close"))
+    conversation_id_for_action = _clean_id_input(st.text_input("Conversation ID"))
     conversation_close_reason = st.text_input("Conversation close reason", value="user_closed")
     conversation_extract_candidates = st.checkbox("Extract candidates when closing conversation", value=True)
     conversation_col1, conversation_col2, conversation_col3, conversation_col4 = st.columns(4)
@@ -617,31 +618,31 @@ with tabs[5]:
         response.raise_for_status()
         st.json(response.json())
     if conversation_col2.button("Show conversation content"):
-        if not conversation_id_to_show:
+        if not conversation_id_for_action:
             st.warning("Enter a conversation ID first.")
         else:
             response = httpx.get(
-                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_show}",
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_for_action}",
                 timeout=30,
             )
             response.raise_for_status()
             st.json(response.json())
     if conversation_col3.button("Delete conversation"):
-        if not conversation_id_to_delete:
+        if not conversation_id_for_action:
             st.warning("Enter a conversation ID first.")
         else:
             response = httpx.delete(
-                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_delete}",
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_for_action}",
                 timeout=30,
             )
             response.raise_for_status()
             st.json(response.json())
     if conversation_col4.button("Close conversation"):
-        if not conversation_id_to_close:
+        if not conversation_id_for_action:
             st.warning("Enter a conversation ID first.")
         else:
             response = httpx.post(
-                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_to_close}/close",
+                f"{API_BASE_URL}/api/memory/conversations/{conversation_id_for_action}/close",
                 json={
                     "closure_reason": conversation_close_reason or "user_closed",
                     "extract_candidates": conversation_extract_candidates,
@@ -712,9 +713,7 @@ with tabs[5]:
         )
         response.raise_for_status()
         st.json(response.json())
-    recent_status_id_to_delete = _clean_id_input(st.text_input("Recent status ID to delete"))
-    recent_status_id_to_expire = _clean_id_input(st.text_input("Recent status ID to expire"))
-    recent_status_id_to_renew = _clean_id_input(st.text_input("Recent status ID to renew"))
+    recent_status_id_for_action = _clean_id_input(st.text_input("Recent status ID"))
     recent_status_new_valid_until = st.text_input("New recent status valid_until", placeholder="2026-06-17T12:00:00Z")
     status_col1, status_col2, status_col3, status_col4, status_col5, status_col6, status_col7 = st.columns(7)
     if status_col1.button("Load current recent status"):
@@ -742,32 +741,32 @@ with tabs[5]:
         response.raise_for_status()
         st.json(response.json())
     if status_col4.button("Delete recent status entry"):
-        if not recent_status_id_to_delete:
+        if not recent_status_id_for_action:
             st.warning("Enter a recent status ID first.")
         else:
             response = httpx.delete(
-                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_delete}",
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_for_action}",
                 timeout=30,
             )
             response.raise_for_status()
             st.json(response.json())
     if status_col5.button("Expire recent status"):
-        if not recent_status_id_to_expire:
+        if not recent_status_id_for_action:
             st.warning("Enter a recent status ID first.")
         else:
             response = httpx.post(
-                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_expire}/expire",
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_for_action}/expire",
                 json={"reason": "user_expired_from_memory_tab"},
                 timeout=30,
             )
             response.raise_for_status()
             st.json(response.json())
     if status_col6.button("Renew recent status"):
-        if not recent_status_id_to_renew or not recent_status_new_valid_until:
+        if not recent_status_id_for_action or not recent_status_new_valid_until:
             st.warning("Enter a recent status ID and new valid_until first.")
         else:
             response = httpx.patch(
-                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_to_renew}/valid-until",
+                f"{API_BASE_URL}/api/memory/recent-status/{recent_status_id_for_action}/valid-until",
                 json={"valid_until": recent_status_new_valid_until},
                 timeout=30,
             )
@@ -785,7 +784,8 @@ with tabs[5]:
     st.markdown("#### Context")
     memory_query = st.text_input("Memory query", value="How should I train today?")
     memory_conversation_id = _clean_id_input(st.text_input("Conversation ID", placeholder="Optional"))
-    if st.button("Build memory context"):
+    context_col1, context_col2, context_col3 = st.columns(3)
+    if context_col1.button("Build memory context"):
         response = httpx.get(
             f"{API_BASE_URL}/api/memory/context",
             params={
@@ -797,11 +797,22 @@ with tabs[5]:
             timeout=30,
         )
         response.raise_for_status()
-        st.json(response.json())
-    if st.button("Search episodes"):
+        payload = response.json()
+        for warning in payload.get("budget_warnings", []):
+            st.warning(warning.get("message", str(warning)))
+        st.json(payload)
+    if context_col2.button("Search episodes"):
         response = httpx.get(
             f"{API_BASE_URL}/api/memory/episodes/search",
             params={"user_id": memory_user_id, "query": memory_query},
+            timeout=30,
+        )
+        response.raise_for_status()
+        st.json(response.json())
+    if context_col3.button("List all episodes"):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/episodes/search",
+            params={"user_id": memory_user_id, "query": "", "top_k": 100},
             timeout=30,
         )
         response.raise_for_status()

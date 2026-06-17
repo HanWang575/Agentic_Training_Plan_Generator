@@ -14,6 +14,7 @@ This file records implementation assumptions and instruction gaps without changi
 - Added token-based working-memory windowing: when unsummarized working-memory text exceeds the working-memory token budget, the oldest unsummarized messages are summarized until the remaining live raw window is about 30% of that budget.
 - Added pre-summary memory extraction so user messages about to leave the live working-memory window create reviewable candidate memory items before the rolling summary cursor advances.
 - Added LLM-backed rolling-summary compaction for oversized working-memory windows, with deterministic fallback.
+- Added rolling-summary self-compression: when the persisted rolling summary exceeds its own section budget, an LLM rewrites it toward about 50% of that budget when available; deterministic fallback drops the oldest summary lines.
 - Added idempotent conversation close behavior that writes one episode per conversation.
 - Added lazy inactivity closure for open conversations with no update for more than one hour. The close is triggered when conversations are next listed, inspected, or reused because there is no background scheduler in this block.
 - Added closed-conversation reuse behavior: if a user continues a closed conversation ID, the conversation is reopened before new turns are appended.
@@ -28,8 +29,8 @@ This file records implementation assumptions and instruction gaps without changi
 - Added Xunji training-log import with idempotence by external ID or checksum and simple normalized training sessions.
 - Added memory-context retrieval with profile, recent status, episodic memory, working memory, conditional active-plan context, and imported training-log summary sections.
 - Profile and recent-status context now keeps only the latest value per key so downstream LLM nodes do not see conflicting duplicate key/value entries.
-- Added LLM-backed active-plan context routing and memory context compaction, with deterministic keyword/trim fallbacks and global `MEMORY_CONTEXT_MAX_TOKENS` behavior through settings.
-- Added `GET /api/memory/context` so the UI and callers can request full compact memory context by `user_id` with optional `conversation_id`.
+- Added LLM-backed active-plan context routing with deterministic keyword fallback and global memory-context token-budget warning behavior through settings.
+- Added `GET /api/memory/context` so the UI and callers can request full memory context by `user_id` with optional `conversation_id`.
 - Added `GET /api/memory/users` so the frontend can show existing local user IDs.
 - Added `GET /api/memory/conversations` so the frontend can show existing local conversations.
 - Added `GET /api/memory/conversations/{conversation_id}` so the frontend can inspect one conversation with all saved messages.
@@ -47,7 +48,7 @@ The Q&A block was intentionally changed only at the optional memory boundary:
 
 - `AskQuestionRequest` now accepts optional `user_id`, `conversation_id`, `include_memory`, and `memory_debug`.
 - `QAService.ask()` accepts the same optional fields.
-- When `include_memory=true`, `QAService` asks `MemoryService` for a compact context and passes it to answer generation.
+- When `include_memory=true`, `QAService` asks `MemoryService` for memory context and passes it to answer generation.
 - Q&A retrieval from approved evidence remains separate from user memory retrieval.
 - The answer prompt labels memory as "personalization only" and says not to treat memory as evidence for scientific claims.
 - If `user_id` is supplied, `QAService` ensures the memory conversation exists, auto-generating a `conv_...` ID when `conversation_id` is blank or reopening a closed supplied conversation ID, then best-effort logs the user question and assistant answer through `MemoryService.append_message()`.
@@ -65,9 +66,10 @@ The Q&A block was intentionally changed only at the optional memory boundary:
 - Conflict handling for manual profile edits updates the current approved field directly because the edit is already user-provided. LLM-extracted candidates still require review before they affect profile or status context.
 - Plan progress is tracked, but this block does not generate training plans.
 - Training-log import is intentionally provider-tolerant because the exact Xunji payload schema was not provided. The raw payload is stored for audit, and common session fields are normalized when present.
-- Working-memory windowing uses the `MemoryContextCompactor` working-memory section cap as its budget. The rolling-summary cursor prevents already summarized turns from re-entering the live working-memory window, but all raw messages remain stored for audit and conversation inspection.
+- Working-memory windowing uses the configured working-memory section token budget. The rolling-summary cursor prevents already summarized turns from re-entering the live working-memory window, but all raw messages remain stored for audit and conversation inspection.
+- Rolling-summary self-compression is intentionally persistent because `Conversation.rolling_summary` is already a lossy working-memory artifact. Raw conversation messages remain stored for audit and future episode creation.
 - Pre-summary extraction creates candidates without requiring a closed episode. When the conversation is later closed, those existing candidates are linked to the episode instead of being re-created.
-- Memory context compaction first applies deterministic budget enforcement and uses the LLM compactor when trimming is needed and the chat provider is available.
+- Memory context retrieval no longer trims or summarizes sections at the final prompt stage. If a section or the whole assembled context exceeds its configured budget, `MemoryService` returns user-visible `budget_warnings` and leaves the context text unchanged.
 - Conversation inactivity closure is lazy, not scheduled. It runs when the memory service touches conversations, including listing, detail/context access, and reuse before appending new messages.
 - The Streamlit Memory tab is a developer/debug UI, not a polished final user experience.
 - User-supplied conversation IDs are accepted for local debugging and Chat-tab continuity. Reusing an existing conversation ID for a different user is rejected to avoid cross-user working-memory mixing.

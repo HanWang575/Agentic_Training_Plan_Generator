@@ -12,7 +12,7 @@ Core responsibilities:
 - Maintain recent status memory: sleep, soreness, pain, illness, stress, availability, readiness, and other short-lived state.
 - Maintain basic training plan progress: active plan ID, plan version, planned sessions, completed/missed/adapted sessions, completion timestamps, and feedback; retrieve full details only when plan context is relevant.
 - Maintain historical training logs imported from `训记` API only in v1.
-- Retrieve a compact `MemoryContext` for Q&A, future program generation, and nutrition coaching.
+- Retrieve a structured `MemoryContext` for Q&A, future program generation, and nutrition coaching.
 
 Out of scope for v1:
 
@@ -130,12 +130,12 @@ flowchart TD
         PSUM --> ROUTER
         PFULL --> ROUTER
         TRET --> ROUTER
-        ROUTER --> COMPACT["Compact MemoryContext with memory IDs, provenance, and recency"]
+        ROUTER --> CONTEXT["Build MemoryContext with memory IDs, provenance, and recency"]
     end
 
-    COMPACT --> QA["Evidence-Based Q&A Assistant"]
-    COMPACT --> GEN["Future Training Program Review/Generator"]
-    COMPACT --> NUTRI["Future Nutrition Coaching"]
+    CONTEXT --> QA["Evidence-Based Q&A Assistant"]
+    CONTEXT --> GEN["Future Training Program Review/Generator"]
+    CONTEXT --> NUTRI["Future Nutrition Coaching"]
 ```
 
 ## 4. Store And Retrieve Rules By Memory Type
@@ -317,21 +317,21 @@ Expiration workflow:
 - If the user does not respond before expiry, hide it from normal memory context but keep it in storage for audit and future review.
 - Expiry reminders should include the status key, value, source, current `valid_until`, and a suggested new date when renewal is reasonable.
 
-## 7. Memory Context Token Budgets And Compaction
+## 7. Memory Context Token Budgets And Warnings
 
-The app uses `gpt-5.4-mini` for normal generation, but v1 should not rely on filling the model's whole context window. The memory layer should feed a compact, predictable `MemoryContext` into Q&A and future planning flows.
+The app uses `gpt-5.4-mini` for normal generation, but v1 should not rely on filling the model's whole context window. The memory layer should feed a predictable `MemoryContext` into Q&A and future planning flows.
 
 Default memory-context budget:
 
-| Memory context section | Default max tokens before compaction | Compaction behavior |
-|---|---:|---|
-| Recent conversation messages | 6000 | Keep the newest turns; move older useful details into `rolling_summary`. |
-| Rolling conversation summary | 2000 | Rewrite into a shorter summary preserving open questions and commitments. |
-| Episodic memories | 6000 | Keep top-ranked episodes; summarize older or lower-ranked episodes into one paragraph with episode IDs. |
-| Long-term profile facts | 3000 | Keep profile facts as key-value lines with provenance; omit unknown or empty fields. |
-| Recent status | 3000 | Keep active safety/readiness statuses first; include editable `valid_until` values and renewal prompts when relevant. |
-| Active plan progress | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `10000` add-on for `full` | Include no details, summary fields, or full active-plan details according to LLM-selected `plan_context_level`. |
-| Historical training log summary | 4000 | Keep recent sessions and key trends; summarize older history into weekly/monthly totals. |
+| Memory context section | Default token budget |
+|---|---:|
+| Recent conversation messages | 6000 |
+| Rolling conversation summary | 2000 |
+| Episodic memories | 6000 |
+| Long-term profile facts | 3000 |
+| Recent status | 3000 |
+| Active plan progress | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `10000` add-on for `full` |
+| Historical training log summary | 4000 |
 
 Global rule:
 
@@ -339,12 +339,10 @@ Global rule:
 - Default non-plan memory budget: `24000` tokens.
 - Active plan summary add-on budget: up to `1000` tokens when `plan_context_level=summary`, for a total summary-mode ceiling of `25000` tokens.
 - Conditional active-plan full-detail add-on budget: up to `10000` tokens when `plan_context_level=full`, for a total full-mode ceiling of `34000` tokens.
-- If any section exceeds its section cap, compact that section automatically before prompt assembly.
-- If the whole `MemoryContext` still exceeds `MEMORY_CONTEXT_MAX_TOKENS`, compact in this order: historical logs, episodic memories, recent conversation messages, rolling summary, long-term profile, recent status, active plan progress.
-- Do not compact or overwrite canonical database rows. Compaction only changes the temporary prompt payload.
-- Compacted text must preserve memory IDs, timestamps, review status, and safety-relevant flags when those details affect the answer or plan.
-- For the future Training Program Review/Generator, active plan details are protected. Compaction may summarize old plan feedback and low-impact event history, but it must preserve the current active plan structure, planned sessions, per-session completion status, and timestamps. If the active plan still does not fit, the context should include the full active plan as a structured payload or retrievable plan reference rather than a lossy summary.
-- A deterministic compactor should run first by filtering, sorting, and trimming. If the section is still too long, an LLM compaction node may summarize it with a strict structured-output schema.
+- If any section exceeds its section cap, return a user-visible `budget_warnings` entry instead of trimming the section.
+- If the whole `MemoryContext` exceeds the active global budget, return a global `budget_warnings` entry.
+- Do not overwrite canonical database rows or mutate the temporary prompt payload during final memory-context assembly.
+- For the future Training Program Review/Generator, active plan details are protected. If the active plan does not fit, the context should include a warning and future retrieval should use a structured payload or retrievable plan reference rather than a lossy summary.
 
 ### Conditional Active Plan Context
 
@@ -368,12 +366,12 @@ Routing rules:
 
 ## 8. LangGraph Nodes
 
-Each node should be a small Python function or class with clear input and output. V1 can use one memory workflow graph with conditional paths for conversation storage, episode creation, memory retrieval, and context compaction. Basic request validation should stay in FastAPI/Pydantic and service methods; a separate validation-only graph node is not needed in v1.
+Each node should be a small Python function or class with clear input and output. V1 can use one memory workflow graph with conditional paths for conversation storage, episode creation, memory retrieval, and budget-warning checks. Basic request validation should stay in FastAPI/Pydantic and service methods; a separate validation-only graph node is not needed in v1.
 
 | Node | Type | Input | Output | Responsibility |
 |---|---|---|---|---|
 | `MessageAppender` | Deterministic code, no LLM | Conversation ID, role, message content, source block | Stored `ConversationMessage` | Save each conversation turn for working memory and future episode creation. |
-| `RollingSummaryUpdater` | LLM node with deterministic threshold | Conversation messages, existing rolling summary | Updated rolling summary or no-op | Compact older turns when a conversation becomes long while preserving unresolved facts and commitments. |
+| `RollingSummaryUpdater` | LLM node with deterministic threshold and fallback | Conversation messages, existing rolling summary | Updated rolling summary or no-op | Compact older turns when a conversation becomes long, then rewrite oversized rolling summaries toward the summary budget. |
 | `ConversationClosureDetector` | Deterministic code, optional LLM assist | Conversation status, user action, inactivity, task completion signals | Closure decision and closure reason | Decide when a conversation should be closed and sent to episodic summarization. |
 | `EpisodeSummarizer` | LLM node | Closed conversation messages, rolling summary | `Episode` summary, topics, importance, source message IDs | Convert a closed conversation into a permanent episodic memory. |
 | `MemoryExtractor` | LLM node with structured output | Conversation messages or episode summary | Candidate `MemoryItem` records | Propose profile, preference, recent status, constraint, performance, or plan-relevant memories. |
@@ -390,8 +388,8 @@ Each node should be a small Python function or class with clear input and output
 | `PlanContextRouter` | LLM node with deterministic fallback | Latest user query, task type, topic hint, conversation summary, active-plan existence flag | `plan_context_level`: `none`, `summary`, or `full`; rationale; confidence | Decide how much active-plan context to retrieve before building the final memory context. |
 | `MemoryRetriever` | Deterministic retrieval plus optional semantic search | User ID, task type, query, filters, `plan_context_level` | Profile facts, active recent status, episodes, conditional plan progress, log summaries | Retrieve memory candidates for Q&A, program generation, nutrition, or debug views without loading full plan details unless needed. |
 | `MemoryContextBuilder` | Deterministic code, no LLM | Retrieved memories, task type, `plan_context_level` | Draft `MemoryContext` sections | Assemble compact, categorized context with memory IDs, timestamps, provenance, recency, and conditional plan detail. |
-| `MemoryContextCompactor` | Deterministic code first; optional LLM fallback | Draft `MemoryContext`, section token caps | Final bounded `MemoryContext` | Enforce per-section and global token budgets before the final prompt. |
-| `MemoryTraceLogger` | Deterministic code, no LLM | Full memory workflow state | Stored memory trace/debug record | Log retrieved memory IDs, compaction decisions, candidate extraction, review status, timings, and errors. |
+| `MemoryBudgetWarningBuilder` | Deterministic code, no LLM | Draft `MemoryContext`, section token caps, global token cap | Budget warning list | Report over-budget sections without trimming the memory context. |
+| `MemoryTraceLogger` | Deterministic code, no LLM | Full memory workflow state | Stored memory trace/debug record | Log retrieved memory IDs, budget warnings, candidate extraction, review status, timings, and errors. |
 
 Graph state should be a typed object with these fields:
 
@@ -416,7 +414,7 @@ active_plan_progress
 training_log_summary
 retrieved_episodes
 memory_context
-compaction_report
+budget_warnings
 memory_debug_ids
 errors
 timings
@@ -471,7 +469,7 @@ Extend `POST /api/qa/ask` with optional:
 }
 ```
 
-When enabled, Q&A receives compact memory context, but evidence retrieval remains separate from user memory retrieval.
+When enabled, Q&A receives memory context, but evidence retrieval remains separate from user memory retrieval.
 
 ### MCP Tools
 
@@ -509,13 +507,13 @@ When enabled, Q&A receives compact memory context, but evidence retrieval remain
 - New `RecentStatus` records receive estimated editable `valid_until` values.
 - Recent status near expiry prompts the user to expire or renew it.
 - Expired recent status is excluded from default context.
-- Memory context assembly enforces every section token budget and triggers compaction when a section exceeds its cap.
-- Global memory context compaction keeps the final `MemoryContext` under `MEMORY_CONTEXT_MAX_TOKENS`.
+- Memory context assembly returns budget warnings when any section exceeds its token budget.
+- Global memory context assembly returns a budget warning when the final `MemoryContext` exceeds the active context budget.
 - `PlanContextRouter` uses the latest user query to classify unrelated Q&A requests as `plan_context_level=none` and does not load active plan details.
 - `PlanContextRouter` uses the latest user query to classify mildly training-related requests as `plan_context_level=summary` and includes only plan summary fields.
 - `PlanContextRouter` uses the latest user query to classify plan review/update requests as `plan_context_level=full` and includes the full active plan within the conditional plan add-on budget.
-- Active plan details remain available to the future Program Generator even after context compaction.
-- Q&A with `include_memory=true` receives compact memory context and debug memory IDs.
+- Active plan details remain available to the future Program Generator; oversized active-plan context should produce a warning rather than a lossy final-stage summary.
+- Q&A with `include_memory=true` receives memory context and debug memory IDs.
 - `训记` imports are idempotent by external ID/checksum.
 - Training log summaries can be retrieved after import.
 - Active plan progress updates create events instead of overwriting history.

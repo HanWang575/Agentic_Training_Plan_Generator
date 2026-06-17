@@ -64,7 +64,7 @@ def upload_source(
         temp_path = Path(temp_file.name)
     try:
         if temp_path.stat().st_size > settings.maximum_upload_bytes:
-            raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
+            raise HTTPException(status_code=413, detail="File is larger than the 400 MB v1 limit.")
         return service.upload_file(
             temp_path,
             title=inferred_title,
@@ -96,7 +96,7 @@ def upload_source_async(
         temp_path = Path(temp_file.name)
     try:
         if temp_path.stat().st_size > settings.maximum_upload_bytes:
-            raise HTTPException(status_code=413, detail="File is larger than the 100 MB v1 limit.")
+            raise HTTPException(status_code=413, detail="File is larger than the 400 MB v1 limit.")
         source_id = service.create_pending_upload(
             temp_path,
             title=inferred_title,

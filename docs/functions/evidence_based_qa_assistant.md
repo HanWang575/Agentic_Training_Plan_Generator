@@ -114,7 +114,7 @@ Use these choices for v1 unless the project owner explicitly changes them before
 - EPUB: `ebooklib` plus `BeautifulSoup`.
 - Markdown/text: standard Python file reading.
 - JSON: standard Python JSON loader, especially for structured nutrition data.
-- Maximum upload size for v1: 100 MB per file.
+- Maximum upload size for v1: 400 MB per file.
 - Supported file types for v1: `.pdf`, `.epub`, `.md`, `.txt`, `.json`.
 - Rule: parsing should produce plain text plus metadata before any indexing happens.
 

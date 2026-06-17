@@ -396,7 +396,7 @@ class TrainingLogSummaryResponse(BaseModel):
 
 
 class MemoryContextOut(BaseModel):
-    """Compact memory context sent to other blocks."""
+    """Memory context sent to other blocks."""
 
     user_id: str
     conversation_id: str | None = None
@@ -407,7 +407,7 @@ class MemoryContextOut(BaseModel):
     sections: dict[str, str] = Field(default_factory=dict)
     memory_ids: list[str] = Field(default_factory=list)
     token_estimate: int = 0
-    compaction_report: dict[str, Any] = Field(default_factory=dict)
+    budget_warnings: list[dict[str, Any]] = Field(default_factory=list)
     debug: dict[str, Any] | None = None
     trace_id: str | None = None
 
@@ -439,7 +439,7 @@ class MemoryWorkflowState(TypedDict, total=False):
     training_log_summary: TrainingLogSummaryResponse | None
     retrieved_episodes: list[EpisodeOut]
     memory_context: MemoryContextOut
-    compaction_report: dict[str, Any]
+    budget_warnings: list[dict[str, Any]]
     memory_debug_ids: list[str]
     errors: list[str]
     timings: dict[str, int]

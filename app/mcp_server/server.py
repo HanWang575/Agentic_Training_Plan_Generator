@@ -79,7 +79,7 @@ def create_mcp_server():
         conversation_id: str | None = None,
         task_type: str = "qa",
     ) -> dict:
-        """Return compact memory context for another function block."""
+        """Return memory context for another function block."""
 
         with Session(engine) as session:
             service = MemoryService(session=session, settings=get_settings())

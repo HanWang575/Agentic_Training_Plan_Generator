@@ -2,14 +2,14 @@
 
 This repository now includes the second function block: the User Profile And Memory system.
 
-The block stores local, inspectable personalization data for the personal trainer AI. It keeps working conversation memory, episodic summaries, reviewable candidate memories, approved profile fields, short-lived recent status, active plan progress, and imported training logs. The Q&A block can optionally request compact memory context without reading memory tables directly.
+The block stores local, inspectable personalization data for the personal trainer AI. It keeps working conversation memory, episodic summaries, reviewable candidate memories, approved profile fields, short-lived recent status, active plan progress, and imported training logs. The Q&A block can optionally request memory context without reading memory tables directly.
 
 ## Folder Guide
 
 - `app/memory/`
   - Memory key catalogs, typed API schemas, graph-compatible nodes, and the service layer.
 - `app/memory/prompts.py`
-  - JSON-only prompts for LLM-backed memory routing, summarization, extraction, key review, and compaction.
+  - JSON-only prompts for LLM-backed memory routing, summarization, extraction, and key review.
 - `app/api/routes_memory.py`
   - FastAPI routes under `/api/memory`.
 - `app/storage/models.py`
@@ -21,7 +21,7 @@ The block stores local, inspectable personalization data for the personal traine
 - `tests/test_memory_service.py`
   - Focused tests for profile, recent status, conversation close, deletion controls, candidate review, plan progress, and Xunji import.
 - `tests/test_qa_memory_integration.py`
-  - Verifies that Q&A can receive compact memory context and log Q&A turns.
+  - Verifies that Q&A can receive memory context and log Q&A turns.
 - `docs/implementation_notes/user_profile_and_memory_notes.md`
   - Implementation assumptions, instruction gaps, QA changes, and verification notes.
 
@@ -32,7 +32,7 @@ The block stores local, inspectable personalization data for the personal traine
 - Append-message API for working memory.
 - Token-based working-memory window: when unsummarized conversation turns exceed the working-memory budget, the oldest turns are folded into the rolling summary until the live raw window is about 30% of that budget.
 - Pre-summary memory extraction: before old working-memory turns are folded into the rolling summary, the same user turns are processed into reviewable candidate memory items so useful profile/status facts are not hidden by summarization.
-- LLM-backed rolling summary for oversized working-memory windows, with deterministic fallback.
+- LLM-backed rolling summary for oversized working-memory windows, with deterministic fallback and LLM-backed self-compression for oversized rolling summaries. If the compression LLM is unavailable or still returns too much text, the deterministic fallback drops oldest summary content.
 - Conversation close API that writes one episode idempotently, updates the episode after reopened conversations add new turns, and extracts candidates only from newly unprocessed messages.
 - Lazy one-hour inactivity closure for open conversations when they are next listed or reused.
 - LLM-backed episode summaries, completed-plan episodes, and candidate memory extraction, with deterministic fallbacks.
@@ -44,8 +44,9 @@ The block stores local, inspectable personalization data for the personal traine
 - Explicit delete routes for user-owned memory, conversations, profile entries, and recent-status entries.
 - Active plan progress tracking with append-only events.
 - Xunji import storage and simple training-session normalization.
-- Compact memory context retrieval for Q&A and future blocks.
-- LLM-backed active-plan context routing and context compaction, with deterministic fallback.
+- Memory context retrieval for Q&A and future blocks.
+- LLM-backed active-plan context routing with deterministic fallback.
+- Memory context token-budget warnings when assembled sections exceed their configured budgets.
 - Optional Chroma episode indexing when embeddings are configured.
 - MCP tools that call the same `MemoryService` methods.
 
@@ -375,7 +376,7 @@ Invoke-RestMethod `
   -Body $reject
 ```
 
-### 11. Retrieve Compact Memory Context
+### 11. Retrieve Memory Context
 
 ```powershell
 Invoke-RestMethod `
@@ -483,7 +484,7 @@ Invoke-RestMethod `
 Expected behavior:
 
 - Q&A still retrieves approved evidence through the Q&A knowledge block.
-- `debug.memory_context` shows the compact memory payload.
+- `debug.memory_context` shows the memory payload and any token-budget warnings.
 - `debug.memory_debug_ids` lists memory rows used.
 - The response and Q&A trace store `user_id`, `conversation_id`, memory context, and memory IDs.
 - The conversation receives a user message and an assistant message with `source_block="qa"`.
@@ -547,7 +548,7 @@ Run user deletion last if you still need `usr_local` for later tutorial steps.
 Start the backend first, then run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run app/ui/streamlit_app.py --server.port 8501
+.\.venv\Scripts\python.exe -m streamlit run app/ui/streamlit_app.py --server.port 8501 --server.maxUploadSize 400
 ```
 
 Open:

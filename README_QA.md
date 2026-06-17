@@ -554,7 +554,7 @@ python -m pip install streamlit httpx
 Start the backend first, then run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run app/ui/streamlit_app.py --server.port 8501
+.\.venv\Scripts\python.exe -m streamlit run app/ui/streamlit_app.py --server.port 8501 --server.maxUploadSize 400
 ```
 
 Open:

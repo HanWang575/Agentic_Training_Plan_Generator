@@ -65,6 +65,28 @@ def build_rolling_summary_prompt(existing_summary: str, messages: list[dict[str,
     )
 
 
+def build_rolling_summary_compression_prompt(rolling_summary: str, target_tokens: int) -> str:
+    """Build a JSON-only prompt for compressing an oversized rolling summary."""
+
+    return (
+        "You are the RollingSummaryCompressor for a personal trainer memory system.\n"
+        "Rewrite an oversized rolling conversation summary so it fits the target budget.\n\n"
+        "Rules:\n"
+        "- Preserve unresolved user commitments, pending questions, durable constraints, goals, injuries, "
+        "preferences, recent readiness issues, and important assistant commitments.\n"
+        "- Prefer current and unresolved facts over stale details.\n"
+        "- Do not invent facts.\n"
+        "- Keep the summary concise and readable.\n"
+        "- Return JSON only.\n\n"
+        f"Target budget: about {target_tokens} tokens.\n\n"
+        f"Oversized rolling summary:\n{rolling_summary or ''}\n\n"
+        "Return exactly this JSON shape:\n"
+        "{\n"
+        '  "rolling_summary": "rewritten compact summary"\n'
+        "}"
+    )
+
+
 def build_episode_summary_prompt(
     title: str | None,
     topic: str | None,
@@ -170,33 +192,6 @@ def build_memory_key_proposal_prompt(
         '  "nearest_existing_keys": ["existing_key"],\n'
         '  "canonical_key": "existing_key_or_empty",\n'
         '  "reason": "short reason"\n'
-        "}"
-    )
-
-
-def build_memory_context_compactor_prompt(
-    sections: dict[str, str],
-    section_caps: dict[str, int],
-    max_tokens: int,
-) -> str:
-    """Build a JSON-only prompt for bounded memory-context compaction."""
-
-    return (
-        "You are the MemoryContextCompactor for a personal trainer memory system.\n"
-        "Compact memory-context sections so they fit the supplied budgets.\n\n"
-        "Rules:\n"
-        "- Preserve memory IDs, timestamps, review status, safety-relevant flags, and provenance markers when present.\n"
-        "- Preserve the newest working-memory turns and the current active plan details when possible.\n"
-        "- Do not alter canonical facts; only shorten the temporary prompt payload.\n"
-        "- Keep section names unchanged.\n"
-        "- Return JSON only.\n\n"
-        f"Global max tokens: {max_tokens}\n"
-        f"Section caps:\n{_json(section_caps)}\n\n"
-        f"Sections:\n{_json(sections)}\n\n"
-        "Return exactly this JSON shape:\n"
-        "{\n"
-        '  "sections": {"section_name": "compacted text"},\n'
-        '  "compaction_report": {"section_name": {"reason": "llm_compaction"}}\n'
         "}"
     )
 
