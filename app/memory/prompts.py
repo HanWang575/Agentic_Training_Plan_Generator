@@ -196,6 +196,34 @@ def build_memory_key_proposal_prompt(
     )
 
 
+def build_training_sport_type_prompt(session_payload: dict[str, Any], allowed_labels: list[str]) -> str:
+    """Build a JSON-only prompt for Xunji training-session sport labeling."""
+
+    return (
+        "You are the TrainingSportTypeClassifier for a personal trainer memory system.\n"
+        "Classify one imported Xunji training session into exactly one allowed sport type label.\n\n"
+        "Allowed labels:\n"
+        f"{_json(allowed_labels)}\n\n"
+        "Guidance:\n"
+        "- strength: resistance training, bodybuilding, powerlifting, weighted exercises, machines, sets/reps.\n"
+        "- running: outdoor running, treadmill running, indoor running, or Apple Health Running sessions.\n"
+        "- other aerobic exercise: cycling, rowing, elliptical, swimming, long steady cardio that is not running.\n"
+        "- other anaerobic exercise: sprint-only, jump-only, throw-only, short explosive work that is not strength.\n"
+        "- other Mixed Aerobic-Anaerobic Exercise: circuits, HYROX-style, CrossFit-style, conditioning, intervals, "
+        "or sessions mixing cardio and resistance/anaerobic elements.\n\n"
+        "Rules:\n"
+        "- Return JSON only.\n"
+        "- Do not invent a label outside the allowed list.\n"
+        "- Use title, movement names, set metrics, duration, distance, and notes when available.\n\n"
+        f"Training session payload:\n{_json(session_payload)}\n\n"
+        "Return exactly this JSON shape:\n"
+        "{\n"
+        '  "sport_type": "one allowed label",\n'
+        '  "reason": "short reason"\n'
+        "}"
+    )
+
+
 def build_completed_plan_episode_prompt(plan_payload: dict[str, Any]) -> str:
     """Build a JSON-only prompt for completed-plan episodic summaries."""
 

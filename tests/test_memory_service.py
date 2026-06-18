@@ -1,7 +1,7 @@
 """User Profile and Memory service behavior."""
 
 import json
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlmodel import Session, select
@@ -14,7 +14,12 @@ from app.core.llm_provider import (
     MemoryPlanRouteResult,
 )
 from app.memory.nodes import estimate_tokens
-from app.memory.schemas import MemoryItemApproveRequest, PlanProgressPatchRequest, TrainingLogImportRequest
+from app.memory.schemas import (
+    MemoryItemApproveRequest,
+    PlanProgressPatchRequest,
+    TrainingLogImportRequest,
+    TrainingLogXunjiSyncRequest,
+)
 from app.memory.service import MemoryService, ROLLING_SUMMARY_TARGET_RATIO, ROLLING_SUMMARY_TOKEN_BUDGET
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import (
@@ -105,6 +110,12 @@ class FakeMemoryLLMProvider:
             topics=["training_plan", "plan_completion", "adherence"],
             importance=0.8,
         )
+
+    def classify_training_sport_type(self, request):
+        title = str(request.session_payload.get("title") or "").lower()
+        if "run" in title or "跑步" in title:
+            return "running"
+        return "strength"
 
 
 def test_manual_profile_and_recent_status_appear_in_context(tmp_path: Path):
@@ -837,4 +848,141 @@ def test_xunji_import_is_idempotent_and_summarized(tmp_path: Path):
     assert duplicate.skipped_duplicate is True
     assert summary.session_count == 1
     assert summary.sport_counts == {"strength": 1}
+    context = service.get_memory_context("usr_test", query="Review my recent training.")
+    training_summary = context.sections["training_log_summary"]
+    assert "exercises_count: 1" in training_summary
+    assert "Squat" in training_summary
+    assert "sets_summary" in training_summary or "sets=3" in training_summary
+    assert "notes=Felt solid." in training_summary
+    session.close()
+
+
+def test_xunji_import_labels_sport_type_drops_overlapping_less_detailed_session_and_filters(tmp_path: Path):
+    """Xunji normalization should classify sessions, drop overlapping duplicates, and support filters."""
+
+    session, service = _make_service(tmp_path)
+    service = MemoryService(session=session, settings=service.settings, llm_provider=FakeMemoryLLMProvider())
+    service.create_user("usr_test")
+    base = datetime(2026, 6, 15, 10, 0, tzinfo=timezone.utc)
+    less_detailed_start = int(base.timestamp() * 1000)
+    less_detailed_end = int((base + timedelta(minutes=60)).timestamp() * 1000)
+    detailed_start = int((base + timedelta(minutes=10)).timestamp() * 1000)
+    detailed_end = int((base + timedelta(minutes=80)).timestamp() * 1000)
+    running_start = int((base + timedelta(hours=4)).timestamp() * 1000)
+    running_end = int((base + timedelta(hours=4, minutes=35)).timestamp() * 1000)
+
+    imported = service.import_xunji(
+        TrainingLogImportRequest(
+            user_id="usr_test",
+            external_id="xunji_overlap_batch",
+            payload={
+                "success": True,
+                "res": {
+                    "trains": [
+                        {
+                            "localid": "short",
+                            "datestr": "2026-06-15",
+                            "title": "Chest",
+                            "start": less_detailed_start,
+                            "end": less_detailed_end,
+                            "movements": [{"name": "Bench Press", "sets": [{"weight": 80, "reps": 5}]}],
+                        },
+                        {
+                            "localid": "detailed",
+                            "datestr": "2026-06-15",
+                            "title": "Strength detailed",
+                            "start": detailed_start,
+                            "end": detailed_end,
+                            "movements": [
+                                {
+                                    "name": "Bench Press",
+                                    "sets": [
+                                        {"weight": 80, "reps": 5, "time": 180},
+                                        {"weight": 85, "reps": 5, "time": 180},
+                                    ],
+                                },
+                                {"name": "Squat", "sets": [{"weight": 120, "reps": 3}]},
+                            ],
+                            "notes": "More complete import.",
+                        },
+                        {
+                            "localid": "run",
+                            "datestr": "2026-06-15",
+                            "title": "Running",
+                            "start": running_start,
+                            "end": running_end,
+                            "movements": [{"name": "Running", "sets": [{"metrics": {"distance": 5000}}]}],
+                        },
+                    ]
+                },
+            },
+        )
+    )
+
+    assert imported.sessions_imported == 2
+    assert len(imported.dropped_sessions) == 1
+    assert {item.title for item in imported.sessions} == {"Strength detailed", "Running"}
+    assert {item.sport_type for item in imported.sessions} == {"strength", "running"}
+    strength_only = service.list_training_sessions(
+        "usr_test",
+        start_date=date(2026, 6, 15),
+        end_date=date(2026, 6, 15),
+        sport_type="strength",
+    )
+    assert strength_only.session_count == 1
+    assert strength_only.sessions[0].title == "Strength detailed"
+    assert strength_only.sessions[0].duration_seconds == 70 * 60
+    assert "time" not in strength_only.sessions[0].exercises[0]["sets"][0]
+    assert "time" in strength_only.sessions[0].raw_payload["movements"][0]["sets"][0]
+    context = service.get_memory_context("usr_test", query="Review my recent training.")
+    training_summary = context.sections["training_log_summary"]
+    assert "Bench Press" in training_summary
+    assert "time=180" not in training_summary
+    session.close()
+
+
+def test_xunji_sync_reads_api_client_and_imports_each_day(tmp_path: Path, monkeypatch):
+    """The Xunji sync path should fetch day payloads and import them through the normal pipeline."""
+
+    class FakeXunjiClient:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def read_day(self, datestr, include_full_data=True, force_refresh=False):
+            return {
+                "success": True,
+                "res": {
+                    "trains": [
+                        {
+                            "localid": f"run_{datestr}",
+                            "datestr": datestr,
+                            "title": "Running",
+                            "start": f"{datestr}T06:00:00+00:00",
+                            "end": f"{datestr}T06:30:00+00:00",
+                            "movements": [{"name": "Running", "sets": [{"metrics": {"distance": 5000}}]}],
+                        }
+                    ]
+                },
+            }
+
+    monkeypatch.setattr("app.memory.service.XunjiClient", FakeXunjiClient)
+    session, service = _make_service(tmp_path)
+    service = MemoryService(session=session, settings=service.settings, llm_provider=FakeMemoryLLMProvider())
+    service.create_user("usr_test")
+
+    response = service.sync_xunji_training_logs(
+        TrainingLogXunjiSyncRequest(
+            user_id="usr_test",
+            start_date=date(2026, 6, 14),
+            end_date=date(2026, 6, 15),
+            include_full_data=True,
+        )
+    )
+
+    listed = service.list_training_sessions("usr_test", sport_type="running")
+    assert response.days_requested == 2
+    assert len(response.imports) == 2
+    assert response.errors == []
+    assert listed.session_count == 2
+    assert {item.title for item in listed.sessions} == {"Running"}
     session.close()

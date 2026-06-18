@@ -2,20 +2,20 @@
 
 ## Summary
 
-The AI trainer will be organized as a modular coaching system made of independent function blocks. The Evidence-Based Q&A Assistant provides the shared evidence layer through user-uploaded materials, trusted references, and RAG. The User Profile And Memory block stores personalized user context with recency so other blocks can retrieve it when needed. The Training Log And Check-In System records daily training and food data, summarizes progress over time, and connects completed work with generated plans. The Training Program Review/Generator creates, explains, saves, and adapts training plans by combining user input, memory, logs, and evidence. The Nutrition Coaching block generates meal plans and daily nutrition education using the same shared evidence, memory, and log sources. External Integrations remain optional adapters for future tools such as wearables, calendars, and document sources.
+The AI trainer will be organized as a modular coaching system made of independent function blocks. The Evidence-Based Q&A Assistant provides the shared evidence layer through user-uploaded materials, trusted references, and RAG. The User Profile And Memory block stores personalized user context with recency so other blocks can retrieve it when needed. The Training Log, Check-In, And Program Review/Generator block records daily training data, summarizes progress over time, creates and adapts training plans, and connects planned training with completed work. External Integrations remain optional adapters for future tools such as wearables, calendars, and document sources.
 
 Detailed schemas, APIs, prompts, LangGraph workflows, tests, and implementation notes for each block should live in separate dedicated files later.
 
 ## Implementation Principle
 
-Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant, User Profile And Memory, Training Log And Check-In System, Training Program Review/Generator, Nutrition Coaching, and External Integrations. Each block should work as an independent service before later blocks depend on it.
+Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant, User Profile And Memory, Training Log, Check-In, And Program Review/Generator, and External Integrations. Each block should work as an independent service before later blocks depend on it.
 
 ## Shared Design Rules
 
 - Each function block owns its own data.
 - Other blocks should access data through stable service interfaces instead of reading another block's internal storage directly.
 - Human-editable data is preferred over hidden memory whenever the information may affect training, nutrition, or safety.
-- LLM outputs that affect trusted knowledge, user memory, active training plans, or meal plans should be reviewable by the user.
+- LLM outputs that affect trusted knowledge, user memory, or active training plans should be reviewable by the user.
 - The system should make it visible which evidence, memory, logs, and generated plans were used to produce important recommendations.
 
 ## Debugging Strategy
@@ -23,7 +23,7 @@ Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant
 - Log retrieved sources for every evidence-based answer.
 - Log memory items extracted from each conversation, including category and recency.
 - Log which function blocks were called for each major response.
-- Show the user which evidence and memory were used when generating training plans, nutrition plans, or personalized advice.
+- Show the user which evidence and memory were used when generating training plans or personalized advice.
 
 ## Function Roadmap
 
@@ -44,56 +44,33 @@ Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant
 - Core functions:
   - Store meaningful user-related information spotted by an LLM agent during conversation, such as recent sleep issues, injuries, disliked foods, current bench press PR, and any other information useful for planning exercise, relaxation, or food.
   - Store time recency for remembered information.
-  - Retrieve stored information whenever needed by other blocks, such as Training Program Review/Generator and Nutrition Coaching.
+  - Retrieve stored information whenever needed by other blocks, such as Training Log, Check-In, And Program Review/Generator.
 - Main stack: LangGraph memory/checkpointing, SQLite or Postgres, profile service, structured data models, memory extraction agent.
 - Data and pipelines: memory categories such as profile, preference, constraint, injury or health note, performance metric, recent status, and goal; goals, training history, equipment, schedule, preferences, limitations, injuries, disliked foods, recent issues, performance PRs, timestamps; memory extraction, classification, storage, review, retrieval, and recency-aware context selection.
 - Decoupling boundary: keep user memory separate from the evidence knowledge base and expose it through a stable memory retrieval service.
 - Safety and quality boundary: user memory should be visible and editable, especially when it may affect training, nutrition, recovery, or safety recommendations.
 
-### 3. Training Log And Check-In System
+### 3.Program Generator
 
-- Purpose: collect structured training and nutrition records, summarize progress, and connect planned training with completed training.
+- Purpose: monitor structured training records, summarize progress, create and adapt training plans, and connect planned training with completed training.
 - Core functions:
-  - Provide a simple interface for the user to modify their training log, supporting different sport-specific fields where needed. For example, bodybuilding and powerlifting logs may include exercise name, weight used, number of sets, reps, rest time between sets, RPE, and extra notes; marathon training logs may include distance, speed or total time, RPE, and extra notes.
-  - Provide a simple interface for the user to record what they have eaten, including food name, weight, and nutrition information such as protein per 100g and fat per 100g.
-  - Save training and food information in a structured daily format.
-  - Keep summary notes for every week, month, and year.
-  - Track the user's training plan if one has been generated by the Training Program Review/Generator.
-  - Provide a training log template to the user when there is a pre-generated training plan for today.
-- Main stack: FastAPI, database tables for logs, simple editing UI, structured extraction pipeline, scheduled summary jobs.
-- Data and pipelines: strength sessions, endurance sessions, food entries, nutrition values, daily logs, weekly/monthly/yearly summaries, generated plan references; log parsing, validation, summary generation, plan-to-log template generation, progress reporting.
-- Decoupling boundary: this block records and summarizes user activity; it may read planned sessions but should not generate or modify training plans.
-
-### 4. Training Program Review/Generator
-
-- Purpose: create, explain, save, and adapt training plans using user context, logs, and evidence.
-- Core functions:
-  - Generate a professional training plan based on information provided by the user, the User Profile And Memory block, the Training Log And Check-In System block, and the RAG system of the Evidence-Based Q&A Assistant block.
+  - Keep summary training notes for every week, month, and year.
+  - Generate a professional training plan based on information provided by the user, the User Profile And Memory block, training summaries, direct readiness/recovery feedback, and the professional knowledge retrieved from the RAG system of the Evidence-Based Q&A Assistant block.
   - Explain the rationale behind the generated training plan.
-  - Save the generated plan as a trackable training plan that can be used by the Training Log And Check-In System block after user approval.
+  - Modify the training plan according to user's feedback. 
+  - Save the generated plan as a trackable training plan and write it to Xunji through API after user approval.
+  - Track the user's active training plan and connect planned sessions with completed logs.
   - When current information is not sufficient to generate a professional training plan, ask the user for extra information such as goal, current training level, and number of days available in the coming week.
   - If the user is unable to achieve the plan because of sickness, meetings, poor sleep, insufficient training level, or other feedback, update and modify the training plan professionally using the user's feedback plus information from the relevant memory, log, and evidence sources.
-- Main stack: LangGraph planning workflow, structured output validation, program template library, RAG integration, memory retrieval, safety/review layer.
-- Data and pipelines: user profile, memory records, training logs, goals, constraints, availability, generated plan versions, plan status, evidence references; information sufficiency check, clarification, program drafting, rationale generation, volume/intensity review, progression planning, plan updating, safety review.
-- Decoupling boundary: consume profile, log, and Q&A/RAG services through stable interfaces; save plans in a format the Training Log And Check-In System can track.
+- Main stack: FastAPI, database tables for logs and plans, simple editing UI, structured extraction pipeline, scheduled summary jobs, LangGraph planning workflow, structured output validation, program template library, RAG integration, memory retrieval, safety/review layer.
+- Data and pipelines: strength sessions, endurance sessions, daily logs, weekly/monthly/yearly summaries, user profile, memory records, goals, constraints, availability, generated plan versions, plan status, evidence references; log parsing, validation, summary generation, information sufficiency check, clarification, program drafting, rationale generation, volume/intensity review, progression planning, plan-to-log template generation, plan updating, safety review, progress reporting.
+- Decoupling boundary: consume profile, memory, training-summary, and Q&A/RAG services through stable interfaces; keep program generation, plan summaries, and plan tracking behind this block's own service interface.
 - Safety and quality boundary: generated plans should start as drafts and become active tracked plans only after the user reviews and approves them.
 
-### 5. Nutrition Coaching
-
-- Purpose: provide personalized meal planning and lightweight daily nutrition education.
-- Core functions:
-  - Generate today's meal plan and corresponding nutrition plan using information from the RAG system of the Evidence-Based Q&A Assistant block, memory content from the User Profile And Memory block, and training/meal logs from the Training Log And Check-In System block.
-  - Show the user one nutrition fact every day for nutrition education, based on the same evidence, memory, and log sources.
-- Main stack: RAG, user profile memory, meal log retrieval, nutrition reference base, structured meal-plan generation, scheduled daily education message.
-- Data and pipelines: nutrition references, goals, dietary preferences, disliked foods, recent meal logs, training load, bodyweight trend if provided, generated meal plans, daily nutrition facts; nutrition context retrieval, target estimation, meal-plan generation, preference filtering, safety checking.
-- Decoupling boundary: consume memory, logs, and evidence through stable interfaces; remain separate from medical nutrition therapy and training-plan generation.
-- Safety and quality boundary: nutrition coaching is for general fitness education and meal planning only; it should not provide medical nutrition therapy, eating disorder support, extreme weight-loss plans, or disease-specific diet plans.
-
-### 6. External Integrations
+### 4. External Integrations
 
 - Purpose: connect optional external tools such as wearables, calendars, documents, or future data sources.
 - Core functions: `[To be defined by project owner]`
 - Main stack: MCP, integration adapters, sync jobs, import validators.
 - Data and pipelines: integration-specific imported data, sync metadata, permissions, source provenance; connector tools, data import, normalization, sync monitoring.
 - Decoupling boundary: each integration should be optional and replaceable; core coaching functions should continue working without integrations.
-

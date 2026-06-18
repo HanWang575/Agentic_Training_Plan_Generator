@@ -1,6 +1,6 @@
 """Pydantic schemas for the User Profile and Memory block."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, TypedDict
 
 from pydantic import BaseModel, Field
@@ -357,6 +357,16 @@ class TrainingLogImportRequest(BaseModel):
     provider: str = "xunji"
 
 
+class TrainingLogXunjiSyncRequest(BaseModel):
+    """Read Xunji training logs from the Open API and import them."""
+
+    user_id: str
+    start_date: date
+    end_date: date
+    include_full_data: bool = True
+    force_refresh: bool = False
+
+
 class TrainingSessionOut(BaseModel):
     """Normalized training session response."""
 
@@ -364,7 +374,11 @@ class TrainingSessionOut(BaseModel):
     user_id: str
     source_import_id: str
     external_id: str | None = None
+    title: str | None = None
     session_date: datetime
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    duration_seconds: int | None = None
     sport_type: str
     exercises: list[dict[str, Any]] = Field(default_factory=list)
     sets_summary: dict[str, Any] = Field(default_factory=dict)
@@ -382,7 +396,19 @@ class TrainingLogImportResponse(BaseModel):
     skipped_duplicate: bool = False
     sessions_imported: int = 0
     sessions: list[TrainingSessionOut] = Field(default_factory=list)
+    dropped_sessions: list[dict[str, Any]] = Field(default_factory=list)
     message: str | None = None
+
+
+class TrainingLogXunjiSyncResponse(BaseModel):
+    """Import result for a Xunji date-range sync."""
+
+    user_id: str
+    start_date: date
+    end_date: date
+    days_requested: int
+    imports: list[TrainingLogImportResponse] = Field(default_factory=list)
+    errors: list[dict[str, str]] = Field(default_factory=list)
 
 
 class TrainingLogSummaryResponse(BaseModel):
@@ -393,6 +419,17 @@ class TrainingLogSummaryResponse(BaseModel):
     session_count: int
     sport_counts: dict[str, int] = Field(default_factory=dict)
     recent_sessions: list[TrainingSessionOut] = Field(default_factory=list)
+
+
+class TrainingSessionListResponse(BaseModel):
+    """Filtered training-session list response."""
+
+    user_id: str
+    start_date: date | None = None
+    end_date: date | None = None
+    sport_type: str | None = None
+    session_count: int
+    sessions: list[TrainingSessionOut] = Field(default_factory=list)
 
 
 class MemoryContextOut(BaseModel):

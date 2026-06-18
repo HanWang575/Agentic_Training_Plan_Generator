@@ -313,7 +313,11 @@ class TrainingSession(SQLModel, table=True):
     user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
     source_import_id: str = Field(index=True, foreign_key="training_log_imports.import_id")
     external_id: Optional[str] = Field(default=None, index=True)
+    title: Optional[str] = None
     session_date: datetime = Field(index=True)
+    start_at: Optional[datetime] = Field(default=None, index=True)
+    end_at: Optional[datetime] = Field(default=None, index=True)
+    duration_seconds: Optional[int] = None
     sport_type: str = Field(default="unknown", index=True)
     exercises_json: str = "[]"
     sets_summary_json: str = "{}"

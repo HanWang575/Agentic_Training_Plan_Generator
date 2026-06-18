@@ -1,7 +1,7 @@
 """Service layer for the User Profile and Memory block."""
 
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import difflib
 import hashlib
 import json
@@ -22,6 +22,7 @@ from app.core.llm_provider import (
     MemoryRollingSummaryCompressionRequest,
     MemoryRollingSummaryRequest,
     OpenAIProvider,
+    TrainingSportTypeRequest,
 )
 from app.memory.catalogs import (
     DAILY_STATUS_KEYS,
@@ -30,6 +31,7 @@ from app.memory.catalogs import (
     default_valid_until,
     normalize_key,
 )
+from app.integrations.xunji import XunjiClient
 from app.memory.graph import run_langgraph_or_nodes
 from app.memory.nodes import (
     MEMORY_SECTION_TOKEN_BUDGETS,
@@ -62,7 +64,10 @@ from app.memory.schemas import (
     RecentStatusPatchResponse,
     TrainingLogImportRequest,
     TrainingLogImportResponse,
+    TrainingLogXunjiSyncRequest,
+    TrainingLogXunjiSyncResponse,
     TrainingLogSummaryResponse,
+    TrainingSessionListResponse,
     TrainingSessionOut,
     UserOut,
 )
@@ -89,6 +94,14 @@ ROLLING_SUMMARY_TOKEN_BUDGET = MEMORY_SECTION_TOKEN_BUDGETS["rolling_summary"]
 ROLLING_SUMMARY_TARGET_RATIO = 0.5
 CONVERSATION_INACTIVE_CLOSE_AFTER = timedelta(hours=1)
 INACTIVE_CLOSURE_REASON = "inactive_timeout"
+TRAINING_SPORT_TYPES = [
+    "strength",
+    "running",
+    "other aerobic exercise",
+    "other anaerobic exercise",
+    "other Mixed Aerobic-Anaerobic Exercise",
+]
+OVERLAP_DROP_THRESHOLD = timedelta(minutes=20)
 
 
 class MemoryService:
@@ -979,7 +992,7 @@ class MemoryService:
         )
         self.session.add(import_row)
         self.session.commit()
-        sessions = self._normalize_training_sessions(import_row, request.payload)
+        sessions, dropped_sessions = self._normalize_training_sessions(import_row, request.payload)
         self.session.commit()
         return TrainingLogImportResponse(
             import_id=import_row.import_id,
@@ -987,6 +1000,47 @@ class MemoryService:
             skipped_duplicate=False,
             sessions_imported=len(sessions),
             sessions=[_training_session_out(item) for item in sessions],
+            dropped_sessions=dropped_sessions,
+        )
+
+    def sync_xunji_training_logs(self, request: TrainingLogXunjiSyncRequest) -> TrainingLogXunjiSyncResponse:
+        """Read Xunji logs for a date range and import each day idempotently."""
+
+        self._ensure_user(request.user_id)
+        if request.end_date < request.start_date:
+            raise ValueError("end_date must be on or after start_date.")
+        client = XunjiClient(self.settings)
+        imports: list[TrainingLogImportResponse] = []
+        errors: list[dict[str, str]] = []
+        current = request.start_date
+        while current <= request.end_date:
+            datestr = current.isoformat()
+            try:
+                payload = client.read_day(
+                    datestr=datestr,
+                    include_full_data=request.include_full_data,
+                    force_refresh=request.force_refresh,
+                )
+                imports.append(
+                    self.import_xunji(
+                        TrainingLogImportRequest(
+                            user_id=request.user_id,
+                            external_id=f"xunji:{datestr}:{'full' if request.include_full_data else 'light'}",
+                            payload=payload,
+                            provider="xunji",
+                        )
+                    )
+                )
+            except Exception as exc:
+                errors.append({"datestr": datestr, "error": str(exc)})
+            current += timedelta(days=1)
+        return TrainingLogXunjiSyncResponse(
+            user_id=request.user_id,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            days_requested=(request.end_date - request.start_date).days + 1,
+            imports=imports,
+            errors=errors,
         )
 
     def get_training_log_summary(self, user_id: str, days: int = 30) -> TrainingLogSummaryResponse:
@@ -1010,6 +1064,41 @@ class MemoryService:
             session_count=len(recent),
             sport_counts=dict(sport_counts),
             recent_sessions=[_training_session_out(item) for item in recent[:20]],
+        )
+
+    def list_training_sessions(
+        self,
+        user_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        sport_type: str | None = None,
+        limit: int = 200,
+    ) -> TrainingSessionListResponse:
+        """Return normalized training sessions filtered by date range and sport type."""
+
+        self._ensure_user(user_id)
+        rows = self.session.exec(
+            select(TrainingSession).where(TrainingSession.user_id == user_id)
+        ).all()
+        filtered = []
+        for row in rows:
+            session_day = _ensure_aware(row.session_date).date()
+            if start_date and session_day < start_date:
+                continue
+            if end_date and session_day > end_date:
+                continue
+            if sport_type and sport_type != "any" and row.sport_type != sport_type:
+                continue
+            filtered.append(row)
+        filtered = sorted(filtered, key=lambda item: item.session_date, reverse=True)
+        safe_limit = max(1, min(1000, limit))
+        return TrainingSessionListResponse(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            sport_type=sport_type,
+            session_count=len(filtered),
+            sessions=[_training_session_out(item) for item in filtered[:safe_limit]],
         )
 
     def get_memory_context(
@@ -1994,40 +2083,232 @@ class MemoryService:
         self,
         import_row: TrainingLogImport,
         payload: Any,
-    ) -> list[TrainingSession]:
-        sessions_payload = payload.get("sessions", payload) if isinstance(payload, dict) else payload
-        if isinstance(sessions_payload, dict):
-            sessions_payload = [sessions_payload]
-        if not isinstance(sessions_payload, list):
-            sessions_payload = []
+    ) -> tuple[list[TrainingSession], list[dict[str, Any]]]:
+        sessions_payload = _extract_training_session_payloads(payload)
+        kept_payloads, dropped_sessions = _drop_overlapping_training_payloads(sessions_payload)
         rows = []
-        for item in sessions_payload:
+        for item in kept_payloads:
             if not isinstance(item, dict):
                 continue
             external_id = str(item.get("id") or item.get("session_id") or item.get("external_id") or "")
-            session_date = _parse_datetime(
+            start_at = _parse_xunji_datetime(
+                item.get("start")
+                or item.get("start_time")
+                or item.get("started_at")
+                or item.get("date")
+                or item.get("training_date")
+            )
+            end_at = _parse_xunji_datetime(
+                item.get("end")
+                or item.get("end_time")
+                or item.get("ended_at")
+            )
+            session_date = _parse_xunji_datetime(
                 item.get("date")
+                or item.get("datestr")
                 or item.get("training_date")
                 or item.get("start_time")
                 or item.get("started_at")
                 or utc_now()
             )
+            if start_at is not None:
+                session_date = start_at
+            duration_seconds = _session_duration_seconds(start_at, end_at, item)
             row = TrainingSession(
                 session_id=f"ts_{uuid4().hex[:12]}",
                 user_id=import_row.user_id,
                 source_import_id=import_row.import_id,
                 external_id=external_id or None,
+                title=str(item.get("title") or item.get("name") or "").strip() or None,
                 session_date=session_date,
-                sport_type=str(item.get("sport_type") or item.get("type") or item.get("sport") or "unknown"),
-                exercises_json=_json_dumps(item.get("exercises") or item.get("movements") or []),
-                sets_summary_json=_json_dumps(item.get("sets_summary") or item.get("sets") or {}),
+                start_at=start_at,
+                end_at=end_at,
+                duration_seconds=duration_seconds,
+                sport_type=self._classify_training_sport_type(item),
+                exercises_json=_json_dumps(_strip_xunji_set_time(item.get("exercises") or item.get("movements") or [])),
+                sets_summary_json=_json_dumps(_strip_xunji_set_time(item.get("sets_summary") or item.get("sets") or {})),
                 rpe=_safe_float(item.get("rpe")),
                 notes=item.get("notes") or item.get("comment"),
                 raw_payload_json=_json_dumps(item),
             )
             self.session.add(row)
             rows.append(row)
-        return rows
+        return rows, dropped_sessions
+
+    def _classify_training_sport_type(self, item: dict[str, Any]) -> str:
+        try:
+            if hasattr(self.llm_provider, "classify_training_sport_type"):
+                label = self.llm_provider.classify_training_sport_type(
+                    TrainingSportTypeRequest(
+                        session_payload=_compact_training_payload_for_label(item),
+                        allowed_labels=TRAINING_SPORT_TYPES,
+                    )
+                )
+                if label in TRAINING_SPORT_TYPES:
+                    return label
+        except Exception:
+            pass
+        return _fallback_training_sport_type(item)
+
+
+def _extract_training_session_payloads(payload: Any) -> list[dict[str, Any]]:
+    """Return candidate session dictionaries from raw Xunji or legacy payload shapes."""
+
+    sessions_payload = payload
+    if isinstance(payload, dict):
+        res = payload.get("res")
+        if isinstance(res, dict) and isinstance(res.get("trains"), list):
+            sessions_payload = res["trains"]
+        elif isinstance(res, list):
+            sessions_payload = res
+        elif "sessions" in payload:
+            sessions_payload = payload.get("sessions")
+        elif "trains" in payload:
+            sessions_payload = payload.get("trains")
+    if isinstance(sessions_payload, dict):
+        sessions_payload = [sessions_payload]
+    if not isinstance(sessions_payload, list):
+        return []
+    return [item for item in sessions_payload if isinstance(item, dict)]
+
+
+def _drop_overlapping_training_payloads(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep the more detailed session when two imported sessions overlap by over 20 minutes."""
+
+    ordered = sorted(items, key=lambda item: (_training_start_or_date(item), -_training_detail_score(item)))
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for item in ordered:
+        replacement_index = None
+        drop_current = False
+        for index, existing in enumerate(kept):
+            if _training_overlap(existing, item) <= OVERLAP_DROP_THRESHOLD:
+                continue
+            if _training_detail_score(item) > _training_detail_score(existing):
+                replacement_index = index
+            else:
+                drop_current = True
+            break
+        if replacement_index is not None:
+            existing = kept[replacement_index]
+            dropped.append(_dropped_training_session_info(existing, kept_reason="overlap_less_detailed"))
+            kept[replacement_index] = item
+        elif drop_current:
+            dropped.append(_dropped_training_session_info(item, kept_reason="overlap_less_detailed"))
+        else:
+            kept.append(item)
+    kept = sorted(kept, key=_training_start_or_date)
+    return kept, dropped
+
+
+def _training_overlap(left: dict[str, Any], right: dict[str, Any]) -> timedelta:
+    left_start = _training_start(left)
+    left_end = _training_end(left)
+    right_start = _training_start(right)
+    right_end = _training_end(right)
+    if None in {left_start, left_end, right_start, right_end}:
+        return timedelta(0)
+    latest_start = max(left_start, right_start)
+    earliest_end = min(left_end, right_end)
+    return max(timedelta(0), earliest_end - latest_start)
+
+
+def _training_start(item: dict[str, Any]) -> datetime | None:
+    return _parse_xunji_datetime(item.get("start") or item.get("start_time") or item.get("started_at"))
+
+
+def _training_end(item: dict[str, Any]) -> datetime | None:
+    return _parse_xunji_datetime(item.get("end") or item.get("end_time") or item.get("ended_at"))
+
+
+def _training_start_or_date(item: dict[str, Any]) -> datetime:
+    return (
+        _training_start(item)
+        or _parse_xunji_datetime(item.get("date") or item.get("datestr") or item.get("training_date"))
+        or utc_now()
+    )
+
+
+def _training_detail_score(item: dict[str, Any]) -> int:
+    score = len(_json_dumps(item))
+    movements = item.get("movements") or item.get("exercises") or []
+    if isinstance(movements, list):
+        score += len(movements) * 20
+        for movement in movements:
+            if isinstance(movement, dict):
+                sets = movement.get("sets") or []
+                if isinstance(sets, list):
+                    score += len(sets) * 10
+    for key in ("notes", "comment", "rpe", "title", "name"):
+        if item.get(key):
+            score += 25
+    return score
+
+
+def _dropped_training_session_info(item: dict[str, Any], kept_reason: str) -> dict[str, Any]:
+    return {
+        "external_id": str(item.get("id") or item.get("session_id") or item.get("external_id") or ""),
+        "title": item.get("title") or item.get("name"),
+        "start_at": (_training_start(item) or _training_start_or_date(item)).isoformat(),
+        "end_at": _training_end(item).isoformat() if _training_end(item) else None,
+        "reason": kept_reason,
+    }
+
+
+def _session_duration_seconds(
+    start_at: datetime | None,
+    end_at: datetime | None,
+    item: dict[str, Any],
+) -> int | None:
+    if start_at and end_at and end_at >= start_at:
+        return int((end_at - start_at).total_seconds())
+    for key in ("duration_seconds", "duration_s", "duration", "workoutTime"):
+        value = _safe_float(item.get(key))
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _compact_training_payload_for_label(item: dict[str, Any]) -> dict[str, Any]:
+    movements = item.get("movements") or item.get("exercises") or []
+    movement_summaries = []
+    if isinstance(movements, list):
+        for movement in movements[:12]:
+            if not isinstance(movement, dict):
+                continue
+            sets = movement.get("sets") if isinstance(movement.get("sets"), list) else []
+            movement_summaries.append(
+                {
+                    "name": movement.get("name") or movement.get("title"),
+                    "set_count": len(sets),
+                    "metrics": movement.get("metrics"),
+                }
+            )
+    return {
+        "title": item.get("title") or item.get("name"),
+        "type": item.get("type") or item.get("sport") or item.get("sport_type"),
+        "start": item.get("start") or item.get("start_time") or item.get("started_at"),
+        "end": item.get("end") or item.get("end_time") or item.get("ended_at"),
+        "duration_seconds": _session_duration_seconds(_training_start(item), _training_end(item), item),
+        "movements": movement_summaries,
+        "notes": item.get("notes") or item.get("comment"),
+    }
+
+
+def _fallback_training_sport_type(item: dict[str, Any]) -> str:
+    text = _json_dumps(_compact_training_payload_for_label(item)).lower()
+    if any(term in text for term in ("running", "run", "跑步", "跑步机", "treadmill", "indoor running")):
+        return "running"
+    if any(term in text for term in ("hyrox", "crossfit", "conditioning", "interval", "metcon", "循环", "综合")):
+        return "other Mixed Aerobic-Anaerobic Exercise"
+    if any(term in text for term in ("cycling", "bike", "row", "elliptical", "swim", "骑行", "划船", "游泳")):
+        return "other aerobic exercise"
+    movements = item.get("movements") or item.get("exercises") or []
+    if isinstance(movements, list) and movements:
+        return "strength"
+    if any(term in text for term in ("sprint", "jump", "throw", "冲刺", "跳", "投掷")):
+        return "other anaerobic exercise"
+    return "other Mixed Aerobic-Anaerobic Exercise"
 
 
 def _user_out(user: UserAccount) -> UserOut:
@@ -2225,10 +2506,14 @@ def _training_session_out(item: TrainingSession) -> TrainingSessionOut:
         user_id=item.user_id,
         source_import_id=item.source_import_id,
         external_id=item.external_id,
+        title=item.title,
         session_date=item.session_date,
+        start_at=item.start_at,
+        end_at=item.end_at,
+        duration_seconds=item.duration_seconds,
         sport_type=item.sport_type,
-        exercises=_json_loads(item.exercises_json, default=[]),
-        sets_summary=_json_loads(item.sets_summary_json, default={}),
+        exercises=_strip_xunji_set_time(_json_loads(item.exercises_json, default=[])),
+        sets_summary=_strip_xunji_set_time(_json_loads(item.sets_summary_json, default={})),
         rpe=item.rpe,
         notes=item.notes,
         raw_payload=_json_loads(item.raw_payload_json, default={}),
@@ -2247,6 +2532,20 @@ def _json_loads(value: str | None, default: Any = None) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return {} if default is None else default
+
+
+def _strip_xunji_set_time(value: Any) -> Any:
+    """Remove Xunji's meaningless set-level `time` field outside raw payloads."""
+
+    if isinstance(value, dict):
+        return {
+            key: _strip_xunji_set_time(item)
+            for key, item in value.items()
+            if key != "time"
+        }
+    if isinstance(value, list):
+        return [_strip_xunji_set_time(item) for item in value]
+    return value
 
 
 def _stringify_value(value: Any) -> str:
@@ -2442,6 +2741,23 @@ def _parse_datetime(value: Any) -> datetime:
     return utc_now()
 
 
+def _parse_xunji_datetime(value: Any) -> datetime | None:
+    """Parse Xunji date/time values, including millisecond timestamps."""
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return _ensure_aware(value)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return _parse_datetime(value)
+
+
 def _render_plan_summary(plan: PlanProgressOut) -> str:
     progress = plan.plan_progress.get("sessions", {}) if isinstance(plan.plan_progress, dict) else {}
     counts = Counter(
@@ -2477,8 +2793,82 @@ def _render_training_log_summary(summary: TrainingLogSummaryResponse) -> str:
         f"Sport counts: {summary.sport_counts}",
     ]
     for session in summary.recent_sessions[:10]:
-        lines.append(
-            f"[{session.session_id} | {session.session_date.isoformat()} | {session.sport_type}] "
-            f"rpe={session.rpe} notes={session.notes or ''}"
-        )
+        lines.extend(_render_training_session_details(session))
     return "\n".join(lines)
+
+
+def _render_training_session_details(session: TrainingSessionOut) -> list[str]:
+    """Render one normalized training session with bounded exercise/set details."""
+
+    lines = [
+        (
+            f"[{session.session_id} | {session.session_date.isoformat()} | {session.sport_type}] "
+            f"title={session.title or ''} start={session.start_at.isoformat() if session.start_at else ''} "
+            f"end={session.end_at.isoformat() if session.end_at else ''} "
+            f"duration_seconds={session.duration_seconds} rpe={session.rpe} notes={session.notes or ''}"
+        )
+    ]
+    if session.sets_summary:
+        lines.append(f"  sets_summary: {_short_json(_strip_xunji_set_time(session.sets_summary), max_chars=900)}")
+    exercises = session.exercises if isinstance(session.exercises, list) else []
+    if not exercises:
+        return lines
+    lines.append(f"  exercises_count: {len(exercises)}")
+    for index, exercise in enumerate(exercises[:12], start=1):
+        if not isinstance(exercise, dict):
+            lines.append(f"  {index}. {_short_json(exercise, max_chars=300)}")
+            continue
+        name = exercise.get("name") or exercise.get("title") or exercise.get("movement") or "unknown"
+        raw_sets = exercise.get("sets")
+        sets = raw_sets if isinstance(raw_sets, list) else []
+        metrics = exercise.get("metrics")
+        prefix = f"  {index}. {name}"
+        if sets:
+            prefix += f" sets={len(sets)}"
+        elif raw_sets not in (None, ""):
+            prefix += f" sets={raw_sets}"
+        if metrics:
+            prefix += f" metrics={_short_json(metrics, max_chars=260)}"
+        lines.append(prefix)
+        for set_index, set_item in enumerate(sets[:12], start=1):
+            lines.append(f"     set {set_index}: {_render_training_set(set_item)}")
+        if len(sets) > 12:
+            lines.append(f"     ... {len(sets) - 12} more set(s)")
+    if len(exercises) > 12:
+        lines.append(f"  ... {len(exercises) - 12} more exercise(s)")
+    return lines
+
+
+def _render_training_set(set_item: Any) -> str:
+    set_item = _strip_xunji_set_time(set_item)
+    if not isinstance(set_item, dict):
+        return _short_json(set_item, max_chars=240)
+    parts = []
+    for key in (
+        "done",
+        "weight",
+        "weight_kg",
+        "unit",
+        "reps",
+        "duration_s",
+        "selfWeight",
+        "restSeconds",
+    ):
+        if key in set_item and set_item.get(key) not in (None, ""):
+            parts.append(f"{key}={set_item.get(key)}")
+    metrics = set_item.get("metrics")
+    if metrics:
+        parts.append(f"metrics={_short_json(metrics, max_chars=260)}")
+    items = set_item.get("items")
+    if isinstance(items, list) and items:
+        parts.append(f"items_count={len(items)}")
+    if parts:
+        return ", ".join(parts)
+    return _short_json(set_item, max_chars=300)
+
+
+def _short_json(value: Any, max_chars: int = 400) -> str:
+    text = _json_dumps(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3]}..."

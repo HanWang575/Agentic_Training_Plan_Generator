@@ -3,6 +3,7 @@
 import json
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 # Streamlit executes this file with `app/ui` on sys.path. Add the project root
@@ -20,6 +21,13 @@ from app.ui.formatting import answer_to_markdown, citations_to_rows
 
 settings = get_settings()
 API_BASE_URL = settings.api_base_url
+TRAINING_SPORT_TYPES = [
+    "strength",
+    "running",
+    "other aerobic exercise",
+    "other anaerobic exercise",
+    "other Mixed Aerobic-Anaerobic Exercise",
+]
 
 
 def _clean_id_input(value: str | None) -> str:
@@ -38,6 +46,158 @@ def _clean_id_input(value: str | None) -> str:
     while len(text) >= 2 and (text[0], text[-1]) in quote_pairs:
         text = text[1:-1].strip()
     return text
+
+
+def _rerun_app() -> None:
+    """Rerun Streamlit after updating session state."""
+
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+def _fetch_memory_items_for_review(user_id: str, status: str = "candidate") -> list[dict]:
+    """Load memory items for the review queue UI."""
+
+    params = {"user_id": user_id}
+    if status != "any":
+        params["status"] = status
+    response = httpx.get(
+        f"{API_BASE_URL}/api/memory/items",
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _candidate_memory_items(items: list[dict]) -> list[dict]:
+    """Return only reviewable candidate memory items from a loaded item list."""
+
+    return [item for item in items if item.get("status") == "candidate" and item.get("memory_id")]
+
+
+def _queue_next_memory_candidate(items: list[dict]) -> None:
+    """Prefill the memory-review text input with the next candidate ID."""
+
+    candidates = _candidate_memory_items(items)
+    next_id = candidates[0]["memory_id"] if candidates else ""
+    st.session_state["memory_review_pending_id"] = next_id
+
+
+def _fetch_key_proposals_for_review(user_id: str, review_status: str = "pending") -> list[dict]:
+    """Load key proposals for the review queue UI."""
+
+    params = {"user_id": user_id}
+    if review_status != "any":
+        params["review_status"] = review_status
+    response = httpx.get(
+        f"{API_BASE_URL}/api/memory/key-proposals",
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _pending_key_proposals(items: list[dict]) -> list[dict]:
+    """Return only reviewable pending key proposals from a loaded proposal list."""
+
+    return [item for item in items if item.get("review_status") == "pending" and item.get("proposal_id")]
+
+
+def _queue_next_key_proposal(items: list[dict]) -> None:
+    """Prefill the key-proposal review text input with the next pending proposal ID."""
+
+    proposals = _pending_key_proposals(items)
+    next_id = proposals[0]["proposal_id"] if proposals else ""
+    st.session_state["key_proposal_review_pending_id"] = next_id
+
+
+def _sync_xunji_with_progress(
+    user_id: str,
+    start_date,
+    end_date,
+    include_full_data: bool,
+    force_refresh: bool,
+    chunk_days: int = 7,
+) -> dict:
+    """Import Xunji logs in small date chunks so long ranges do not timeout."""
+
+    if end_date < start_date:
+        return {
+            "user_id": user_id,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "days_requested": 0,
+            "imports": [],
+            "errors": [{"datestr": "", "error": "End date must be on or after start date."}],
+        }
+
+    total_days = (end_date - start_date).days + 1
+    safe_chunk_days = max(1, min(31, int(chunk_days)))
+    progress = st.progress(0)
+    status = st.empty()
+    chunks = []
+    imports = []
+    errors = []
+    completed_days = 0
+    current = start_date
+
+    while current <= end_date:
+        chunk_end = min(current + timedelta(days=safe_chunk_days - 1), end_date)
+        chunk_count = (chunk_end - current).days + 1
+        status.write(
+            f"Importing Xunji logs {current.isoformat()} to {chunk_end.isoformat()} "
+            f"({completed_days + 1}-{completed_days + chunk_count} of {total_days} days)"
+        )
+        try:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/imports/xunji/sync",
+                json={
+                    "user_id": user_id,
+                    "start_date": current.isoformat(),
+                    "end_date": chunk_end.isoformat(),
+                    "include_full_data": include_full_data,
+                    "force_refresh": force_refresh,
+                },
+                timeout=max(180, safe_chunk_days * 90),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            chunks.append(payload)
+            imports.extend(payload.get("imports", []))
+            errors.extend(payload.get("errors", []))
+        except Exception as exc:
+            errors.append(
+                {
+                    "datestr": f"{current.isoformat()}..{chunk_end.isoformat()}",
+                    "error": str(exc),
+                }
+            )
+        completed_days += chunk_count
+        progress.progress(min(1.0, completed_days / total_days))
+        current = chunk_end + timedelta(days=1)
+
+    imported_sessions = sum(item.get("sessions_imported", 0) for item in imports)
+    skipped_duplicates = sum(1 for item in imports if item.get("skipped_duplicate"))
+    status.write(
+        f"Xunji import finished: {imported_sessions} session(s) imported, "
+        f"{skipped_duplicates} duplicate day(s) skipped, {len(errors)} error(s)."
+    )
+    return {
+        "user_id": user_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "days_requested": total_days,
+        "chunk_days": safe_chunk_days,
+        "sessions_imported": imported_sessions,
+        "skipped_duplicate_imports": skipped_duplicates,
+        "imports": imports,
+        "errors": errors,
+        "chunks": chunks,
+    }
 
 
 def _source_label(source: dict) -> str:
@@ -386,7 +546,7 @@ def _render_trace_response(payload: dict) -> None:
 st.set_page_config(page_title="Evidence Q&A", layout="wide")
 st.title("Evidence-Based Q&A Assistant")
 
-tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace", "Memory"])
+tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace", "Training Log", "Memory"])
 
 
 with tabs[0]:
@@ -573,6 +733,70 @@ with tabs[4]:
 
 
 with tabs[5]:
+    st.subheader("Historical Training Log")
+    training_user_id = _clean_id_input(st.text_input("Training log user ID", value="usr_local"))
+
+    st.markdown("#### Import From Xunji")
+    sync_col1, sync_col2 = st.columns(2)
+    xunji_start_date = sync_col1.date_input("Xunji import start date")
+    xunji_end_date = sync_col2.date_input("Xunji import end date")
+    xunji_include_full = st.checkbox("Include full Xunji data", value=True)
+    xunji_force_refresh = st.checkbox("Force Xunji cache refresh", value=False)
+    xunji_chunk_days = st.number_input("Import chunk size in days", min_value=1, max_value=31, value=7, step=1)
+    if st.button("Import Xunji logs"):
+        st.json(
+            _sync_xunji_with_progress(
+                user_id=training_user_id,
+                start_date=xunji_start_date,
+                end_date=xunji_end_date,
+                include_full_data=xunji_include_full,
+                force_refresh=xunji_force_refresh,
+                chunk_days=int(xunji_chunk_days),
+            )
+        )
+
+    st.markdown("#### Training Sessions")
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    session_start_date = filter_col1.date_input("Session start date")
+    session_end_date = filter_col2.date_input("Session end date")
+    session_sport_type = filter_col3.selectbox("Sport type", ["any"] + TRAINING_SPORT_TYPES)
+    session_limit = filter_col4.number_input("Session limit", min_value=1, max_value=1000, value=200, step=1)
+    if st.button("Load training sessions"):
+        params = {
+            "user_id": training_user_id,
+            "start_date": session_start_date.isoformat(),
+            "end_date": session_end_date.isoformat(),
+            "limit": int(session_limit),
+        }
+        if session_sport_type != "any":
+            params["sport_type"] = session_sport_type
+        response = httpx.get(
+            f"{API_BASE_URL}/api/memory/training-log/sessions",
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        sessions = payload.get("sessions", [])
+        st.caption(f"{payload.get('session_count', 0)} session(s) matched.")
+        if sessions:
+            rows = [
+                {
+                    "session_id": item.get("session_id"),
+                    "date": item.get("session_date"),
+                    "title": item.get("title"),
+                    "sport_type": item.get("sport_type"),
+                    "duration_seconds": item.get("duration_seconds"),
+                    "rpe": item.get("rpe"),
+                    "notes": item.get("notes"),
+                }
+                for item in sessions
+            ]
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+        st.json(payload)
+
+
+with tabs[6]:
     st.subheader("User Memory")
     memory_user_id = _clean_id_input(st.text_input("User ID", value="usr_local"))
     display_name = st.text_input("Display name")
@@ -823,20 +1047,26 @@ with tabs[5]:
         "Memory item status",
         ["any", "candidate", "approved", "rejected"],
     )
-    memory_item_review_id = _clean_id_input(st.text_input("Memory item ID to review"))
+    if "memory_review_items" not in st.session_state:
+        st.session_state["memory_review_items"] = []
+    if "memory_review_last_result" not in st.session_state:
+        st.session_state["memory_review_last_result"] = None
+    if "memory_item_review_id_input" not in st.session_state:
+        st.session_state["memory_item_review_id_input"] = ""
+    if "memory_review_pending_id" in st.session_state:
+        st.session_state["memory_item_review_id_input"] = st.session_state.pop("memory_review_pending_id")
+
+    memory_item_review_id = _clean_id_input(
+        st.text_input("Memory item ID to review", key="memory_item_review_id_input")
+    )
     memory_item_review_note = st.text_input("Memory item review note")
     col1, col2, col3 = st.columns(3)
     if col1.button("Load memory items"):
-        memory_item_params = {"user_id": memory_user_id}
-        if memory_item_status != "any":
-            memory_item_params["status"] = memory_item_status
-        response = httpx.get(
-            f"{API_BASE_URL}/api/memory/items",
-            params=memory_item_params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        st.json(response.json())
+        items = _fetch_memory_items_for_review(memory_user_id, memory_item_status)
+        st.session_state["memory_review_items"] = items
+        st.session_state["memory_review_last_result"] = None
+        _queue_next_memory_candidate(items)
+        _rerun_app()
     if col2.button("Approve memory item"):
         if not memory_item_review_id:
             st.warning("Enter a candidate memory item ID first.")
@@ -847,7 +1077,11 @@ with tabs[5]:
                 timeout=30,
             )
             response.raise_for_status()
-            st.json(response.json())
+            st.session_state["memory_review_last_result"] = response.json()
+            items = _fetch_memory_items_for_review(memory_user_id, "candidate")
+            st.session_state["memory_review_items"] = items
+            _queue_next_memory_candidate(items)
+            _rerun_app()
     if col3.button("Reject memory item"):
         if not memory_item_review_id:
             st.warning("Enter a candidate memory item ID first.")
@@ -858,33 +1092,101 @@ with tabs[5]:
                 timeout=30,
             )
             response.raise_for_status()
-            st.json(response.json())
+            st.session_state["memory_review_last_result"] = response.json()
+            items = _fetch_memory_items_for_review(memory_user_id, "candidate")
+            st.session_state["memory_review_items"] = items
+            _queue_next_memory_candidate(items)
+            _rerun_app()
+
+    loaded_memory_items = st.session_state.get("memory_review_items", [])
+    candidate_items = _candidate_memory_items(loaded_memory_items)
+    current_candidate = next(
+        (item for item in candidate_items if item.get("memory_id") == memory_item_review_id),
+        candidate_items[0] if candidate_items else None,
+    )
+    if st.session_state.get("memory_review_last_result"):
+        st.markdown("##### Last review result")
+        st.json(st.session_state["memory_review_last_result"])
+    if current_candidate:
+        st.markdown("##### Current candidate")
+        st.caption(
+            f"{len(candidate_items)} candidate item(s) loaded. "
+            "Approve or reject this item to advance to the next candidate."
+        )
+        st.json(current_candidate)
+    elif loaded_memory_items:
+        st.info("No candidate memory items are loaded for review.")
+        st.json(loaded_memory_items)
 
     key_proposal_review_status = st.selectbox(
         "Key proposal status",
         ["any", "pending", "approved", "rejected"],
     )
-    key_proposal_id_to_approve = _clean_id_input(st.text_input("Key proposal ID to approve"))
-    proposal_col1, proposal_col2 = st.columns(2)
+    if "key_proposal_review_items" not in st.session_state:
+        st.session_state["key_proposal_review_items"] = []
+    if "key_proposal_review_last_result" not in st.session_state:
+        st.session_state["key_proposal_review_last_result"] = None
+    if "key_proposal_review_id_input" not in st.session_state:
+        st.session_state["key_proposal_review_id_input"] = ""
+    if "key_proposal_review_pending_id" in st.session_state:
+        st.session_state["key_proposal_review_id_input"] = st.session_state.pop("key_proposal_review_pending_id")
+
+    key_proposal_review_id = _clean_id_input(
+        st.text_input("Key proposal ID to review", key="key_proposal_review_id_input")
+    )
+    proposal_col1, proposal_col2, proposal_col3 = st.columns(3)
     if proposal_col1.button("Load key proposals"):
-        key_proposal_params = {"user_id": memory_user_id}
-        if key_proposal_review_status != "any":
-            key_proposal_params["review_status"] = key_proposal_review_status
-        response = httpx.get(
-            f"{API_BASE_URL}/api/memory/key-proposals",
-            params=key_proposal_params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        st.json(response.json())
+        proposals = _fetch_key_proposals_for_review(memory_user_id, key_proposal_review_status)
+        st.session_state["key_proposal_review_items"] = proposals
+        st.session_state["key_proposal_review_last_result"] = None
+        _queue_next_key_proposal(proposals)
+        _rerun_app()
     if proposal_col2.button("Approve key proposal"):
-        if not key_proposal_id_to_approve:
+        if not key_proposal_review_id:
             st.warning("Enter a key proposal ID first.")
         else:
             response = httpx.post(
-                f"{API_BASE_URL}/api/memory/key-proposals/{key_proposal_id_to_approve}/approve",
+                f"{API_BASE_URL}/api/memory/key-proposals/{key_proposal_review_id}/approve",
                 json={},
                 timeout=30,
             )
             response.raise_for_status()
-            st.json(response.json())
+            st.session_state["key_proposal_review_last_result"] = response.json()
+            proposals = _fetch_key_proposals_for_review(memory_user_id, "pending")
+            st.session_state["key_proposal_review_items"] = proposals
+            _queue_next_key_proposal(proposals)
+            _rerun_app()
+    if proposal_col3.button("Reject key proposal"):
+        if not key_proposal_review_id:
+            st.warning("Enter a key proposal ID first.")
+        else:
+            response = httpx.post(
+                f"{API_BASE_URL}/api/memory/key-proposals/{key_proposal_review_id}/reject",
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.session_state["key_proposal_review_last_result"] = response.json()
+            proposals = _fetch_key_proposals_for_review(memory_user_id, "pending")
+            st.session_state["key_proposal_review_items"] = proposals
+            _queue_next_key_proposal(proposals)
+            _rerun_app()
+
+    loaded_key_proposals = st.session_state.get("key_proposal_review_items", [])
+    pending_key_proposals = _pending_key_proposals(loaded_key_proposals)
+    current_key_proposal = next(
+        (item for item in pending_key_proposals if item.get("proposal_id") == key_proposal_review_id),
+        pending_key_proposals[0] if pending_key_proposals else None,
+    )
+    if st.session_state.get("key_proposal_review_last_result"):
+        st.markdown("##### Last key proposal review result")
+        st.json(st.session_state["key_proposal_review_last_result"])
+    if current_key_proposal:
+        st.markdown("##### Current key proposal")
+        st.caption(
+            f"{len(pending_key_proposals)} pending proposal(s) loaded. "
+            "Approve or reject this proposal to advance to the next one."
+        )
+        st.json(current_key_proposal)
+    elif loaded_key_proposals:
+        st.info("No pending key proposals are loaded for review.")
+        st.json(loaded_key_proposals)

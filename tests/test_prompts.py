@@ -11,12 +11,16 @@ def test_answer_prompt_requests_explanatory_grounded_style():
         evidence_context="[src_a / chk_a] Example Source, page 1\nVO2max means maximal oxygen uptake.",
         safety_mode="normal",
         safety_flags=[],
+        max_tokens=1500,
     )
 
     assert "Use only the evidence context" in prompt
     assert "do not sound mechanical or overly terse" in prompt
     assert "Write like a thoughtful coach-educator" in prompt
     assert "Avoid one-line, dry answers" in prompt
+    assert "you have at most about 1500 output tokens" in prompt
+    assert "Avoid large tables" in prompt
+    assert "starting a table that cannot fit" in prompt
     assert "Do not invent citations" in prompt
     assert "Use Arabic-number citations" in prompt
     assert "write 'text [2].', not 'text.[2]'" in prompt

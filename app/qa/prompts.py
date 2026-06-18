@@ -8,6 +8,7 @@ def build_answer_prompt(
     evidence_context: str,
     safety_mode: str,
     safety_flags: list[dict],
+    max_tokens: int,
     memory_context: str | None = None,
 ) -> str:
     """Build the live answer-generation prompt.
@@ -17,6 +18,7 @@ def build_answer_prompt(
         evidence_context: retrieved evidence text already selected for the LLM.
         safety_mode: `normal` or `caution`.
         safety_flags: list of safety flag dictionaries.
+        max_tokens: maximum output tokens enforced by the chat provider.
     Returns:
         str: grounded prompt for the answer model.
     """
@@ -45,9 +47,15 @@ def build_answer_prompt(
         "why it matters, how it is used in practice, and give a small example.\n"
         "6. Do not pad the answer with generic advice that is not grounded in the evidence.\n\n"
         "Style guidance:\n"
+        f"- Output budget: you have at most about {max_tokens} output tokens. "
+        "Plan the answer so every started section is completed within that budget.\n"
         "- Avoid one-line, dry answers unless the evidence is genuinely minimal.\n"
         "- In 'Short answer', give a direct answer in 2-4 sentences when evidence allows.\n"
         "- In 'Practical guidance', interpret the evidence in plain language.\n"
+        "- Avoid large tables unless the user explicitly asks for a table or the evidence cannot be clearly summarized "
+        "without one. If a table would be long, use compact bullets or a short grouped checklist instead.\n"
+        "- If the user asks for a form, checklist, or table and the evidence contains many fields, include the most "
+        "important fields first and summarize the rest instead of starting a table that cannot fit.\n"
         "- If the question asks for explanation, definition, comparison, or examples, provide them when supported.\n"
         "- If evidence conflicts or is narrow, mention that uncertainty briefly and specifically.\n\n"
         "Citation style:\n"

@@ -158,6 +158,30 @@ def init_db(active_engine=None) -> None:
             column_name="rolling_summary_until_message_id",
             column_definition="TEXT",
         )
+        _ensure_column(
+            connection,
+            table_name="training_sessions",
+            column_name="title",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="training_sessions",
+            column_name="start_at",
+            column_definition="DATETIME",
+        )
+        _ensure_column(
+            connection,
+            table_name="training_sessions",
+            column_name="end_at",
+            column_definition="DATETIME",
+        )
+        _ensure_column(
+            connection,
+            table_name="training_sessions",
+            column_name="duration_seconds",
+            column_definition="INTEGER",
+        )
         connection.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts

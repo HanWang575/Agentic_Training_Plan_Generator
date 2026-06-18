@@ -1,5 +1,7 @@
 """FastAPI routes for the User Profile and Memory block."""
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.dependencies import memory_service_dependency
@@ -34,7 +36,10 @@ from app.memory.schemas import (
     RecentStatusValidUntilRequest,
     TrainingLogImportRequest,
     TrainingLogImportResponse,
+    TrainingLogXunjiSyncRequest,
+    TrainingLogXunjiSyncResponse,
     TrainingLogSummaryResponse,
+    TrainingSessionListResponse,
     UserCreateRequest,
     UserOut,
     MessageAppendRequest,
@@ -503,6 +508,39 @@ def import_xunji(
     """Import Xunji training logs idempotently."""
 
     return service.import_xunji(request)
+
+
+@router.post("/imports/xunji/sync", response_model=TrainingLogXunjiSyncResponse)
+def sync_xunji_training_logs(
+    request: TrainingLogXunjiSyncRequest,
+    service: MemoryService = Depends(memory_service_dependency),
+) -> TrainingLogXunjiSyncResponse:
+    """Read Xunji logs from the Open API and import normalized sessions."""
+
+    try:
+        return service.sync_xunji_training_logs(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/training-log/sessions", response_model=TrainingSessionListResponse)
+def list_training_sessions(
+    user_id: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    sport_type: str | None = None,
+    limit: int = 200,
+    service: MemoryService = Depends(memory_service_dependency),
+) -> TrainingSessionListResponse:
+    """List normalized training sessions by date range and sport type."""
+
+    return service.list_training_sessions(
+        user_id=user_id,
+        start_date=start_date,
+        end_date=end_date,
+        sport_type=sport_type,
+        limit=limit,
+    )
 
 
 @router.get("/training-log/summary", response_model=TrainingLogSummaryResponse)

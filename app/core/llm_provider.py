@@ -16,6 +16,7 @@ from app.memory.prompts import (
     build_memory_plan_router_prompt,
     build_rolling_summary_compression_prompt,
     build_rolling_summary_prompt,
+    build_training_sport_type_prompt,
 )
 from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
 
@@ -150,6 +151,14 @@ class CompletedPlanEpisodeRequest:
     plan_payload: dict[str, Any]
 
 
+@dataclass(slots=True)
+class TrainingSportTypeRequest:
+    """Input shape for LLM training-session sport labeling."""
+
+    session_payload: dict[str, Any]
+    allowed_labels: list[str]
+
+
 class OpenAIProvider:
     """Small adapter around OpenAI-compatible APIs.
 
@@ -257,6 +266,7 @@ class OpenAIProvider:
             evidence_context=request.evidence_context,
             safety_mode=request.safety_mode,
             safety_flags=request.safety_flags,
+            max_tokens=request.max_tokens,
             memory_context=request.memory_context,
         )
         return self._generate_chat_text(prompt, max_tokens=request.max_tokens)
@@ -408,6 +418,19 @@ class OpenAIProvider:
             topics=_string_list(payload.get("topics", [])) or ["training_plan", "plan_completion"],
             importance=_clamp_float(payload.get("importance"), default=0.75),
         )
+
+    def classify_training_sport_type(self, request: TrainingSportTypeRequest) -> str:
+        """Classify one imported training session into an allowed sport type."""
+
+        prompt = build_training_sport_type_prompt(
+            session_payload=request.session_payload,
+            allowed_labels=request.allowed_labels,
+        )
+        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=250))
+        sport_type = str(payload.get("sport_type", "")).strip()
+        if sport_type not in set(request.allowed_labels):
+            raise ValueError(f"TrainingSportTypeClassifier returned invalid sport_type: {sport_type}")
+        return sport_type
 
     def _generate_chat_text(self, prompt: str, max_tokens: int) -> str:
         """Generate text with the configured chat model."""

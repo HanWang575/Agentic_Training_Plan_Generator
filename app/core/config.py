@@ -81,10 +81,14 @@ class Settings(BaseSettings):
     semantic_top_k: int = 30
     final_context_top_k: int = 12
     max_context_tokens: int = 12000
-    answer_max_tokens: int = 1000
+    answer_max_tokens: int = 1500
     hybrid_rrf_k: int = 60
     embedding_batch_size: int = 10
     maximum_upload_bytes: int = 400 * 1024 * 1024
+
+    xunji_api_key: str | None = Field(default=None, validation_alias="XUNJI_API_KEY")
+    xunji_base_url: str = Field(default="https://trains.xunjiapp.cn", validation_alias="XUNJI_BASE_URL")
+    xunji_cache_dir: Path = Field(default=Path("data/xunji_cache"), validation_alias="XUNJI_CACHE_DIR")
 
     memory_context_max_tokens: int = 34000
     memory_non_plan_max_tokens: int = 24000

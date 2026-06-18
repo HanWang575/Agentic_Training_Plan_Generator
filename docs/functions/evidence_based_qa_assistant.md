@@ -16,7 +16,7 @@ Core responsibilities:
 Out of scope for this block:
 
 - User profile and long-term memory.
-- Training log and check-in storage.
+- Training-summary storage.
 - Training program generation.
 - Meal plan generation.
 - Wearable, calendar, or external app integrations.
