@@ -2,7 +2,7 @@
 
 ## Summary
 
-The AI trainer will be organized as a modular coaching system made of independent function blocks. The Evidence-Based Q&A Assistant provides the shared evidence layer through user-uploaded materials, trusted references, and RAG. The User Profile And Memory block stores personalized user context with recency so other blocks can retrieve it when needed. The Training Log, Check-In, And Program Review/Generator block records daily training data, summarizes progress over time, creates and adapts training plans, and connects planned training with completed work. External Integrations remain optional adapters for future tools such as wearables, calendars, and document sources.
+The AI trainer will be organized as a modular coaching system made of independent function blocks. The Evidence-Based Q&A Assistant provides the shared evidence layer through user-uploaded materials, trusted references, and RAG. The User Profile And Memory block stores personalized user context, the approved active plan, plan progress, and training-log history with recency so other blocks can retrieve them when needed. The Program Review/Generator block creates, reviews, and adapts training plans, then sends approved plans to the Memory block for activation and progress tracking. External Integrations remain optional adapters for future tools such as wearables, calendars, and document sources.
 
 Detailed schemas, APIs, prompts, LangGraph workflows, tests, and implementation notes for each block should live in separate dedicated files later.
 
@@ -52,20 +52,19 @@ Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant
 
 ### 3.Program Generator
 
-- Purpose: monitor structured training records, summarize progress, create and adapt training plans, and connect planned training with completed training.
+- Purpose: create, review, and adapt training plans using user context, active-plan progress, training summaries, deterministic calculations, and retrieved evidence. Approved plans are handed to the User Profile And Memory block for activation and progress tracking.
 - Core functions:
   - Keep summary training notes for every week, month, and year.
   - Generate a professional training plan based on information provided by the user, the User Profile And Memory block, training summaries, direct readiness/recovery feedback, and the professional knowledge retrieved from the RAG system of the Evidence-Based Q&A Assistant block.
   - Explain the rationale behind the generated training plan.
   - Modify the training plan according to user's feedback. 
-  - Save the generated plan as a trackable training plan and write it to Xunji through API after user approval.
-  - Track the user's active training plan and connect planned sessions with completed logs.
+  - Send the complete approved plan to the User Profile And Memory block for activation and progress tracking, and write it to Xunji through API only after separate user approval.
   - When current information is not sufficient to generate a professional training plan, ask the user for extra information such as goal, current training level, and number of days available in the coming week.
   - If the user is unable to achieve the plan because of sickness, meetings, poor sleep, insufficient training level, or other feedback, update and modify the training plan professionally using the user's feedback plus information from the relevant memory, log, and evidence sources.
-- Main stack: FastAPI, database tables for logs and plans, simple editing UI, structured extraction pipeline, scheduled summary jobs, LangGraph planning workflow, structured output validation, program template library, RAG integration, memory retrieval, safety/review layer.
-- Data and pipelines: strength sessions, endurance sessions, daily logs, weekly/monthly/yearly summaries, user profile, memory records, goals, constraints, availability, generated plan versions, plan status, evidence references; log parsing, validation, summary generation, information sufficiency check, clarification, program drafting, rationale generation, volume/intensity review, progression planning, plan-to-log template generation, plan updating, safety review, progress reporting.
-- Decoupling boundary: consume profile, memory, training-summary, and Q&A/RAG services through stable interfaces; keep program generation, plan summaries, and plan tracking behind this block's own service interface.
-- Safety and quality boundary: generated plans should start as drafts and become active tracked plans only after the user reviews and approves them.
+- Main stack: FastAPI, database tables for generated plan artifacts and traces, simple editing UI, scheduled summary jobs, LangGraph planning workflow, structured output validation, program template library, RAG integration, memory retrieval, and a safety/review layer.
+- Data and pipelines: user profile, active-plan progress, training-log summaries, goals, constraints, availability, generated plan versions, evidence references, and feedback; information sufficiency checks, clarification, program drafting, rationale generation, volume/intensity review, progression planning, adaptation, approval, and Memory-block handoff.
+- Decoupling boundary: consume profile, active plan, progress, training summaries, and Q&A/RAG evidence through stable interfaces; keep program generation, review, adaptation, and their audit records behind this block's own service interface.
+- Safety and quality boundary: generated plans should start as drafts and may be sent to the User Profile And Memory block for activation only after the user reviews and approves them.
 
 ### 4. External Integrations
 

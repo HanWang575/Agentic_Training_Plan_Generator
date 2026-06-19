@@ -138,16 +138,20 @@ flowchart TD
     CONTEXT --> NUTRI["Future Nutrition Coaching"]
 ```
 
+
+
 ## 4. Store And Retrieve Rules By Memory Type
 
-| Memory type | Store process | Retrieve process | Canonical store |
-|---|---|---|---|
-| Working memory | Save every message under `conversation_id`; update rolling summary when long | Recent messages + rolling summary | `Conversation`, `ConversationMessage` |
-| Episodic memory | On conversation close or plan completion, summarize the conversation/plan and optionally embed summary | Semantic search over episodes plus metadata filters | `Episode` table; Chroma as search index |
-| Long-term profile | Manual edit or approved extracted candidate; proposed new keys require user approval before joining the key catalog | Approved non-expired profile facts by user and category | `ProfileField`, stable `MemoryItem`, `MemoryKeyProposal` |
-| Recent status | Manual edit or approved candidate with `observed_at` and an estimated editable `valid_until` | Active non-expired statuses only; near-expiry statuses prompt the user to expire or renew them | `RecentStatus`, `MemoryKeyProposal` |
-| Plan progress | Store approved plan version, a current `plan_progress` item, and append-only progress events | Conditional retrieval by `plan_context_level`: none, summary, or full active plan with per-session status and timestamps | `TrainingPlanProgress` |
-| Historical logs | Import from `训记`; store raw payload; normalize sessions | Recent sessions, weekly/monthly summaries, exercise history | `TrainingLogImport`, `TrainingSession` |
+
+| Memory type       | Store process                                                                                                       | Retrieve process                                                                                                         | Canonical store                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| Working memory    | Save every message under `conversation_id`; update rolling summary when long                                        | Recent messages + rolling summary                                                                                        | `Conversation`, `ConversationMessage`                    |
+| Episodic memory   | On conversation close or plan completion, summarize the conversation/plan and optionally embed summary              | Semantic search over episodes plus metadata filters                                                                      | `Episode` table; Chroma as search index                  |
+| Long-term profile | Manual edit or approved extracted candidate; proposed new keys require user approval before joining the key catalog | Approved non-expired profile facts by user and category                                                                  | `ProfileField`, stable `MemoryItem`, `MemoryKeyProposal` |
+| Recent status     | Manual edit or approved candidate with `observed_at` and an estimated editable `valid_until`                        | Active non-expired statuses only; near-expiry statuses prompt the user to expire or renew them                           | `RecentStatus`, `MemoryKeyProposal`                      |
+| Plan progress     | Store approved plan version, a current `plan_progress` item, and append-only progress events                        | Conditional retrieval by `plan_context_level`: none, summary, or full active plan with per-session status and timestamps | `TrainingPlanProgress`                                   |
+| Historical logs   | Import from `训记`; store raw payload; normalize sessions                                                             | Recent sessions, weekly/monthly summaries, exercise history                                                              | `TrainingLogImport`, `TrainingSession`                   |
+
 
 ## 5. Core Data Objects
 
@@ -323,15 +327,29 @@ The app uses `gpt-5.4-mini` for normal generation, but v1 should not rely on fil
 
 Default memory-context budget:
 
-| Memory context section | Default token budget |
-|---|---:|
-| Recent conversation messages | 6000 |
-| Rolling conversation summary | 2000 |
-| Episodic memories | 6000 |
-| Long-term profile facts | 3000 |
-| Recent status | 3000 |
-| Active plan progress | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `10000` add-on for `full` |
-| Historical training log summary | 4000 |
+
+| Memory context section          | Default token budget                                                                            |
+| ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Recent conversation messages    | 6000                                                                                            |
+| Rolling conversation summary    | 2000                                                                                            |
+| Episodic memories               | 6000                                                                                            |
+| Long-term profile facts         | 3000                                                                                            |
+| Recent status                   | 3000                                                                                            |
+| Active plan progress            | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `10000` add-on for `full` |
+| Historical training log summary | 4000                                                                                            |
+
+
+The table above remains the general-purpose default used by Q&A function. The task-specific caps below override those defaults for their named profiles. `MemoryContext` should accept a `context_profile` so callers can request a task-shaped payload without defining a competing memory schema.
+
+Supported v1 profiles:
+
+
+| `context_profile`    | Intended caller                                        | Default `plan_context_level`                             |
+| -------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| `qa`                 | Evidence-Based Q&A Assistant                           | Routed as `none`, `summary`, or `full` from the question |
+| `program_generation` | New-program design                                     | `full`                                                   |
+| `program_adaptation` | Program review, missed-session handling, or adaptation | `full`                                                   |
+
 
 Global rule:
 
@@ -342,23 +360,26 @@ Global rule:
 - If any section exceeds its section cap, return a user-visible `budget_warnings` entry instead of trimming the section.
 - If the whole `MemoryContext` exceeds the active global budget, return a global `budget_warnings` entry.
 - Do not overwrite canonical database rows or mutate the temporary prompt payload during final memory-context assembly.
-- For the future Training Program Review/Generator, active plan details are protected. If the active plan does not fit, the context should include a warning and future retrieval should use a structured payload or retrievable plan reference rather than a lossy summary.
+- For the future Training Program Generator, active plan details are protected. If the active plan does not fit, the context should include a warning and future retrieval should use a structured payload or retrievable plan reference rather than a lossy summary.
 
 ### Conditional Active Plan Context
 
 Active plan progress is expensive and should not be included in full for unrelated conversations. Before building `MemoryContext`, an LLM router should inspect the user's most recent query and route the request to one of three plan-context levels:
 
-| `plan_context_level` | When used | Active plan content |
-|---|---|---|
-| `none` | The request is unrelated to the current plan, for example a general evidence Q&A question | No plan details; optionally include only `active_plan_exists=true`. |
-| `summary` | The request is mildly training-related but not asking to inspect or change the current plan | Plan ID/version, current week, next planned session, recent adherence, and major constraints. |
-| `full` | The user discusses the current plan, today's workout, a planned session, missed/adapted sessions, fatigue/soreness affecting the plan, schedule changes, progression, or plan review/update | Full active plan, planned sessions, per-session progress, timestamps, feedback, and pending changes. |
+
+| `plan_context_level` | When used                                                                                                                                                                                   | Active plan content                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `none`               | The request is unrelated to the current plan, for example a general evidence Q&A question                                                                                                   | No plan details; optionally include only `active_plan_exists=true`.                                  |
+| `summary`            | The request is mildly training-related but not asking to inspect or change the current plan                                                                                                 | Plan ID/version, current week, next planned session, recent adherence, and major constraints.        |
+| `full`               | The user discusses the current plan, today's workout, a planned session, missed/adapted sessions, fatigue/soreness affecting the plan, schedule changes, progression, or plan review/update | Full active plan, planned sessions, per-session progress, timestamps, feedback, and pending changes. |
+
 
 Routing rules:
 
 - `PlanContextRouter` should be an LLM node that receives the latest user query, task type, topic hint, current conversation summary, and whether an active plan exists. It should return structured output: `plan_context_level`, short rationale, and confidence.
 - Use `full` when the latest user query references the current plan, a planned session, plan progress, plan feedback, missed/completed status, or asks to modify/review the plan.
-- Calls from the future Training Program Review/Generator should default to `full`.
+- Calls with `context_profile=program_generation` should default to `full` .
+- Calls with `context_profile=program_adaptation` should always use `full`.
 - When uncertain, use `summary` rather than `full`; the downstream block can request `full` if needed.
 - Deterministic keyword rules should be kept only as fallback or guardrails when the LLM router is unavailable or returns invalid output.
 - The active-plan summary add-on has its own `1000` token budget and raises the summary-mode ceiling to `25000` tokens.
@@ -368,28 +389,30 @@ Routing rules:
 
 Each node should be a small Python function or class with clear input and output. V1 can use one memory workflow graph with conditional paths for conversation storage, episode creation, memory retrieval, and budget-warning checks. Basic request validation should stay in FastAPI/Pydantic and service methods; a separate validation-only graph node is not needed in v1.
 
-| Node | Type | Input | Output | Responsibility |
-|---|---|---|---|---|
-| `MessageAppender` | Deterministic code, no LLM | Conversation ID, role, message content, source block | Stored `ConversationMessage` | Save each conversation turn for working memory and future episode creation. |
-| `RollingSummaryUpdater` | LLM node with deterministic threshold and fallback | Conversation messages, existing rolling summary | Updated rolling summary or no-op | Compact older turns when a conversation becomes long, then rewrite oversized rolling summaries toward the summary budget. |
-| `ConversationClosureDetector` | Deterministic code, optional LLM assist | Conversation status, user action, inactivity, task completion signals | Closure decision and closure reason | Decide when a conversation should be closed and sent to episodic summarization. |
-| `EpisodeSummarizer` | LLM node | Closed conversation messages, rolling summary | `Episode` summary, topics, importance, source message IDs | Convert a closed conversation into a permanent episodic memory. |
-| `MemoryExtractor` | LLM node with structured output | Conversation messages or episode summary | Candidate `MemoryItem` records | Propose profile, preference, recent status, constraint, performance, or plan-relevant memories. |
-| `MemoryKeyProposalDetector` | Deterministic check plus optional LLM equivalence check | Extracted memory keys, approved key catalogs | `MemoryKeyProposal` records or duplicate/equivalent rejection | Propose new `ProfileField` or `RecentStatus` keys only when they are useful and not duplicates or equivalents of existing keys. |
-| `MemoryCandidateValidator` | Deterministic code, optional rule fallback | Candidate `MemoryItem` records | Validated candidates, rejection reasons, safety flags | Enforce allowed categories, key names, required timestamps, expiry rules, and review requirements. |
-| `MemoryReviewRouter` | Deterministic code, no LLM | Validated candidates, key proposals, category, safety flags | `candidate`, `approved`, `rejected`, or `key_review` routing decision | Route manual edits to approved storage and LLM-extracted, safety-relevant, or new-key memories to user review. |
-| `ProfileUpdater` | Deterministic code, no LLM | Approved stable memory or manual profile edit | `ProfileField` row and linked `MemoryItem` | Update stable user profile fields while preserving provenance and replacement history. |
-| `RecentStatusUpdater` | Deterministic code, no LLM | Approved recent-status memory or manual status edit | `RecentStatus` row | Store short-lived readiness, pain, fatigue, schedule, or nutrition status with `observed_at` and estimated editable `valid_until`. |
-| `RecentStatusExpiryChecker` | Deterministic scheduled check, no LLM | Active `RecentStatus` rows and current time | Expiry prompts, expired status updates | Ask the user to expire or renew statuses that are about to expire; hide expired statuses from normal context. |
-| `PlanProgressUpdater` | Deterministic code, no LLM | Plan version, session progress update, user feedback | Updated `plan_progress` item and progress event | Track each planned session's pending/completed/missed/adapted state and timestamps such as `completed_at`. |
-| `CompletedPlanEpisodeWriter` | LLM node with deterministic trigger | Completed plan, final `plan_progress`, user feedback, completion events | Plan-completion `Episode` | Save completed plans as episodic memories for future retrieval and planning reflection. |
-| `XunjiImportNormalizer` | Deterministic code, no LLM | Raw `训记` import payload | Raw import row, normalized `TrainingSession` records, duplicate skips | Preserve imported payloads and normalize historical sessions idempotently by external ID/checksum. |
-| `EpisodeIndexer` | Embedding + vector indexing, no chat LLM | Stored episode summary | Chroma index row or indexing error | Add searchable episode embeddings when embedding configuration is available. |
-| `PlanContextRouter` | LLM node with deterministic fallback | Latest user query, task type, topic hint, conversation summary, active-plan existence flag | `plan_context_level`: `none`, `summary`, or `full`; rationale; confidence | Decide how much active-plan context to retrieve before building the final memory context. |
-| `MemoryRetriever` | Deterministic retrieval plus optional semantic search | User ID, task type, query, filters, `plan_context_level` | Profile facts, active recent status, episodes, conditional plan progress, log summaries | Retrieve memory candidates for Q&A, program generation, nutrition, or debug views without loading full plan details unless needed. |
-| `MemoryContextBuilder` | Deterministic code, no LLM | Retrieved memories, task type, `plan_context_level` | Draft `MemoryContext` sections | Assemble compact, categorized context with memory IDs, timestamps, provenance, recency, and conditional plan detail. |
-| `MemoryBudgetWarningBuilder` | Deterministic code, no LLM | Draft `MemoryContext`, section token caps, global token cap | Budget warning list | Report over-budget sections without trimming the memory context. |
-| `MemoryTraceLogger` | Deterministic code, no LLM | Full memory workflow state | Stored memory trace/debug record | Log retrieved memory IDs, budget warnings, candidate extraction, review status, timings, and errors. |
+
+| Node                          | Type                                                    | Input                                                                                      | Output                                                                                  | Responsibility                                                                                                                     |
+| ----------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `MessageAppender`             | Deterministic code, no LLM                              | Conversation ID, role, message content, source block                                       | Stored `ConversationMessage`                                                            | Save each conversation turn for working memory and future episode creation.                                                        |
+| `RollingSummaryUpdater`       | LLM node with deterministic threshold and fallback      | Conversation messages, existing rolling summary                                            | Updated rolling summary or no-op                                                        | Compact older turns when a conversation becomes long, then rewrite oversized rolling summaries toward the summary budget.          |
+| `ConversationClosureDetector` | Deterministic code, optional LLM assist                 | Conversation status, user action, inactivity, task completion signals                      | Closure decision and closure reason                                                     | Decide when a conversation should be closed and sent to episodic summarization.                                                    |
+| `EpisodeSummarizer`           | LLM node                                                | Closed conversation messages, rolling summary                                              | `Episode` summary, topics, importance, source message IDs                               | Convert a closed conversation into a permanent episodic memory.                                                                    |
+| `MemoryExtractor`             | LLM node with structured output                         | Conversation messages or episode summary                                                   | Candidate `MemoryItem` records                                                          | Propose profile, preference, recent status, constraint, performance, or plan-relevant memories.                                    |
+| `MemoryKeyProposalDetector`   | Deterministic check plus optional LLM equivalence check | Extracted memory keys, approved key catalogs                                               | `MemoryKeyProposal` records or duplicate/equivalent rejection                           | Propose new `ProfileField` or `RecentStatus` keys only when they are useful and not duplicates or equivalents of existing keys.    |
+| `MemoryCandidateValidator`    | Deterministic code, optional rule fallback              | Candidate `MemoryItem` records                                                             | Validated candidates, rejection reasons, safety flags                                   | Enforce allowed categories, key names, required timestamps, expiry rules, and review requirements.                                 |
+| `MemoryReviewRouter`          | Deterministic code, no LLM                              | Validated candidates, key proposals, category, safety flags                                | `candidate`, `approved`, `rejected`, or `key_review` routing decision                   | Route manual edits to approved storage and LLM-extracted, safety-relevant, or new-key memories to user review.                     |
+| `ProfileUpdater`              | Deterministic code, no LLM                              | Approved stable memory or manual profile edit                                              | `ProfileField` row and linked `MemoryItem`                                              | Update stable user profile fields while preserving provenance and replacement history.                                             |
+| `RecentStatusUpdater`         | Deterministic code, no LLM                              | Approved recent-status memory or manual status edit                                        | `RecentStatus` row                                                                      | Store short-lived readiness, pain, fatigue, schedule, or nutrition status with `observed_at` and estimated editable `valid_until`. |
+| `RecentStatusExpiryChecker`   | Deterministic scheduled check, no LLM                   | Active `RecentStatus` rows and current time                                                | Expiry prompts, expired status updates                                                  | Ask the user to expire or renew statuses that are about to expire; hide expired statuses from normal context.                      |
+| `PlanProgressUpdater`         | Deterministic code, no LLM                              | Plan version, session progress update, user feedback                                       | Updated `plan_progress` item and progress event                                         | Track each planned session's pending/completed/missed/adapted state and timestamps such as `completed_at`.                         |
+| `CompletedPlanEpisodeWriter`  | LLM node with deterministic trigger                     | Completed plan, final `plan_progress`, user feedback, completion events                    | Plan-completion `Episode`                                                               | Save completed plans as episodic memories for future retrieval and planning reflection.                                            |
+| `XunjiImportNormalizer`       | Deterministic code, no LLM                              | Raw `训记` import payload                                                                    | Raw import row, normalized `TrainingSession` records, duplicate skips                   | Preserve imported payloads and normalize historical sessions idempotently by external ID/checksum.                                 |
+| `EpisodeIndexer`              | Embedding + vector indexing, no chat LLM                | Stored episode summary                                                                     | Chroma index row or indexing error                                                      | Add searchable episode embeddings when embedding configuration is available.                                                       |
+| `PlanContextRouter`           | LLM node with deterministic fallback                    | Latest user query, task type, topic hint, conversation summary, active-plan existence flag | `plan_context_level`: `none`, `summary`, or `full`; rationale; confidence               | Decide how much active-plan context to retrieve before building the final memory context.                                          |
+| `MemoryRetriever`             | Deterministic retrieval plus optional semantic search   | User ID, task type, `context_profile`, query, filters, `plan_context_level`                | Profile facts, active recent status, episodes, conditional plan progress, log summaries | Retrieve memory candidates for Q&A, program generation, nutrition, or debug views without loading full plan details unless needed. |
+| `MemoryContextBuilder`        | Deterministic code, no LLM                              | Retrieved memories, task type, `context_profile`, `plan_context_level`                     | Draft `MemoryContext` sections                                                          | Assemble compact, categorized context with memory IDs, timestamps, provenance, recency, and conditional plan detail.               |
+| `MemoryBudgetWarningBuilder`  | Deterministic code, no LLM                              | Draft `MemoryContext`, `context_profile`, profile-specific section caps, global token cap  | Budget warning list                                                                     | Report over-budget sections without trimming the memory context.                                                                   |
+| `MemoryTraceLogger`           | Deterministic code, no LLM                              | Full memory workflow state                                                                 | Stored memory trace/debug record                                                        | Log retrieved memory IDs, budget warnings, candidate extraction, review status, timings, and errors.                               |
+
 
 Graph state should be a typed object with these fields:
 
@@ -397,6 +420,7 @@ Graph state should be a typed object with these fields:
 user_id
 conversation_id
 task_type
+context_profile
 incoming_message
 conversation_status
 closure_reason
@@ -471,6 +495,22 @@ Extend `POST /api/qa/ask` with optional:
 
 When enabled, Q&A receives memory context, but evidence retrieval remains separate from user memory retrieval.
 
+### Program Generator Integration
+
+The Program Generator must reuse `MemoryContext` rather than define a second memory payload:
+
+```json
+{
+  "user_id": "usr_001",
+  "conversation_id": "conv_001",
+  "task_type": "program_generation",
+  "context_profile": "program_generation",
+  "plan_context_level": "summary"
+}
+```
+
+For adaptation, use `task_type="program_adaptation"`, `context_profile="program_adaptation"`, and `plan_context_level="full"`. The returned `MemoryContext` is embedded unchanged in the Program Generator's `ProgramContext`; program-only evidence, calculations, SOP state, and weekly summary notes are added outside it.
+
 ### MCP Tools
 
 - `get_user_memory_context`
@@ -481,6 +521,8 @@ When enabled, Q&A receives memory context, but evidence retrieval remains separa
 - `list_expiring_recent_status`
 - `get_active_plan_progress`
 - `get_training_log_summary`
+
+`get_user_memory_context` accepts `task_type`, `context_profile`, and optional `plan_context_level`; it returns the same structured MemoryContext schema for every caller, with profile-specific selection and token caps.
 
 ## 10. Review And Safety Rules
 
@@ -512,6 +554,8 @@ When enabled, Q&A receives memory context, but evidence retrieval remains separa
 - `PlanContextRouter` uses the latest user query to classify unrelated Q&A requests as `plan_context_level=none` and does not load active plan details.
 - `PlanContextRouter` uses the latest user query to classify mildly training-related requests as `plan_context_level=summary` and includes only plan summary fields.
 - `PlanContextRouter` uses the latest user query to classify plan review/update requests as `plan_context_level=full` and includes the full active plan within the conditional plan add-on budget.
+- `program_generation` retrieval respects its 17000-token MemoryContext subtotal and defaults to active-plan summary mode.
+- `program_adaptation` retrieval respects its 21000-token MemoryContext subtotal and includes full active-plan progress.
 - Active plan details remain available to the future Program Generator; oversized active-plan context should produce a warning rather than a lossy final-stage summary.
 - Q&A with `include_memory=true` receives memory context and debug memory IDs.
 - `训记` imports are idempotent by external ID/checksum.
