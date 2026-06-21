@@ -2767,8 +2767,7 @@ def _render_plan_summary(plan: PlanProgressOut) -> str:
     )
     return (
         f"[{plan.plan_id}] version={plan.version} status={plan.status} current_week={plan.current_week}\n"
-        f"Session status counts: {dict(counts)}\n"
-        f"Recent feedback count: {len(plan.feedback)}"
+        f"Session status counts: {dict(counts)}"
     )
 
 
@@ -2780,8 +2779,7 @@ def _render_plan_full(plan: PlanProgressOut) -> str:
         "current_week": plan.current_week,
         "planned_sessions": plan.planned_sessions,
         "plan_progress": plan.plan_progress,
-        "progress_events": plan.progress_events[-20:],
-        "feedback": plan.feedback[-20:],
+        "progress_events": plan.progress_events,
         "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,
     }
     return f"[{plan.plan_id}]\n{_json_dumps(payload)}"

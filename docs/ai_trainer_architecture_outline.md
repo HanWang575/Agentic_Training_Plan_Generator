@@ -54,7 +54,7 @@ Build the system step by step in the roadmap order: Evidence-Based Q&A Assistant
 
 - Purpose: create, review, and adapt training plans using user context, active-plan progress, training summaries, deterministic calculations, and retrieved evidence. Approved plans are handed to the User Profile And Memory block for activation and progress tracking.
 - Core functions:
-  - Keep summary training notes for every week, month, and year.
+  - Keep summary training notes for every week.
   - Generate a professional training plan based on information provided by the user, the User Profile And Memory block, training summaries, direct readiness/recovery feedback, and the professional knowledge retrieved from the RAG system of the Evidence-Based Q&A Assistant block.
   - Explain the rationale behind the generated training plan.
   - Modify the training plan according to user's feedback. 

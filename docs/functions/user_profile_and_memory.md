@@ -158,7 +158,7 @@ flowchart TD
 - `UserAccount`: `user_id`, display name, timezone, created time.
 - `Conversation`: `conversation_id`, `user_id`, status, topic/title, rolling summary, closure reason, timestamps.
 - `ConversationMessage`: role, content, source block, optional Q&A trace ID, timestamp.
-- `Episode`: summary, topics, importance, source message IDs, time range, embedding ID.
+- `Episode`: summary, topics, importance, source message IDs, time range, embedding ID, ProgramContext ID (if applicable).
 - `MemoryItem`: category, text summary, `value_json`, confidence, source IDs, status, timestamps, expiry, replacement link.
 - `ProfileField`: stable user fact name, value, source, review status, updated time.
 - `RecentStatus`: status type, value, severity/impact, `observed_at`, estimated editable `valid_until`, review status, expiration reminder status.
@@ -367,11 +367,11 @@ Global rule:
 Active plan progress is expensive and should not be included in full for unrelated conversations. Before building `MemoryContext`, an LLM router should inspect the user's most recent query and route the request to one of three plan-context levels:
 
 
-| `plan_context_level` | When used                                                                                                                                                                                   | Active plan content                                                                                  |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `none`               | The request is unrelated to the current plan, for example a general evidence Q&A question                                                                                                   | No plan details; optionally include only `active_plan_exists=true`.                                  |
-| `summary`            | The request is mildly training-related but not asking to inspect or change the current plan                                                                                                 | Plan ID/version, current week, next planned session, recent adherence, and major constraints.        |
-| `full`               | The user discusses the current plan, today's workout, a planned session, missed/adapted sessions, fatigue/soreness affecting the plan, schedule changes, progression, or plan review/update | Full active plan, planned sessions, per-session progress, timestamps, feedback, and pending changes. |
+| `plan_context_level` | When used                                                                                                                                                                                   | Active plan content                                                                                                        |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `none`               | The request is unrelated to the current plan, for example a general evidence Q&A question                                                                                                   | No plan details; optionally include only `active_plan_exists=true`.                                                        |
+| `summary`            | The request is mildly training-related but not asking to inspect or change the current plan                                                                                                 | Plan ID/version, current week, next planned session, recent adherence, and major constraints.                              |
+| `full`               | The user discusses the current plan, today's workout, a planned session, missed/adapted sessions, fatigue/soreness affecting the plan, schedule changes, progression, or plan review/update | Full active plan, planned sessions (including session IDs, dates, exercises, sets,), per-session progress, and version IDs |
 
 
 Routing rules:
@@ -449,8 +449,8 @@ timings
 A conversation should be considered closed when one of these conditions is met:
 
 - The user explicitly closes it, starts a new topic/thread, or asks to end the conversation.
-- The conversation has been inactive for more than 1 hour even if no explicit close action happened.
-- A plan review, plan update, adaptation, or import-review workflow reaches a clear final state.
+- The conversation has been inactive for more than 1 hour even if no explicit close action happened (applied to QA assistant only).
+- A plan review, plan update, adaptation workflow reaches a clear final state.
 
 Do not close a conversation while it still has pending memory approvals, unresolved safety issues, or an active multi-step workflow waiting for user input. Closing should be idempotent: running close twice should not create duplicate episodes or duplicate memory candidates.
 
@@ -505,7 +505,7 @@ The Program Generator must reuse `MemoryContext` rather than define a second mem
   "conversation_id": "conv_001",
   "task_type": "program_generation",
   "context_profile": "program_generation",
-  "plan_context_level": "summary"
+  "plan_context_level": "full"
 }
 ```
 
