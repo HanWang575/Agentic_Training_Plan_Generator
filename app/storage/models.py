@@ -170,6 +170,7 @@ class Episode(SQLModel, table=True):
     episode_id: str = Field(primary_key=True, index=True)
     user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
     conversation_id: Optional[str] = Field(default=None, index=True)
+    program_context_id: Optional[str] = Field(default=None, index=True)
     source_type: str = Field(default="conversation", index=True)
     title: Optional[str] = None
     summary: str
@@ -277,10 +278,12 @@ class TrainingPlanProgress(SQLModel, table=True):
 
     plan_id: str = Field(primary_key=True, index=True)
     user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
+    version_id: Optional[str] = Field(default=None, index=True)
     version: int = 1
     status: str = Field(default="active", index=True)
     current_week: Optional[int] = None
     planned_sessions_json: str = "[]"
+    plan_snapshot_json: str = "{}"
     plan_progress_json: str = "{}"
     progress_events_json: str = "[]"
     feedback_json: str = "[]"
@@ -346,3 +349,247 @@ class MemoryTrace(SQLModel, table=True):
     errors_json: str = "[]"
     created_at: datetime = Field(default_factory=utc_now)
     total_latency_ms: int = 0
+
+
+class TrainingSummaryNote(SQLModel, table=True):
+    """Stable summary for one completed natural week."""
+
+    __tablename__ = "training_summary_notes"
+
+    summary_id: str = Field(primary_key=True, index=True)
+    user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
+    week_start: datetime = Field(index=True)
+    week_end: datetime = Field(index=True)
+    timezone: str = "UTC"
+    summary: str = ""
+    source_ids_json: str = "[]"
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ProgramContextRecord(SQLModel, table=True):
+    """Checkpointed conversation-scoped state for program work."""
+
+    __tablename__ = "program_contexts"
+
+    context_id: str = Field(primary_key=True, index=True)
+    parent_context_id: Optional[str] = Field(default=None, index=True)
+    user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
+    conversation_id: str = Field(index=True)
+    context_revision: int = 0
+    status: str = Field(default="open", index=True)
+    active_task_type: Optional[str] = Field(default=None, index=True)
+    current_turn_route: Optional[str] = None
+    active_sop: Optional[str] = None
+    current_sop_step: Optional[str] = None
+    pending_action: Optional[str] = None
+    latest_program_id: Optional[str] = Field(default=None, index=True)
+    latest_version_id: Optional[str] = Field(default=None, index=True)
+    review_status: Optional[str] = None
+    approval_status: Optional[str] = None
+    sections_json: str = "{}"
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    closed_at: Optional[datetime] = None
+
+
+class ProgramRequest(SQLModel, table=True):
+    """One user turn routed through a ProgramContext."""
+
+    __tablename__ = "program_requests"
+
+    request_id: str = Field(primary_key=True, index=True)
+    context_id: str = Field(index=True, foreign_key="program_contexts.context_id")
+    conversation_id: str = Field(index=True)
+    request_type: str = Field(index=True)
+    raw_request: str
+    goal: Optional[str] = None
+    constraints_json: str = "{}"
+    status: str = Field(default="received", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TrainingProgram(SQLModel, table=True):
+    """Program identity shared by immutable generated versions."""
+
+    __tablename__ = "training_programs"
+
+    program_id: str = Field(primary_key=True, index=True)
+    user_id: str = Field(index=True, foreign_key="user_accounts.user_id")
+    title: str
+    goal: str
+    sport: str = "general_fitness"
+    generation_status: str = Field(default="draft", index=True)
+    latest_version_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ProgramVersion(SQLModel, table=True):
+    """Immutable reviewable program version."""
+
+    __tablename__ = "program_versions"
+
+    version_id: str = Field(primary_key=True, index=True)
+    program_id: str = Field(index=True, foreign_key="training_programs.program_id")
+    version_number: int = 1
+    status: str = Field(default="draft", index=True)
+    reason: str = "new_program"
+    screening_json: str = "{}"
+    needs_analysis_json: str = "{}"
+    periodization_json: str = "{}"
+    planning_model: str = "parallel"
+    rationale: str = ""
+    assumptions_json: str = "[]"
+    warnings_json: str = "[]"
+    source_references_json: str = "{}"
+    created_at: datetime = Field(default_factory=utc_now)
+    reviewed_at: Optional[datetime] = None
+
+
+class ProgramSession(SQLModel, table=True):
+    """One dated session in a program version."""
+
+    __tablename__ = "program_sessions"
+
+    session_id: str = Field(primary_key=True, index=True)
+    version_id: str = Field(index=True, foreign_key="program_versions.version_id")
+    planned_date: datetime = Field(index=True)
+    week_number: int
+    day_number: int
+    session_type: str
+    goal: str
+    duration_minutes: int
+    duration_calculation_trace_id: Optional[str] = None
+    exercise_order_json: str = "[]"
+
+
+class ExercisePrescription(SQLModel, table=True):
+    """Ordered exercise within a planned session."""
+
+    __tablename__ = "exercise_prescriptions"
+
+    exercise_prescription_id: str = Field(primary_key=True, index=True)
+    session_id: str = Field(index=True, foreign_key="program_sessions.session_id")
+    exercise_name: str
+    exercise_order: int
+    mode: str = "resistance"
+    notes: str = ""
+    volume: Optional[float] = None
+    volume_unit: Optional[str] = None
+    calculation_trace_ids_json: str = "[]"
+
+
+class SetPrescription(SQLModel, table=True):
+    """Fully numeric set prescription with calculation references."""
+
+    __tablename__ = "set_prescriptions"
+
+    set_prescription_id: str = Field(primary_key=True, index=True)
+    exercise_prescription_id: str = Field(index=True, foreign_key="exercise_prescriptions.exercise_prescription_id")
+    set_number: int
+    reps: Optional[int] = None
+    load_kg: Optional[float] = None
+    intensity_percent: Optional[float] = None
+    rpe: Optional[float] = None
+    rest_seconds: int
+    duration_seconds: Optional[int] = None
+    distance_meters: Optional[float] = None
+    pace_seconds_per_km: Optional[int] = None
+    calculation_trace_ids_json: str = "[]"
+
+
+class ProgramAdaptation(SQLModel, table=True):
+    """Audit link from an active version to its proposed replacement."""
+
+    __tablename__ = "program_adaptations"
+
+    adaptation_id: str = Field(primary_key=True, index=True)
+    from_version_id: str = Field(index=True, foreign_key="program_versions.version_id")
+    to_version_id: str = Field(index=True, foreign_key="program_versions.version_id", unique=True)
+    trigger: str
+    user_feedback: str
+    changed_json: str = "[]"
+    unchanged_json: str = "[]"
+    rationale: str = ""
+    evidence_references_json: str = "[]"
+    calculation_trace_ids_json: str = "[]"
+    approval_status: str = Field(default="pending", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ProgramTrace(SQLModel, table=True):
+    """Replayable trace for one program action or turn."""
+
+    __tablename__ = "program_traces"
+
+    trace_id: str = Field(primary_key=True, index=True)
+    context_id: str = Field(index=True, foreign_key="program_contexts.context_id")
+    version_id: Optional[str] = Field(default=None, index=True)
+    context_revision: int
+    task_type: str
+    sop_step: Optional[str] = None
+    action: str
+    details_json: str = "{}"
+    rag_query_count: int = 0
+    user_question_count: int = 0
+    warnings_json: str = "[]"
+    errors_json: str = "[]"
+    latency_ms: int = 0
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ProgramToolCall(SQLModel, table=True):
+    """External or deterministic tool call made during a program trace."""
+
+    __tablename__ = "program_tool_calls"
+
+    tool_call_id: str = Field(primary_key=True, index=True)
+    trace_id: str = Field(index=True, foreign_key="program_traces.trace_id")
+    tool_name: str
+    inputs_json: str = "{}"
+    output_json: str = "{}"
+    status: str = "completed"
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class CalculationTrace(SQLModel, table=True):
+    """Deterministic calculation used by a visible prescription."""
+
+    __tablename__ = "calculation_traces"
+
+    calculation_trace_id: str = Field(primary_key=True, index=True)
+    trace_id: str = Field(index=True, foreign_key="program_traces.trace_id")
+    tool_name: str
+    inputs_json: str
+    result_json: str
+    formula: str
+    unit: str
+    rounding_policy: str
+    source_references_json: str = "[]"
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ProgramCitation(SQLModel, table=True):
+    """Approved evidence linked to a program trace."""
+
+    __tablename__ = "program_citations"
+
+    citation_id: str = Field(primary_key=True, index=True)
+    trace_id: str = Field(index=True, foreign_key="program_traces.trace_id")
+    source_id: str
+    chunk_id: str
+    title: str
+    page_or_section: Optional[str] = None
+
+
+class ProgramSafetyFlag(SQLModel, table=True):
+    """Safety condition that blocks or limits normal planning."""
+
+    __tablename__ = "program_safety_flags"
+
+    safety_flag_id: str = Field(primary_key=True, index=True)
+    trace_id: str = Field(index=True, foreign_key="program_traces.trace_id")
+    flag_type: str
+    severity: str
+    explanation: str
+    blocks_planning: bool = False

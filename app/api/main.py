@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from app.api.routes_knowledge import router as knowledge_router
 from app.api.routes_memory import router as memory_router
 from app.api.routes_qa import router as qa_router
+from app.api.routes_program import router as program_router
 from app.storage.database import init_db
 
 
@@ -16,10 +17,11 @@ def create_app() -> FastAPI:
     """
 
     init_db()
-    app = FastAPI(title="Personal Coach Evidence-Based Q&A Assistant")
+    app = FastAPI(title="Personal Coach AI Agent")
     app.include_router(qa_router)
     app.include_router(knowledge_router)
     app.include_router(memory_router)
+    app.include_router(program_router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

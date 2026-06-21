@@ -18,6 +18,7 @@ from app.memory.prompts import (
     build_rolling_summary_prompt,
     build_training_sport_type_prompt,
 )
+from app.program.prompts import build_program_plan_prompt
 from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
 
 
@@ -157,6 +158,19 @@ class TrainingSportTypeRequest:
 
     session_payload: dict[str, Any]
     allowed_labels: list[str]
+
+
+@dataclass(slots=True)
+class ProgramPlanRequest:
+    """Structured inputs for new-program design or adaptation."""
+
+    task_type: str
+    user_message: str
+    collected_inputs: dict[str, Any]
+    memory_context: str
+    weekly_summaries: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    active_plan: dict[str, Any] | None = None
 
 
 class OpenAIProvider:
@@ -431,6 +445,20 @@ class OpenAIProvider:
         if sport_type not in set(request.allowed_labels):
             raise ValueError(f"TrainingSportTypeClassifier returned invalid sport_type: {sport_type}")
         return sport_type
+
+    def generate_program_plan(self, request: ProgramPlanRequest) -> dict[str, Any]:
+        """Generate one JSON program design for deterministic validation."""
+
+        prompt = build_program_plan_prompt(
+            task_type=request.task_type,
+            user_message=request.user_message,
+            collected_inputs=request.collected_inputs,
+            memory_context=request.memory_context,
+            weekly_summaries=request.weekly_summaries,
+            evidence=request.evidence,
+            active_plan=request.active_plan,
+        )
+        return _parse_json_object(self._generate_chat_text(prompt, max_tokens=6000))
 
     def _generate_chat_text(self, prompt: str, max_tokens: int) -> str:
         """Generate text with the configured chat model."""

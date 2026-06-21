@@ -11,6 +11,10 @@ from sqlmodel import Session
 from app.core.config import get_settings
 from app.knowledge.service import KnowledgeService
 from app.memory.service import MemoryService
+from app.memory.schemas import PlanActivationRequest
+from app.program.calculators import CalculatorService
+from app.program.schemas import ProgramReviewRequest, ProgramTurnRequest, XunjiWriteRequest
+from app.program.service import ProgramService
 from app.qa.service import QAService
 from app.storage.database import engine, init_db
 
@@ -176,6 +180,170 @@ def create_mcp_server():
         with Session(engine) as session:
             service = MemoryService(session=session, settings=get_settings())
             return service.get_training_log_summary(user_id=user_id, days=days).model_dump()
+
+    @mcp.tool()
+    def activate_approved_plan(
+        user_id: str,
+        program_id: str,
+        version_id: str,
+        version_number: int,
+        planned_sessions: list[dict],
+        plan_snapshot: dict,
+    ) -> dict:
+        """Atomically activate an approved plan and deactivate older plans."""
+
+        with Session(engine) as session:
+            service = MemoryService(session=session, settings=get_settings())
+            return service.activate_plan(
+                PlanActivationRequest(
+                    user_id=user_id,
+                    program_id=program_id,
+                    version_id=version_id,
+                    version_number=version_number,
+                    planned_sessions=planned_sessions,
+                    plan_snapshot=plan_snapshot,
+                )
+            ).model_dump(mode="json")
+
+    @mcp.tool()
+    def send_program_conversation_turn(
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        expected_context_revision: int | None = None,
+    ) -> dict:
+        """Process one Program Generator conversation turn."""
+
+        with Session(engine) as session:
+            settings = get_settings()
+            service = ProgramService(session=session, settings=settings)
+            return service.process_turn(
+                conversation_id,
+                ProgramTurnRequest(
+                    user_id=user_id,
+                    message=message,
+                    expected_context_revision=expected_context_revision,
+                ),
+            ).model_dump(mode="json")
+
+    @mcp.tool()
+    def get_program_context(context_id: str) -> dict:
+        """Return one checkpointed ProgramContext."""
+
+        with Session(engine) as session:
+            return ProgramService(session=session, settings=get_settings()).get_context(context_id).model_dump(mode="json")
+
+    @mcp.tool()
+    def get_program_version(program_id: str, version_id: str) -> dict:
+        """Return a complete generated program version."""
+
+        with Session(engine) as session:
+            return ProgramService(session=session, settings=get_settings()).get_version(
+                program_id, version_id
+            ).model_dump(mode="json")
+
+    @mcp.tool()
+    def review_training_program(
+        user_id: str,
+        program_id: str,
+        version_id: str,
+        decision: str,
+        reason: str | None = None,
+        expected_version_number: int | None = None,
+    ) -> dict:
+        """Approve and activate, or reject, one generated version."""
+
+        with Session(engine) as session:
+            return ProgramService(session=session, settings=get_settings()).review_program(
+                program_id,
+                version_id,
+                ProgramReviewRequest(
+                    user_id=user_id,
+                    decision=decision,
+                    reason=reason,
+                    expected_version_number=expected_version_number,
+                ),
+            ).model_dump(mode="json")
+
+    @mcp.tool()
+    def get_program_trace(trace_id: str) -> dict:
+        """Return one complete Program Generator trace."""
+
+        with Session(engine) as session:
+            return ProgramService(session=session, settings=get_settings()).get_trace(trace_id).model_dump(mode="json")
+
+    @mcp.tool()
+    def write_training_program_to_xunji(
+        user_id: str,
+        program_id: str,
+        version_id: str,
+        confirmed: bool,
+    ) -> dict:
+        """Attempt separately approved Xunji write-back."""
+
+        with Session(engine) as session:
+            return ProgramService(session=session, settings=get_settings()).write_to_xunji(
+                program_id,
+                version_id,
+                XunjiWriteRequest(user_id=user_id, confirmed=confirmed),
+            ).model_dump(mode="json")
+
+    def calculator(tool_name: str, inputs: dict) -> dict:
+        return CalculatorService(get_settings()).run(tool_name, inputs).model_dump(mode="json")
+
+    @mcp.tool()
+    def calculate_expression(expression: str, unit: str = "count") -> dict:
+        return calculator("calculate_expression", {"expression": expression, "unit": unit})
+
+    @mcp.tool()
+    def estimate_repetition_max(weight: float, reps: int, method: str = "epley", unit: str = "kg") -> dict:
+        return calculator("estimate_repetition_max", {"weight": weight, "reps": reps, "method": method, "unit": unit})
+
+    @mcp.tool()
+    def calculate_percentage_load(one_rm: float, percentage: float, unit: str = "kg") -> dict:
+        return calculator("calculate_percentage_load", {"one_rm": one_rm, "percentage": percentage, "unit": unit})
+
+    @mcp.tool()
+    def round_training_load(load: float, increment: float = 0.5, unit: str = "kg") -> dict:
+        return calculator("round_training_load", {"load": load, "increment": increment, "unit": unit})
+
+    @mcp.tool()
+    def calculate_volume_load(sets: int, reps: int, load: float, unit: str = "kg") -> dict:
+        return calculator("calculate_volume_load", {"sets": sets, "reps": reps, "load": load, "unit": unit})
+
+    @mcp.tool()
+    def calculate_session_duration(work_seconds: float, rest_seconds: float, transition_seconds: float = 0) -> dict:
+        return calculator(
+            "calculate_session_duration",
+            {"work_seconds": work_seconds, "rest_seconds": rest_seconds, "transition_seconds": transition_seconds},
+        )
+
+    @mcp.tool()
+    def calculate_rest_interval(goal: str, compound: bool = True) -> dict:
+        return calculator("calculate_rest_interval", {"goal": goal, "compound": compound})
+
+    @mcp.tool()
+    def calculate_distance_pace_time(
+        distance_meters: float | None = None,
+        pace_seconds_per_km: float | None = None,
+        duration_seconds: float | None = None,
+    ) -> dict:
+        return calculator(
+            "calculate_distance_pace_time",
+            {"distance_meters": distance_meters, "pace_seconds_per_km": pace_seconds_per_km,
+             "duration_seconds": duration_seconds},
+        )
+
+    @mcp.tool()
+    def calculate_weekly_frequency(sessions: int, weeks: int = 1) -> dict:
+        return calculator("calculate_weekly_frequency", {"sessions": sessions, "weeks": weeks})
+
+    @mcp.tool()
+    def calculate_progression_increment(current_value: float, percentage: float, unit: str = "count") -> dict:
+        return calculator(
+            "calculate_progression_increment",
+            {"current_value": current_value, "percentage": percentage, "unit": unit},
+        )
 
     return mcp
 

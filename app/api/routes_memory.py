@@ -26,6 +26,8 @@ from app.memory.schemas import (
     MemoryItemReviewResponse,
     PlanProgressOut,
     PlanProgressPatchRequest,
+    PlanActivationRequest,
+    PlanActivationResponse,
     ProfilePatchRequest,
     ProfilePatchResponse,
     ProfileResponse,
@@ -216,6 +218,7 @@ def close_conversation(
             conversation_id=conversation_id,
             closure_reason=request.closure_reason,
             extract_candidates=request.extract_candidates,
+            program_context_id=request.program_context_id,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -484,6 +487,16 @@ def get_active_plan(
     """Return the current active plan progress, if present."""
 
     return service.get_active_plan(user_id)
+
+
+@router.post("/plans/activate", response_model=PlanActivationResponse)
+def activate_plan(
+    request: PlanActivationRequest,
+    service: MemoryService = Depends(memory_service_dependency),
+) -> PlanActivationResponse:
+    """Atomically replace the user's active plan."""
+
+    return service.activate_plan(request)
 
 
 @router.patch("/plans/{plan_id}/progress", response_model=PlanProgressOut)

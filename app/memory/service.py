@@ -56,6 +56,8 @@ from app.memory.schemas import (
     MemoryItemReviewResponse,
     PlanProgressOut,
     PlanProgressPatchRequest,
+    PlanActivationRequest,
+    PlanActivationResponse,
     ProfileFieldOut,
     ProfilePatchResponse,
     ProfileResponse,
@@ -405,6 +407,7 @@ class MemoryService:
         conversation_id: str,
         closure_reason: str = "user_closed",
         extract_candidates: bool = True,
+        program_context_id: str | None = None,
     ) -> ConversationCloseResponse:
         """Close a conversation idempotently and create one episode."""
 
@@ -413,6 +416,7 @@ class MemoryService:
             conversation,
             closure_reason=closure_reason,
             extract_candidates=extract_candidates,
+            program_context_id=program_context_id,
         )
 
     def _close_conversation(
@@ -420,6 +424,7 @@ class MemoryService:
         conversation: Conversation,
         closure_reason: str,
         extract_candidates: bool,
+        program_context_id: str | None = None,
     ) -> ConversationCloseResponse:
         """Close one conversation and create or refresh its episode and candidates."""
 
@@ -437,6 +442,11 @@ class MemoryService:
             select(Episode).where(Episode.conversation_id == conversation.conversation_id)
         ).first()
         episode = self._upsert_episode_from_conversation(conversation, messages, existing_episode)
+        if program_context_id and episode.program_context_id != program_context_id:
+            episode.program_context_id = program_context_id
+            self.session.add(episode)
+            self.session.commit()
+            self.session.refresh(episode)
         candidates = []
         if extract_candidates:
             candidates = self._extract_candidates_for_episode(conversation, episode)
@@ -891,6 +901,7 @@ class MemoryService:
             plan = TrainingPlanProgress(
                 plan_id=plan_id,
                 user_id=request.user_id,
+                version_id=request.version_id,
                 version=request.version or 1,
                 status=request.status or "active",
                 current_week=request.current_week,
@@ -902,6 +913,8 @@ class MemoryService:
                 raise ValueError("Plan ID belongs to another user.")
             if request.version is not None:
                 plan.version = request.version
+            if request.version_id is not None:
+                plan.version_id = request.version_id
             if request.status is not None:
                 plan.status = request.status
             if request.current_week is not None:
@@ -962,6 +975,78 @@ class MemoryService:
         if plan.status == "completed":
             self._write_completed_plan_episode(plan)
         return _plan_progress_out(plan)
+
+    def activate_plan(self, request: PlanActivationRequest) -> PlanActivationResponse:
+        """Atomically replace the user's active plan with an approved version."""
+
+        self._ensure_user(request.user_id)
+        now = utc_now()
+        active_rows = self.session.exec(
+            select(TrainingPlanProgress).where(
+                TrainingPlanProgress.user_id == request.user_id,
+                TrainingPlanProgress.status == "active",
+            )
+        ).all()
+        deactivated_ids: list[str] = []
+        for row in active_rows:
+            if row.plan_id == request.program_id:
+                continue
+            row.status = "superseded"
+            row.updated_at = now
+            deactivated_ids.append(row.plan_id)
+            self.session.add(row)
+
+        plan = self.session.get(TrainingPlanProgress, request.program_id)
+        existing_progress = _json_loads(plan.plan_progress_json, default={}) if plan else {}
+        existing_sessions = existing_progress.get("sessions", {}) if isinstance(existing_progress, dict) else {}
+        existing_planned = _json_loads(plan.planned_sessions_json, default=[]) if plan else []
+        progress_by_slot = {
+            (item.get("week_number"), item.get("day_number")): existing_sessions.get(str(item.get("session_id")), {})
+            for item in existing_planned
+            if isinstance(item, dict)
+        }
+        next_sessions: dict[str, dict[str, Any]] = {}
+        for session in request.planned_sessions:
+            session_id = str(session.get("session_id", ""))
+            if not session_id:
+                raise ValueError("Every activated session must have a session_id.")
+            previous = existing_sessions.get(session_id, {}) if isinstance(existing_sessions, dict) else {}
+            if not previous:
+                previous = progress_by_slot.get((session.get("week_number"), session.get("day_number")), {})
+            next_sessions[session_id] = {
+                "status": previous.get("status", "pending"),
+                **({"completed_at": previous["completed_at"]} if previous.get("completed_at") else {}),
+                "updated_at": now.isoformat(),
+            }
+        if plan is None:
+            plan = TrainingPlanProgress(plan_id=request.program_id, user_id=request.user_id, created_at=now)
+        elif plan.user_id != request.user_id:
+            raise ValueError("Plan ID belongs to another user.")
+        plan.version_id = request.version_id
+        plan.version = request.version_number
+        plan.status = "active"
+        plan.current_week = 1
+        plan.planned_sessions_json = _json_dumps(request.planned_sessions)
+        plan.plan_snapshot_json = _json_dumps(request.plan_snapshot)
+        plan.plan_progress_json = _json_dumps({"sessions": next_sessions})
+        events = _json_loads(plan.progress_events_json, default=[])
+        events.append(
+            {
+                "event_id": f"pevt_{uuid4().hex[:12]}",
+                "event_type": "plan_activated",
+                "version_id": request.version_id,
+                "created_at": now.isoformat(),
+            }
+        )
+        plan.progress_events_json = _json_dumps(events)
+        plan.updated_at = now
+        self.session.add(plan)
+        self.session.commit()
+        self.session.refresh(plan)
+        return PlanActivationResponse(
+            activated_plan=_plan_progress_out(plan),
+            deactivated_plan_ids=deactivated_ids,
+        )
 
     def import_xunji(self, request: TrainingLogImportRequest) -> TrainingLogImportResponse:
         """Import a raw Xunji payload idempotently by external ID or checksum."""
@@ -2355,6 +2440,7 @@ def _episode_out(episode: Episode) -> EpisodeOut:
         episode_id=episode.episode_id,
         user_id=episode.user_id,
         conversation_id=episode.conversation_id,
+        program_context_id=episode.program_context_id,
         source_type=episode.source_type,
         title=episode.title,
         summary=episode.summary,
@@ -2487,10 +2573,12 @@ def _plan_progress_out(item: TrainingPlanProgress) -> PlanProgressOut:
     return PlanProgressOut(
         plan_id=item.plan_id,
         user_id=item.user_id,
+        version_id=item.version_id,
         version=item.version,
         status=item.status,
         current_week=item.current_week,
         planned_sessions=_json_loads(item.planned_sessions_json, default=[]),
+        plan_snapshot=_json_loads(item.plan_snapshot_json, default={}),
         plan_progress=_json_loads(item.plan_progress_json, default={}),
         progress_events=_json_loads(item.progress_events_json, default=[]),
         feedback=_json_loads(item.feedback_json, default=[]),
@@ -2766,7 +2854,8 @@ def _render_plan_summary(plan: PlanProgressOut) -> str:
         if isinstance(item, dict)
     )
     return (
-        f"[{plan.plan_id}] version={plan.version} status={plan.status} current_week={plan.current_week}\n"
+        f"[{plan.plan_id}] version_id={plan.version_id} version={plan.version} "
+        f"status={plan.status} current_week={plan.current_week}\n"
         f"Session status counts: {dict(counts)}"
     )
 
@@ -2774,10 +2863,12 @@ def _render_plan_summary(plan: PlanProgressOut) -> str:
 def _render_plan_full(plan: PlanProgressOut) -> str:
     payload = {
         "plan_id": plan.plan_id,
+        "version_id": plan.version_id,
         "version": plan.version,
         "status": plan.status,
         "current_week": plan.current_week,
         "planned_sessions": plan.planned_sessions,
+        "plan_snapshot": plan.plan_snapshot,
         "plan_progress": plan.plan_progress,
         "progress_events": plan.progress_events,
         "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,

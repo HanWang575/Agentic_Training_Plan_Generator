@@ -182,6 +182,63 @@ def init_db(active_engine=None) -> None:
             column_name="duration_seconds",
             column_definition="INTEGER",
         )
+        _ensure_column(
+            connection,
+            table_name="episodes",
+            column_name="program_context_id",
+            column_definition="TEXT",
+        )
+        _ensure_column(
+            connection,
+            table_name="training_plan_progress",
+            column_name="version_id",
+            column_definition="TEXT",
+        )
+        _ensure_column(connection, "exercise_prescriptions", "volume", "REAL")
+        _ensure_column(connection, "exercise_prescriptions", "volume_unit", "TEXT")
+        _ensure_column(
+            connection,
+            "exercise_prescriptions",
+            "calculation_trace_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            "program_versions",
+            "source_references_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
+            "training_plan_progress",
+            "plan_snapshot_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(connection, "program_requests", "goal", "TEXT")
+        _ensure_column(
+            connection,
+            "program_requests",
+            "constraints_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
+            "program_sessions",
+            "duration_calculation_trace_id",
+            "TEXT",
+        )
+        _ensure_column(
+            connection,
+            "program_adaptations",
+            "evidence_references_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        _ensure_column(
+            connection,
+            "program_adaptations",
+            "calculation_trace_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
         connection.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts

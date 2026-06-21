@@ -95,6 +95,24 @@ class Settings(BaseSettings):
     memory_plan_summary_max_tokens: int = 1000
     memory_plan_full_max_tokens: int = 10000
 
+    program_max_rag_queries: int = 5
+    program_max_user_questions: int = 5
+    program_max_sop_steps_per_run: int = 12
+    program_max_context_tokens: int = 66000
+    program_checkpoint_after_each_context_update: bool = True
+    program_evidence_context_top_k: int = 12
+    program_default_units: str = "metric"
+    program_barbell_load_rounding_kg: float = 0.5
+    program_dumbbell_load_rounding_kg: float = 2.0
+    program_machine_load_rounding_kg: float = 2.5
+    program_bodyweight_load_rounding_kg: float = 0.5
+    program_rest_rounding_seconds: int = 5
+    program_duration_rounding_seconds: int = 60
+    program_pace_rounding_seconds_per_km: int = 1
+    program_require_approval_before_activation: bool = True
+    program_require_approval_before_xunji_write: bool = True
+    program_xunji_write_enabled: bool = False
+
     @property
     def api_base_url(self) -> str:
         """Output shape: `http://host:port`, used by Streamlit and MCP clients."""

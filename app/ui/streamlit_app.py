@@ -543,10 +543,10 @@ def _render_trace_response(payload: dict) -> None:
     _render_retrieved_chunks_viewer(payload, source=f"trace_{payload.get('trace_id', 'lookup')}")
 
 
-st.set_page_config(page_title="Evidence Q&A", layout="wide")
-st.title("Evidence-Based Q&A Assistant")
+st.set_page_config(page_title="Personal Coach AI Agent", layout="wide")
+st.title("Personal Coach AI Agent")
 
-tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace", "Training Log", "Memory"])
+tabs = st.tabs(["Chat", "Upload", "Review", "Sources", "Trace", "Training Log", "Memory", "Program Generator"])
 
 
 with tabs[0]:
@@ -1190,3 +1190,149 @@ with tabs[6]:
     elif loaded_key_proposals:
         st.info("No pending key proposals are loaded for review.")
         st.json(loaded_key_proposals)
+
+
+with tabs[7]:
+    st.subheader("Program Generator")
+    program_user_id = _clean_id_input(st.text_input("Program user ID", key="program_user_id"))
+    program_conversation_id = _clean_id_input(
+        st.text_input("Program conversation ID", value="program_conversation", key="program_conversation_id")
+    )
+    if program_user_id:
+        active_plan_response = httpx.get(
+            f"{API_BASE_URL}/api/memory/plans/active",
+            params={"user_id": program_user_id},
+            timeout=30,
+        )
+        with st.expander("Active plan and progress"):
+            if active_plan_response.is_success and active_plan_response.json():
+                st.json(active_plan_response.json())
+            elif active_plan_response.is_success:
+                st.info("No active plan.")
+            else:
+                st.error(active_plan_response.json().get("detail", active_plan_response.text))
+    if "program_messages" not in st.session_state:
+        st.session_state["program_messages"] = []
+    for item in st.session_state["program_messages"]:
+        with st.chat_message(item["role"]):
+            st.markdown(item["content"])
+
+    program_message = st.chat_input("Ask for a new plan, revision, or rationale")
+    if program_message:
+        if not program_user_id:
+            st.error("Program user ID is required.")
+        else:
+            st.session_state["program_messages"].append({"role": "user", "content": program_message})
+            response = httpx.post(
+                f"{API_BASE_URL}/api/programs/conversations/{program_conversation_id}/turns",
+                json={"user_id": program_user_id, "message": program_message},
+                timeout=300,
+            )
+            if response.is_success:
+                payload = response.json()
+                st.session_state["program_last_response"] = payload
+                st.session_state["program_messages"].append({"role": "assistant", "content": payload["response"]})
+                _rerun_app()
+            else:
+                st.error(response.json().get("detail", response.text))
+
+    program_result = st.session_state.get("program_last_response")
+    if program_result:
+        draft_program_id = program_result.get("draft_program_id")
+        draft_version_id = program_result.get("draft_version_id")
+        review_reason = st.text_input("Review note", key="program_review_reason")
+        requested_change = st.text_input("Requested plan change", key="program_requested_change")
+        col1, col2, col3, col4 = st.columns(4)
+        if col1.button("Approve plan", disabled=not bool(draft_version_id)):
+            response = httpx.post(
+                f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}/review",
+                json={"user_id": program_user_id, "decision": "approve", "reason": review_reason or None},
+                timeout=120,
+            )
+            st.session_state["program_review_result"] = response.json()
+        if col2.button("Reject plan", disabled=not bool(draft_version_id)):
+            response = httpx.post(
+                f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}/review",
+                json={"user_id": program_user_id, "decision": "reject", "reason": review_reason or None},
+                timeout=120,
+            )
+            st.session_state["program_review_result"] = response.json()
+        if col3.button("Request change", disabled=not bool(draft_version_id and requested_change)):
+            response = httpx.post(
+                f"{API_BASE_URL}/api/programs/conversations/{program_conversation_id}/turns",
+                json={"user_id": program_user_id, "message": requested_change},
+                timeout=300,
+            )
+            if response.is_success:
+                payload = response.json()
+                st.session_state["program_last_response"] = payload
+                st.session_state["program_messages"].extend(
+                    [
+                        {"role": "user", "content": requested_change},
+                        {"role": "assistant", "content": payload["response"]},
+                    ]
+                )
+                _rerun_app()
+            else:
+                st.error(response.json().get("detail", response.text))
+        if col4.button("Refresh weekly notes", disabled=not bool(program_user_id)):
+            response = httpx.post(
+                f"{API_BASE_URL}/api/training/summary-notes/refresh",
+                json={"user_id": program_user_id},
+                timeout=120,
+            )
+            st.session_state["program_weekly_notes"] = response.json()
+        if draft_program_id and draft_version_id:
+            version = httpx.get(
+                f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}",
+                timeout=60,
+            )
+            if version.is_success:
+                st.json(version.json())
+        context_id = program_result.get("context_id")
+        if context_id:
+            context_response = httpx.get(
+                f"{API_BASE_URL}/api/programs/contexts/{context_id}",
+                timeout=60,
+            )
+            if context_response.is_success:
+                context_payload = context_response.json()
+                with st.expander("SOP progress and context"):
+                    st.json(
+                        {
+                            "status": context_payload.get("status"),
+                            "active_sop": context_payload.get("active_sop"),
+                            "current_sop_step": context_payload.get("current_sop_step"),
+                            "pending_action": context_payload.get("pending_action"),
+                            "sop_progress": context_payload.get("sections", {}).get("sop_progress", {}),
+                            "evidence": context_payload.get("sections", {}).get("retrieved_evidence", []),
+                            "calculations": context_payload.get("sections", {}).get("calculation_results", []),
+                            "safety_and_warnings": context_payload.get("sections", {}).get(
+                                "safety_flags_and_budget_warnings", []
+                            ),
+                        }
+                    )
+        trace_id = program_result.get("trace_id")
+        if trace_id:
+            trace_response = httpx.get(f"{API_BASE_URL}/api/programs/traces/{trace_id}", timeout=60)
+            if trace_response.is_success:
+                with st.expander("Program trace"):
+                    st.json(trace_response.json())
+    if st.session_state.get("program_review_result"):
+        review_result = st.session_state["program_review_result"]
+        st.json(review_result)
+        xunji_confirmed = st.checkbox("Confirm Xunji write-back", key="program_xunji_confirmed")
+        if st.button(
+            "Write approved plan to Xunji",
+            disabled=not bool(xunji_confirmed and review_result.get("review_status") == "approved"),
+        ):
+            response = httpx.post(
+                f"{API_BASE_URL}/api/programs/{review_result['program_id']}/versions/{review_result['version_id']}/xunji-write",
+                json={"user_id": program_user_id, "confirmed": True},
+                timeout=120,
+            )
+            st.session_state["program_xunji_result"] = response.json()
+    if st.session_state.get("program_xunji_result"):
+        st.json(st.session_state["program_xunji_result"])
+    if st.session_state.get("program_weekly_notes"):
+        st.json(st.session_state["program_weekly_notes"])

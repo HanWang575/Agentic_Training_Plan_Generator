@@ -91,6 +91,7 @@ class CloseConversationRequest(BaseModel):
 
     closure_reason: str = "user_closed"
     extract_candidates: bool = True
+    program_context_id: str | None = None
 
 
 class EpisodeOut(BaseModel):
@@ -99,6 +100,7 @@ class EpisodeOut(BaseModel):
     episode_id: str
     user_id: str
     conversation_id: str | None = None
+    program_context_id: str | None = None
     source_type: str
     title: str | None = None
     summary: str
@@ -319,6 +321,7 @@ class PlanProgressPatchRequest(BaseModel):
     """Create or update active training-plan progress."""
 
     user_id: str
+    version_id: str | None = None
     version: int | None = None
     status: str | None = None
     current_week: int | None = None
@@ -336,16 +339,36 @@ class PlanProgressOut(BaseModel):
 
     plan_id: str
     user_id: str
+    version_id: str | None = None
     version: int
     status: str
     current_week: int | None = None
     planned_sessions: list[dict[str, Any]] = Field(default_factory=list)
+    plan_snapshot: dict[str, Any] = Field(default_factory=dict)
     plan_progress: dict[str, Any] = Field(default_factory=dict)
     progress_events: list[dict[str, Any]] = Field(default_factory=list)
     feedback: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+
+
+class PlanActivationRequest(BaseModel):
+    """Activate one complete approved program version."""
+
+    user_id: str
+    program_id: str
+    version_id: str
+    version_number: int
+    planned_sessions: list[dict[str, Any]]
+    plan_snapshot: dict[str, Any]
+
+
+class PlanActivationResponse(BaseModel):
+    """Result of the atomic active-plan replacement."""
+
+    activated_plan: PlanProgressOut
+    deactivated_plan_ids: list[str] = Field(default_factory=list)
 
 
 class TrainingLogImportRequest(BaseModel):
