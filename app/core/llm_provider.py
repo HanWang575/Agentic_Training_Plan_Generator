@@ -18,8 +18,18 @@ from app.memory.prompts import (
     build_rolling_summary_prompt,
     build_training_sport_type_prompt,
 )
-from app.program.prompts import build_program_plan_prompt
+from app.program.prompts import (
+    build_program_lift_max_extraction_prompt,
+    build_program_plan_update_prompt,
+    build_program_rationale_prompt,
+    build_program_sop_step_prompt,
+    build_program_task_router_prompt,
+)
 from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
+
+
+class StructuredOutputError(ValueError):
+    """Raised when an LLM structured-output response cannot be parsed."""
 
 
 @dataclass(slots=True)
@@ -161,16 +171,68 @@ class TrainingSportTypeRequest:
 
 
 @dataclass(slots=True)
-class ProgramPlanRequest:
-    """Structured inputs for new-program design or adaptation."""
+class ProgramSOPStepDecisionRequest:
+    """Structured inputs for one SOPStepExecutor decision."""
 
     task_type: str
+    sop_step: str
     user_message: str
     collected_inputs: dict[str, Any]
     memory_context: str
     weekly_summaries: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
-    active_plan: dict[str, Any] | None = None
+    previous_decisions: dict[str, Any]
+    raw_plan: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ProgramPlanUpdateRequest:
+    """Structured inputs for one PlanUpdater raw-plan rewrite."""
+
+    sop_step: str
+    decision: dict[str, Any]
+    raw_plan: dict[str, Any]
+    collected_inputs: dict[str, Any]
+    previous_decisions: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ProgramLiftMaxExtractionRequest:
+    """Current user-message input for LLM lift-max extraction."""
+
+    user_message: str
+
+
+@dataclass(slots=True)
+class ProgramTaskRouteRequest:
+    """Structured state supplied to the LLM Program Generator task router."""
+
+    user_turn: str
+    pending_action: str | None
+    active_task_type: str | None
+    active_sop: str | None
+    current_sop_step: str | None
+    latest_version_id: str | None
+    approval_status: str | None
+
+
+@dataclass(slots=True)
+class ProgramTaskRouteResult:
+    """Validated LLM task-routing result."""
+
+    route: str
+    rationale: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class ProgramRationaleRequest:
+    """Grounded inputs for the LLM rationale-answer node."""
+
+    question: str
+    sop_context: dict[str, Any]
+    recorded_rationale: str
+    numeric_facts: dict[str, Any] | None = None
 
 
 class OpenAIProvider:
@@ -423,7 +485,7 @@ class OpenAIProvider:
         """Generate an episodic summary for a completed training plan."""
 
         prompt = build_completed_plan_episode_prompt(request.plan_payload)
-        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=900))
+        payload = self._generate_json_object(prompt, max_tokens=900, label="CompletedPlanEpisodeWriter")
         summary = str(payload.get("summary", "")).strip()
         if not summary:
             raise ValueError("CompletedPlanEpisodeWriter returned an empty summary.")
@@ -440,25 +502,103 @@ class OpenAIProvider:
             session_payload=request.session_payload,
             allowed_labels=request.allowed_labels,
         )
-        payload = _parse_json_object(self._generate_chat_text(prompt, max_tokens=250))
+        payload = self._generate_json_object(prompt, max_tokens=250, label="TrainingSportTypeClassifier")
         sport_type = str(payload.get("sport_type", "")).strip()
         if sport_type not in set(request.allowed_labels):
             raise ValueError(f"TrainingSportTypeClassifier returned invalid sport_type: {sport_type}")
         return sport_type
 
-    def generate_program_plan(self, request: ProgramPlanRequest) -> dict[str, Any]:
-        """Generate one JSON program design for deterministic validation."""
+    def generate_program_sop_step_decision(self, request: ProgramSOPStepDecisionRequest) -> dict[str, Any]:
+        """Generate the decision for one new-program SOP step."""
 
-        prompt = build_program_plan_prompt(
+        prompt = build_program_sop_step_prompt(
             task_type=request.task_type,
+            sop_step=request.sop_step,
             user_message=request.user_message,
             collected_inputs=request.collected_inputs,
             memory_context=request.memory_context,
             weekly_summaries=request.weekly_summaries,
             evidence=request.evidence,
-            active_plan=request.active_plan,
+            previous_decisions=request.previous_decisions,
+            raw_plan=request.raw_plan,
         )
-        return _parse_json_object(self._generate_chat_text(prompt, max_tokens=6000))
+        return self._generate_json_object(prompt, max_tokens=1800, label="SOPStepExecutor")
+
+    def update_program_plan(self, request: ProgramPlanUpdateRequest) -> dict[str, Any]:
+        """Update the structured raw_plan from one SOP decision."""
+
+        prompt = build_program_plan_update_prompt(
+            sop_step=request.sop_step,
+            decision=request.decision,
+            raw_plan=request.raw_plan,
+            collected_inputs=request.collected_inputs,
+            previous_decisions=request.previous_decisions,
+        )
+        return self._generate_json_object(prompt, max_tokens=6000, label="PlanUpdater")
+
+    def extract_program_lift_maxes(self, request: ProgramLiftMaxExtractionRequest) -> dict[str, float]:
+        """Extract current user-reported lift maxes through the LLM extractor node."""
+
+        prompt = build_program_lift_max_extraction_prompt(request.user_message)
+        payload = self._generate_json_object(prompt, max_tokens=700, label="LiftMaxExtractor")
+        return _program_lift_maxes_from_payload(payload)
+
+    def generate_program_task_route(self, request: ProgramTaskRouteRequest) -> ProgramTaskRouteResult:
+        """Classify one Program Generator turn with structured LLM output."""
+
+        prompt = build_program_task_router_prompt(
+            user_turn=request.user_turn,
+            pending_action=request.pending_action,
+            active_task_type=request.active_task_type,
+            active_sop=request.active_sop,
+            current_sop_step=request.current_sop_step,
+            latest_version_id=request.latest_version_id,
+            approval_status=request.approval_status,
+        )
+        payload = self._generate_json_object(prompt, max_tokens=300, label="TaskAndSOPRouter")
+        route = str(payload.get("route", "")).strip()
+        allowed_routes = {
+            "new_program",
+            "explain_plan_rationale",
+            "clarification_answer",
+        }
+        if route not in allowed_routes:
+            raise ValueError(f"TaskAndSOPRouter returned invalid route: {route}")
+        return ProgramTaskRouteResult(
+            route=route,
+            rationale=str(payload.get("rationale", "")).strip(),
+            confidence=_clamp_float(payload.get("confidence"), default=0.0),
+        )
+
+    def generate_program_rationale(self, request: ProgramRationaleRequest) -> str:
+        """Build one question-specific rationale from stored context and numeric facts."""
+
+        prompt = build_program_rationale_prompt(
+            question=request.question,
+            sop_context=request.sop_context,
+            recorded_rationale=request.recorded_rationale,
+            numeric_facts=request.numeric_facts,
+        )
+        payload = self._generate_json_object(prompt, max_tokens=1400, label="RationaleAnswerBuilder")
+        answer = str(payload.get("answer", "")).strip()
+        if not answer:
+            raise ValueError("RationaleAnswerBuilder returned an empty answer.")
+        return answer
+
+    def _generate_json_object(self, prompt: str, max_tokens: int, label: str) -> dict[str, Any]:
+        raw_text = self._generate_chat_text(prompt, max_tokens=max_tokens)
+        try:
+            return _parse_json_object(raw_text, label=label)
+        except StructuredOutputError as first_error:
+            repair_prompt = _build_json_repair_prompt(raw_text)
+            repaired_text = self._generate_chat_text(repair_prompt, max_tokens=max_tokens)
+            try:
+                return _parse_json_object(repaired_text, label=f"{label}Repair")
+            except StructuredOutputError as repair_error:
+                raise StructuredOutputError(
+                    f"{label} returned malformed JSON after one repair attempt. "
+                    f"First error: {first_error}; repair error: {repair_error}"
+                ) from repair_error
 
     def _generate_chat_text(self, prompt: str, max_tokens: int) -> str:
         """Generate text with the configured chat model."""
@@ -481,18 +621,75 @@ class OpenAIProvider:
         return content or ""
 
 
-def _parse_json_object(text: str) -> dict:
+def _parse_json_object(text: str, label: str = "LLM") -> dict:
     """Extract one JSON object from a model response."""
 
     cleaned = text.strip()
     if not cleaned:
-        raise ValueError("Query planner returned an empty response.")
-    if cleaned.startswith("{") and cleaned.endswith("}"):
-        return json.loads(cleaned)
+        raise StructuredOutputError(f"{label} returned an empty response.")
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise _structured_json_error(label, exc) from exc
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if not match:
-        raise ValueError("Query planner did not return a JSON object.")
-    return json.loads(match.group(0))
+        raise StructuredOutputError(f"{label} did not return a JSON object.")
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        raise _structured_json_error(label, exc) from exc
+
+
+def _structured_json_error(label: str, exc: json.JSONDecodeError) -> StructuredOutputError:
+    return StructuredOutputError(
+        f"{label} returned malformed JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}."
+    )
+
+
+def _build_json_repair_prompt(raw_text: str) -> str:
+    return (
+        "Repair the following malformed JSON into one valid JSON object. "
+        "Return only the repaired JSON object. Preserve all fields and values that are present. "
+        "Do not add markdown, comments, or explanation.\n\n"
+        "MALFORMED_JSON:\n"
+        f"{raw_text}"
+    )
+
+
+def _program_lift_maxes_from_payload(payload: dict[str, Any]) -> dict[str, float]:
+    allowed = {
+        "squat_1rm_kg",
+        "bench_press_1rm_kg",
+        "deadlift_1rm_kg",
+        "overhead_press_1rm_kg",
+    }
+    raw_items = payload.get("lift_maxes", [])
+    if isinstance(raw_items, dict):
+        raw_items = [{"key": key, "value_kg": value} for key, value in raw_items.items()]
+    if not isinstance(raw_items, list):
+        return {}
+    values: dict[str, float] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", "")).strip()
+        if key not in allowed:
+            continue
+        try:
+            value = float(item.get("value_kg"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= value <= 500:
+            continue
+        confidence = _clamp_float(item.get("confidence"), default=1.0)
+        if confidence < 0.5:
+            continue
+        values[key] = value
+    return values
 
 
 def _string_list(value: Any) -> list[str]:

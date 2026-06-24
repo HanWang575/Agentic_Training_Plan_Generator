@@ -55,6 +55,13 @@ def get_program_context(
     return _run(lambda: service.get_context(context_id))
 
 
+@router.get("/programs/contexts", response_model=list[str])
+def list_program_context_ids(
+    service: ProgramService = Depends(program_service_dependency),
+) -> list[str]:
+    return _run(service.list_context_ids)
+
+
 @router.get("/programs/{program_id}/versions/{version_id}", response_model=ProgramVersionResponse)
 def get_program_version(
     program_id: str,

@@ -57,6 +57,320 @@ def _rerun_app() -> None:
         st.experimental_rerun()
 
 
+def _render_program_version_response(payload: dict) -> None:
+    """Render one ProgramVersionResponse section at a time to keep the UI responsive."""
+
+    st.markdown("#### Program Version")
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Version", payload.get("version_number", ""))
+    summary_columns[1].metric("Status", payload.get("status", ""))
+    summary_columns[2].metric("Sessions", len(payload.get("sessions", [])))
+    summary_columns[3].metric("Sport", payload.get("sport", ""))
+
+    section_names = [
+        "program_details",
+        "screening",
+        "needs_analysis",
+        "periodization",
+        "rationale",
+        "assumptions",
+        "warnings",
+        "source_references",
+        "sessions",
+    ]
+    selected_section = st.selectbox(
+        "ProgramVersionResponse section",
+        section_names,
+        key=f"program_version_section_{payload.get('version_id', 'unknown')}",
+    )
+
+    viewer_key_suffix = selected_section
+    if selected_section == "program_details":
+        section_payload = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "screening",
+                "needs_analysis",
+                "periodization",
+                "rationale",
+                "assumptions",
+                "warnings",
+                "source_references",
+                "sessions",
+            }
+        }
+    elif selected_section == "sessions":
+        sessions = payload.get("sessions", [])
+        if not sessions:
+            st.info("This version has no sessions.")
+            return
+        st.dataframe(
+            [
+                {
+                    "session_id": session.get("session_id"),
+                    "date": session.get("planned_date"),
+                    "week": session.get("week_number"),
+                    "day": session.get("day_number"),
+                    "type": session.get("session_type"),
+                    "goal": session.get("goal"),
+                    "duration_minutes": session.get("duration_minutes"),
+                    "exercises": len(session.get("exercises", [])),
+                }
+                for session in sessions
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        selected_session_id = st.selectbox(
+            "Session",
+            [session.get("session_id", f"session-{index + 1}") for index, session in enumerate(sessions)],
+            format_func=lambda session_id: next(
+                (
+                    f"Week {session.get('week_number')}, day {session.get('day_number')} - "
+                    f"{session.get('session_type')} ({session_id})"
+                    for session in sessions
+                    if session.get("session_id") == session_id
+                ),
+                session_id,
+            ),
+            key=f"program_version_session_{payload.get('version_id', 'unknown')}",
+        )
+        section_payload = next(
+            (session for session in sessions if session.get("session_id") == selected_session_id),
+            sessions[0],
+        )
+        viewer_key_suffix = f"sessions_{selected_session_id}"
+    else:
+        section_payload = payload.get(selected_section)
+
+    st.text_area(
+        "Selected section JSON",
+        value=json.dumps(section_payload, indent=2, ensure_ascii=False, default=str),
+        height=500,
+        disabled=True,
+        key=f"program_version_json_{payload.get('version_id', 'unknown')}_{viewer_key_suffix}",
+    )
+
+
+def _render_active_plan_progress(payload: dict) -> None:
+    """Render one active-plan section or session at a time."""
+
+    st.markdown("#### Active Plan And Progress")
+    sessions = payload.get("planned_sessions", [])
+    progress_by_session = payload.get("plan_progress", {}).get("sessions", {})
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Version", payload.get("version", ""))
+    summary_columns[1].metric("Status", payload.get("status", ""))
+    summary_columns[2].metric("Current week", payload.get("current_week", ""))
+    summary_columns[3].metric("Sessions", len(sessions))
+
+    plan_identity = f"{payload.get('plan_id', 'unknown')}_{payload.get('version_id', 'unknown')}"
+    selected_section = st.selectbox(
+        "Active plan section",
+        [
+            "plan_details",
+            "plan_snapshot",
+            "plan_progress",
+            "progress_events",
+            "feedback",
+            "planned_sessions",
+        ],
+        key=f"active_plan_section_{plan_identity}",
+    )
+    viewer_key_suffix = selected_section
+    if selected_section == "plan_details":
+        section_payload = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "plan_snapshot",
+                "plan_progress",
+                "progress_events",
+                "feedback",
+                "planned_sessions",
+            }
+        }
+    elif selected_section == "planned_sessions":
+        if not sessions:
+            st.info("The active plan has no planned sessions.")
+            return
+        st.dataframe(
+            [
+                {
+                    "session_id": session.get("session_id"),
+                    "date": session.get("planned_date"),
+                    "week": session.get("week_number"),
+                    "day": session.get("day_number"),
+                    "type": session.get("session_type"),
+                    "goal": session.get("goal"),
+                    "status": progress_by_session.get(session.get("session_id"), {}).get("status", "pending"),
+                    "duration_minutes": session.get("duration_minutes"),
+                    "exercises": len(session.get("exercises", [])),
+                }
+                for session in sessions
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        selected_session_id = st.selectbox(
+            "Active plan session",
+            [session.get("session_id", f"session-{index + 1}") for index, session in enumerate(sessions)],
+            format_func=lambda session_id: next(
+                (
+                    f"Week {session.get('week_number')}, day {session.get('day_number')} - "
+                    f"{session.get('session_type')} ({session_id})"
+                    for session in sessions
+                    if session.get("session_id") == session_id
+                ),
+                session_id,
+            ),
+            key=f"active_plan_session_{plan_identity}",
+        )
+        selected_session = next(
+            (session for session in sessions if session.get("session_id") == selected_session_id),
+            sessions[0],
+        )
+        section_payload = {
+            "session": selected_session,
+            "progress": progress_by_session.get(selected_session_id, {}),
+        }
+        viewer_key_suffix = f"planned_sessions_{selected_session_id}"
+    else:
+        section_payload = payload.get(selected_section)
+
+    updated_at = str(payload.get("updated_at", "unchanged")).replace(":", "_")
+    st.text_area(
+        "Selected active-plan section JSON",
+        value=json.dumps(section_payload, indent=2, ensure_ascii=False, default=str),
+        height=500,
+        disabled=True,
+        key=f"active_plan_json_{plan_identity}_{updated_at}_{viewer_key_suffix}",
+    )
+
+
+def _json_child_rows(value) -> list[dict]:
+    """Return direct children for a JSON-like container."""
+
+    if isinstance(value, dict):
+        return [
+            {
+                "selector": str(key),
+                "label": str(key),
+                "value": child,
+            }
+            for key, child in value.items()
+        ]
+    if isinstance(value, list):
+        return [
+            {
+                "selector": str(index),
+                "label": f"[{index}]",
+                "value": child,
+            }
+            for index, child in enumerate(value)
+        ]
+    return []
+
+
+def _render_json_path_picker(
+    value,
+    *,
+    context_id: str,
+    base_key: str,
+    max_depth: int = 3,
+) -> tuple[list[str], object, bool]:
+    """Let the user drill into nested JSON without eagerly rendering large parents."""
+
+    current = value
+    path: list[str] = []
+    render_whole = not isinstance(current, (dict, list))
+    for depth in range(1, max_depth + 1):
+        children = _json_child_rows(current)
+        if not children:
+            render_whole = True
+            break
+        summary_option = "__summary__"
+        whole_option = "__whole__"
+        child_options = [child["selector"] for child in children]
+        options = [summary_option] + child_options + [whole_option]
+        label_by_selector = {child["selector"]: child["label"] for child in children}
+        selected = st.selectbox(
+            f"Level {depth} subsection",
+            options,
+            format_func=lambda option: (
+                "(show subsection list only)"
+                if option == summary_option
+                else "(show whole current object)"
+                if option == whole_option
+                else label_by_selector.get(option, option)
+            ),
+            key=f"program_context_path_{context_id}_{base_key}_{depth}_{'_'.join(path) or 'root'}",
+        )
+        if selected == summary_option:
+            return path, current, False
+        if selected == whole_option:
+            return path, current, True
+        selected_child = next(child for child in children if child["selector"] == selected)
+        path.append(selected_child["label"])
+        current = selected_child["value"]
+        render_whole = True
+    return path, current, render_whole
+
+
+def _render_program_context_debug(context_payload: dict) -> None:
+    """Render ProgramContext metadata and one selected section at a time."""
+
+    context_id = context_payload.get("context_id", "unknown")
+    metadata = {key: value for key, value in context_payload.items() if key != "sections"}
+    st.markdown("##### ProgramContext metadata")
+    st.text_area(
+        "Metadata JSON",
+        value=json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
+        height=220,
+        disabled=True,
+        key=f"program_context_metadata_{context_id}",
+    )
+
+    sections = context_payload.get("sections", {})
+    if not isinstance(sections, dict) or not sections:
+        st.info("This ProgramContext has no stored sections.")
+        return
+
+    st.markdown("##### Sections")
+    section_names = list(sections)
+    selected_section = st.selectbox(
+        "ProgramContext section",
+        section_names,
+        key=f"program_context_section_{context_id}",
+    )
+    section_content = sections.get(selected_section)
+    path, selected_payload, should_render = _render_json_path_picker(
+        section_content,
+        context_id=str(context_id),
+        base_key=selected_section,
+        max_depth=3,
+    )
+    selected_path = ".".join([selected_section, *path])
+    st.caption(f"Selected path: {selected_path}")
+    if should_render:
+        if isinstance(selected_payload, (dict, list)):
+            value = json.dumps(selected_payload, indent=2, ensure_ascii=False, default=str)
+        else:
+            value = str(selected_payload)
+        st.text_area(
+            "Selected path JSON",
+            value=value,
+            height=650,
+            disabled=True,
+            key=f"program_context_section_json_{context_id}_{selected_section}_{'_'.join(path) or 'root'}",
+        )
+    else:
+        st.info("Choose a subsection above, or choose 'show whole current object' to render this object.")
+
+
 def _fetch_memory_items_for_review(user_id: str, status: str = "candidate") -> list[dict]:
     """Load memory items for the review queue UI."""
 
@@ -1204,20 +1518,19 @@ with tabs[7]:
             params={"user_id": program_user_id},
             timeout=30,
         )
-        with st.expander("Active plan and progress"):
-            if active_plan_response.is_success and active_plan_response.json():
-                st.json(active_plan_response.json())
-            elif active_plan_response.is_success:
-                st.info("No active plan.")
-            else:
-                st.error(active_plan_response.json().get("detail", active_plan_response.text))
+        if active_plan_response.is_success and active_plan_response.json():
+            _render_active_plan_progress(active_plan_response.json())
+        elif active_plan_response.is_success:
+            st.info("No active plan.")
+        else:
+            st.error(active_plan_response.json().get("detail", active_plan_response.text))
     if "program_messages" not in st.session_state:
         st.session_state["program_messages"] = []
     for item in st.session_state["program_messages"]:
         with st.chat_message(item["role"]):
             st.markdown(item["content"])
 
-    program_message = st.chat_input("Ask for a new plan, revision, or rationale")
+    program_message = st.chat_input("Ask for a new plan or rationale")
     if program_message:
         if not program_user_id:
             st.error("Program user ID is required.")
@@ -1241,8 +1554,7 @@ with tabs[7]:
         draft_program_id = program_result.get("draft_program_id")
         draft_version_id = program_result.get("draft_version_id")
         review_reason = st.text_input("Review note", key="program_review_reason")
-        requested_change = st.text_input("Requested plan change", key="program_requested_change")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         if col1.button("Approve plan", disabled=not bool(draft_version_id)):
             response = httpx.post(
                 f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}/review",
@@ -1257,25 +1569,7 @@ with tabs[7]:
                 timeout=120,
             )
             st.session_state["program_review_result"] = response.json()
-        if col3.button("Request change", disabled=not bool(draft_version_id and requested_change)):
-            response = httpx.post(
-                f"{API_BASE_URL}/api/programs/conversations/{program_conversation_id}/turns",
-                json={"user_id": program_user_id, "message": requested_change},
-                timeout=300,
-            )
-            if response.is_success:
-                payload = response.json()
-                st.session_state["program_last_response"] = payload
-                st.session_state["program_messages"].extend(
-                    [
-                        {"role": "user", "content": requested_change},
-                        {"role": "assistant", "content": payload["response"]},
-                    ]
-                )
-                _rerun_app()
-            else:
-                st.error(response.json().get("detail", response.text))
-        if col4.button("Refresh weekly notes", disabled=not bool(program_user_id)):
+        if col3.button("Refresh weekly notes", disabled=not bool(program_user_id)):
             response = httpx.post(
                 f"{API_BASE_URL}/api/training/summary-notes/refresh",
                 json={"user_id": program_user_id},
@@ -1283,12 +1577,25 @@ with tabs[7]:
             )
             st.session_state["program_weekly_notes"] = response.json()
         if draft_program_id and draft_version_id:
-            version = httpx.get(
-                f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}",
-                timeout=60,
-            )
-            if version.is_success:
-                st.json(version.json())
+            version_cache_key = f"{draft_program_id}:{draft_version_id}"
+            cached_version_key = st.session_state.get("program_version_cache_key")
+            refresh_version = st.button("Refresh ProgramVersionResponse")
+            if refresh_version or cached_version_key != version_cache_key:
+                version = httpx.get(
+                    f"{API_BASE_URL}/api/programs/{draft_program_id}/versions/{draft_version_id}",
+                    timeout=60,
+                )
+                if version.is_success:
+                    st.session_state["program_version_cache_key"] = version_cache_key
+                    st.session_state["program_version_response"] = version.json()
+                else:
+                    st.error(version.json().get("detail", version.text))
+            version_payload = st.session_state.get("program_version_response")
+            if (
+                st.session_state.get("program_version_cache_key") == version_cache_key
+                and version_payload
+            ):
+                _render_program_version_response(version_payload)
         context_id = program_result.get("context_id")
         if context_id:
             context_response = httpx.get(
@@ -1306,7 +1613,6 @@ with tabs[7]:
                             "pending_action": context_payload.get("pending_action"),
                             "sop_progress": context_payload.get("sections", {}).get("sop_progress", {}),
                             "evidence": context_payload.get("sections", {}).get("retrieved_evidence", []),
-                            "calculations": context_payload.get("sections", {}).get("calculation_results", []),
                             "safety_and_warnings": context_payload.get("sections", {}).get(
                                 "safety_flags_and_budget_warnings", []
                             ),
@@ -1336,3 +1642,46 @@ with tabs[7]:
         st.json(st.session_state["program_xunji_result"])
     if st.session_state.get("program_weekly_notes"):
         st.json(st.session_state["program_weekly_notes"])
+
+    st.divider()
+    st.markdown("#### ProgramContext Debug")
+    default_debug_context_id = program_result.get("context_id", "") if program_result else ""
+    debug_context_id = _clean_id_input(
+        st.text_input(
+            "Context ID",
+            value=default_debug_context_id,
+            key="program_debug_context_id",
+        )
+    )
+    debug_col1, debug_col2 = st.columns(2)
+    if debug_col1.button("Load ProgramContext", disabled=not bool(debug_context_id)):
+        response = httpx.get(
+            f"{API_BASE_URL}/api/programs/contexts/{debug_context_id}",
+            timeout=60,
+        )
+        if response.is_success:
+            st.session_state["program_debug_context"] = response.json()
+        else:
+            st.session_state.pop("program_debug_context", None)
+            st.error(response.json().get("detail", response.text))
+    if debug_col2.button("Show all context IDs"):
+        response = httpx.get(f"{API_BASE_URL}/api/programs/contexts", timeout=60)
+        if response.is_success:
+            st.session_state["program_context_ids"] = response.json()
+        else:
+            st.error(response.json().get("detail", response.text))
+
+    context_ids = st.session_state.get("program_context_ids")
+    if context_ids is not None:
+        if context_ids:
+            st.dataframe(
+                [{"context_id": context_id} for context_id in context_ids],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("No ProgramContext records found.")
+
+    debug_context = st.session_state.get("program_debug_context")
+    if debug_context and debug_context.get("context_id") == debug_context_id:
+        _render_program_context_debug(debug_context)

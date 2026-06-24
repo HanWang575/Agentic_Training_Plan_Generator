@@ -1,1 +1,1 @@
-"""Training program generation, review, and adaptation block."""
+"""Training program generation and review block."""

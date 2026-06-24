@@ -13,7 +13,7 @@ Core responsibilities:
 - Maintain one checkpointed `ProgramContext` for each open Program Generator conversation and update the corresponding context sections after every user turn, tool result, and completed SOP step.
 - Record every user and assistant message through the User Profile And Memory block; when the conversation closes, let the Memory block create an `Episode` using the same conversation lifecycle used by the Q&A Assistant.
 - Use a LangGraph reasoning-and-actioning loop that can decide whether to query RAG, ask the user, run deterministic calculation tools, or produce a plan step.
-- Pre-calculate every numeric plan prescription through deterministic tools, including weights, sets, reps, rest times, paces, durations, intensities, volume totals, and progression increments.
+- Pre-calculate every numeric strength-plan prescription through deterministic tools, including weights, sets, reps, rest times, session durations, intensities, volume totals, and progression increments.
 - Save generated or revised plans as draft plan versions, send approved versions to the Memory block for activation and progress tracking, and write approved plans to Xunji when configured.
 - Adapt the remaining plan when the user misses or cannot complete a planned session because of schedule conflicts, sickness, poor sleep, insufficient recovery, insufficient training level, pain, or other feedback.
 - Expose generation, review, adaptation, calculator, summary, and trace capabilities through backend APIs and MCP tools.
@@ -126,7 +126,6 @@ PROGRAM_MACHINE_LOAD_ROUNDING_KG=2.5
 PROGRAM_BODYWEIGHT_LOAD_ROUNDING_KG=0.5
 PROGRAM_REST_ROUNDING_SECONDS=5
 PROGRAM_DURATION_ROUNDING_SECONDS=60
-PROGRAM_PACE_ROUNDING_SECONDS_PER_KM=1
 
 PROGRAM_REQUIRE_APPROVAL_BEFORE_ACTIVATION=true
 PROGRAM_REQUIRE_APPROVAL_BEFORE_XUNJI_WRITE=true
@@ -216,7 +215,7 @@ flowchart TD
     NEW --> NEWOUT["Output to Reasoning Loop<br/>(new ProgramContext, SOP, current step)"]:::handoff
     ROUTE -->|revise_current_plan| REV["Use existing ProgramContext<br/>(Current Plan Revision/Adaptation SOP)"]
     REV --> EXISTOUT["Output to Reasoning Loop<br/>(existing ProgramContext, SOP, current step)"]:::handoff
-    ROUTE -->|explain_plan_rationale| WHY["RationaleAnswerBuilder<br/>read SOP progress and linked support"]
+    ROUTE -->|explain_plan_rationale| WHY["LLM RationaleAnswerBuilder<br/>read SOP progress, linked support, and deterministic numeric facts"]
     ROUTE -->|clarification_answer| RESUME["Use existing ProgramContext<br/>(resume pending SOP step)"]
     RESUME --> EXISTOUT
     ROUTE -->|review_or_approval| REVIEW["Output to Review/Approval<br/>(review or approval decision)"]:::handoff
@@ -225,7 +224,7 @@ flowchart TD
 
 
 
-`TaskAndSOPRouter` reads `current_user_turn`, `active_task_type`, `active_sop`, `current_sop_step`, and pending clarification/review/approval state from the current ProgramContext. A new-plan request refreshes the existing ProgramContext (empty some program design related sections including `retrieved_evidence`, `sop_progress,` Active task working state, `draft_artifacts` and `source_and_trace_references`, and `calculation_results`) before entering the New Program Design SOP. Revision and clarification-answer routes retain and update the existing ProgramContext. `explain_plan_rationale` creates no context: it reads the existing `sop_progress` and linked evidence, calculations, user inputs, and plan/version references, then returns an explanation.
+The LLM-backed `TaskAndSOPRouter` reads `current_user_turn`, `active_task_type`, `active_sop`, `current_sop_step`, active-version/approval state, and pending clarification state from the current ProgramContext. It returns one validated route plus a short rationale and confidence. The route is selected once per user turn and locked during the reasoning/action loop. A new-plan request refreshes the existing ProgramContext (empty some program design related sections including `retrieved_evidence`, `sop_progress,` Active task working state, and `draft_artifacts`) before entering the New Program Design SOP. Revision and clarification-answer routes retain and update the existing ProgramContext. `explain_plan_rationale` creates no context: deterministic code selects any relevant prescription and calculation-chain facts, then the LLM `RationaleAnswerBuilder` tailors an explanation from those facts and the existing SOP progress/context.
 
 ### 4.3 Reasoning, Actioning, And Context Update Loop
 
@@ -261,7 +260,7 @@ flowchart TD
     ACTION -->|write_step_output| STEP["SOPStepExecutor"]
     ACTION -->|ask_user, max 5| ASK["Output to Clarification Flow<br/>(question and pending step)"]:::handoff
     RAG --> RPATCH["Build evidence-section patch"]
-    CALC --> CPATCH["Build calculation-section patch"]
+    CALC --> CPATCH["Build calculation-artifacts patch<br/>(active working state)"]
     STEP --> SOPTYPE{"Active SOP type"}
     SOPTYPE -->|new program| NPATCH["Build patch set<br/>(new_program_working_state + sop_progress)"]
     SOPTYPE -->|revision/adaptation| APATCH["Build patch set<br/>(revision_adaptation_working_state + sop_progress)"]
@@ -284,7 +283,7 @@ flowchart TD
 
 Every action returns one typed `ProgramContextPatch` or a validated patch set. `SOPStepExecutor` returns a patch set containing one update for the corresponding working-state section and one update for `sop_progress`. Each individual patch may update only its declared section. No patch may overwrite read-only `MemoryContext` data, weekly summaries, prior calculation traces, or prior evidence records.
 
-For the New Program Design SOP, step outputs populate fields such as health screening, needs analysis, periodization, planning model, programming decisions, and prescriptions in `new_program_working_state`. For the Current Program Revision And Adaptation SOP, they populate the revision trigger, protected goals, impact analysis, affected variables, proposed changes, and changed/unchanged elements in `revision_adaptation_working_state`.
+For the New Program Design SOP, step outputs populate fields such as health screening, needs analysis, periodization, planning model, programming decisions, and prescriptions in `sop_progress.decisions` and `new_program_working_state`. For the Current Program Revision And Adaptation SOP, they populate protected goals, impact analysis, affected variables, proposed changes, and changed/unchanged elements in `sop_progress.decisions` and `revision_adaptation_working_state`.
 
 `Finalizer` runs only after the selected SOP is complete. It has one path: build the draft/revision patch, validate and apply it, checkpoint the updated ProgramContext, and then send that saved draft to user review.
 
@@ -383,22 +382,21 @@ created_at, updated_at, closed_at
 Both `program_generation` and `program_adaptation` request `plan_context_level=full`.
 
 
-| ProgramContext section                              | Content and ownership                                                                                                                                                                                                                                                                          | Token cap |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| `current_user_turn`                                 | Current user message and normalized input                                                                                                                                                                                                                                                      | 1000      |
-| `memory_context`                                    | Complete read-only `MemoryContext` from the Memory block                                                                                                                                                                                                                                       | 34000     |
-| `latest_four_week_summary_notes`                    | Read-only Program Generator summaries                                                                                                                                                                                                                                                          | 2000      |
-| `retrieved_evidence`                                | Append-preserving RAG results and citations                                                                                                                                                                                                                                                    | 6000      |
-| `user_clarification_answers`                        | Append-preserving user answers                                                                                                                                                                                                                                                                 | 2000      |
-| `sop_progress`                                      | Current step, completed steps, decisions, rationale, and linked support                                                                                                                                                                                                                        | 2000      |
-| Active task working state                           | `new_program_working_state` or `revision_adaptation_working_state`, used by the program generator agent for brain stomming and recording its internal monologue (i.e., decisions, assumptions, rationales, alternatives, source links for each SOP step), can be updated during each SOP step. | 10000     |
-| `draft_artifacts` and `source_and_trace_references` | Draft output and provenance references                                                                                                                                                                                                                                                         | 5000      |
-| `calculation_results`                               | Deterministic outputs and trace IDs                                                                                                                                                                                                                                                            | 3000      |
-| `safety_flags_and_budget_warnings`                  | Blocking or limiting conditions                                                                                                                                                                                                                                                                | 1000      |
-| **Planned maximum**                                 | `PROGRAM_MAX_CONTEXT_TOKENS=66000`                                                                                                                                                                                                                                                             | **66000** |
+| ProgramContext section             | Content and ownership                                                                                                                                                                                                                                                                                                                                                                                             | Token cap |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `current_user_turn`                | Current user message and normalized input                                                                                                                                                                                                                                                                                                                                                                         | 1000      |
+| `memory_context`                   | Compact read-only copy of the Memory block context: section text, memory IDs, trace ID, token estimate, and budget warnings. `rendered_context` and debug metadata are not checkpointed in ProgramContext; prompt text is rendered from the stored sections when needed. The Memory block API remains unchanged.                                                                                                  | 34000     |
+| `latest_four_week_summary_notes`   | Read-only Program Generator summaries                                                                                                                                                                                                                                                                                                                                                                             | 2000      |
+| `retrieved_evidence`               | Full retrieved evidence for the current SOP step only, stored as `{current_step, items}`. Historical step-to-evidence mapping lives compactly in `sop_progress.evidence_refs_by_step`; full audit rows remain in `ProgramTrace`, `ProgramToolCall`, `ProgramCitation`, and the knowledge store.                                                                                                                   | 6000      |
+| `user_clarification_answers`       | Append-preserving user answers                                                                                                                                                                                                                                                                                                                                                                                    | 2000      |
+| `sop_progress`                     | Current step, completed steps, decisions, rationale, and linked support                                                                                                                                                                                                                                                                                                                                           | 2000      |
+| Active task working state          | `new_program_working_state` or `revision_adaptation_working_state`, used by the program generator agent for brain stomming and recording SOP decisions. Keep the LLM `raw_plan` as the high-level template and store deterministic expansion as `calculation_artifacts` (`calculated_sessions` plus `calculated_periodization`); derive the full calculated plan only when finalizing or serving a review object. | 10000     |
+| `draft_artifacts`                  | Draft output IDs required by the frontend review flow                                                                                                                                                                                                                                                                                                                                                             | 5000      |
+| `safety_flags_and_budget_warnings` | Blocking or limiting conditions                                                                                                                                                                                                                                                                                                                                                                                   | 1000      |
+| **Planned maximum**                | `PROGRAM_MAX_CONTEXT_TOKENS=66000`                                                                                                                                                                                                                                                                                                                                                                                | **66000** |
 
 
-Each accepted patch updates only its declared section, increments `context_revision`, and is checkpointed. Evidence, calculations, answers, and traces may be superseded with a reason but must not be silently overwritten. Memory-owned data is never patched by this block.
+Each accepted patch updates only its declared section, increments `context_revision`, and is checkpointed. Evidence, answers, and traces may be superseded with a reason but must not be silently overwritten. Full calculation audit stays in `CalculationTrace` rows and prescription-specific trace links, not in ProgramContext sections. Memory-owned data is never patched by this block.
 
 The Memory outline owns the internal `MemoryContext` section caps. These caps are maxima, not targets. Before every LLM call, count the assembled prompt. If it exceeds 66000 tokens, pause, send a warining to the user through frontend, mentioen all sections exceeding their limit and let the user decide if the generation process should continue or stop and close the conversation; never silently remove protected plan details, safety information, provenance, or calculation traces.
 
@@ -420,34 +418,22 @@ The reasoning loop may pause any SOP step to retrieve evidence, ask the user, or
 2. **Needs analysis:** define goal/sport demands, training status, constraints, schedule, equipment, movement needs, and limiting factors.
 3. **Periodization:** establish the macrocycle, mesocycles, microcycles, phases, and target timeline.
 4. **Planning model:** choose `parallel`, `sequential`, or `emphasis` and record why.
-5. **Programming decisions:** based on needs analysis, choose modes, methods, intensities, volumes, loading patterns, set types, and session types.
-6. **Exercise selection:** match exercises to the needs analysis.
-7. **Frequency:** fit session frequency to goal, schedule, recovery, and training age.
-8. **Exercise order:** arrange technical priority, goal priority, fatigue, and safety.
-9. **Load and repetitions:** calculate load, effort, reps, distance, pace, duration, and intervals.
-10. **Volume:** calculate session, week, and block workload in suitable units.
-11. **Rest periods:** calculate recovery intervals after intensity and volume are known.
-12. **Final review:** validate safety, recovery, progression, constraints, evidence, schema, and numeric completeness.
+5. **Programming decisions - Exercises and Order:** based on needs analysis and retrieved knowledges, choose exercises, their training frequency, and decide their order in a session.
+6. **Programming decisions - Intensity and Volumn:** based on needs analysis and retrieved knowledges, for each planned exercises, choose their intensities, repetitions, loading patterns, set types, and session types.
+7. **Load calculation:** calculate `load_kg` for each exercise in each session.
+  Every exercise must be classified as `weighted` or `bodyweight`. A weighted exercise requires an available 1RM record or recent weight-and-repetition record for that exercise in Memory, or a current user-provided 1RM. If no valid load reference exists in the memory, ask the user for that raw performance input and estimate the exercise 1RM with a deterministic calculator before calculating every `load_kg`. Only bodyweight exercises may retain `load_kg=null`.
+8. **Volume calculation:** calculate session and week workload in suitable units.
+9. **Rest periods:** calculate recovery intervals after intensity and volume are known.
 
 ### 6.2 Current Plan Revision Or Adaptation
 
-1. Classify the trigger: goal, schedule, equipment, preference, performance, difficulty, recovery, pain/safety, or missed session.
-2. Use the full active plan/version and progress shown in the "`active_plan_progress`" section of the memory context as the baseline, do not mutate the Memory-owned active plan before approval.
-3. Identify protected goals, safety constraints, timeline, emphases, and unaffected elements.
-4. Analyze effects of the potential revision/adaption on future sessions, blocks, calculations, evidence-backed decisions, and progress links.
-5. Choose the smallest coherent change or the missed-session branch below.
-6. Recalculate every affected number.
-7. Create a new draft version listing changed and unchanged elements, rationale behind and calculations.
-
-### 6.3 Missed Or Impossible Session Branch
-
-1. Separate schedule conflict from recovery, illness, pain, or fatigue.
-2. Protect the training goal and periodized sequence rather than the exact date.
-3. For schedule conflict, reschedule within the current or nearby microcycle without stacking all missed work.
-4. For recovery limitation, reduce fatigue load and allow recovery before the next hard session.
-5. Redistribute key work coherently across remaining sessions.
-6. Adjust in this order: frequency, volume, intensity, exercise selection/order, rest.
-7. Avoid failure-based work when fatigue or recovery risk is high.
+1. **Trigger classification**: Classify the trigger: goal, schedule, equipment, preference, performance, difficulty, recovery, pain/safety, or missed session.
+2. **Load existing plan**: Use the full active plan/version and progress shown in the "`active_plan_progress`" section of the memory context as the baseline, do not mutate the Memory-owned active plan before approval.
+3. **Identify Constraints**: Identify protected goals, safety constraints, timeline, emphases, and unaffected elements.
+4. **Assess Impact**: Analyze effects of the potential revision/adaption on future sessions, evidence-backed decisions, and progress links.
+5. **Select Revision**: Choose the smallest coherent change according to the current progress of the plan to be revised, the trigger and retrieved knowledge.
+6. **Recalculation**: Recalculate every affected number.
+7. **Draft Plan Update**: Create a new draft version listing changed and unchanged elements, rationale behind and calculations.
 
 ## 7. Output And Validation Rules
 
@@ -504,19 +490,19 @@ Program artifact status in this database describes generation/review only. Activ
 Sections 4.1-4.5 are the authoritative graph. Implement their labels as small typed nodes or deterministic services.
 
 
-| Component                            | Contract                                                                                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `TaskAndSOPRouter`                   | Read only the current ProgramContext; create a new context for a new plan, reuse it for revision/resume, or route rationale/review actions |
-| `SOPStepReadinessAssessor`           | Return ready/not-ready or missing inputs                                                                                                   |
-| `ReasoningActionRouter`              | Based on the outputs of `SOPStepReadinessAssessor`, choose RAG, user clarification, calculation, step output, or finalization              |
-| `SOPStepExecutor`                    | Produce a working-state patch and an SOP-progress patch for the active SOP                                                                 |
-| `RAGQueryToolNode`                   | Retrieve approved evidence                                                                                                                 |
-| `CalculatorToolNode`                 | Run deterministic calculators and return traceable outputs                                                                                 |
-| Patch validator/updater/checkpointer | Validate section ownership, apply patches atomically, and persist the incremented context revision                                         |
-| `Finalizer`                          | Build the draft-artifact patch only after the SOP is complete                                                                              |
-| `RationaleAnswerBuilder`             | Explain recorded SOP decisions without changing planning state                                                                             |
-| Response/approval handlers           | Record output, persist drafts, process review, and automatically run the Memory activation/deactivation transaction after approval         |
-| `ProgramTraceLogger`                 | Record actions, context revisions, source IDs, calculations, warnings, errors, and timings                                                 |
+| Component                            | Contract                                                                                                                                                                 |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TaskAndSOPRouter`                   | Use structured LLM output over the current ProgramContext to select a validated route once per turn; reuse the locked route during revision/resume and reasoning actions |
+| `SOPStepReadinessAssessor`           | Return ready/not-ready or missing inputs                                                                                                                                 |
+| `ReasoningActionRouter`              | Based on the outputs of `SOPStepReadinessAssessor`, choose RAG, user clarification, calculation, step output, or finalization                                            |
+| `SOPStepExecutor`                    | Produce a working-state patch and an SOP-progress patch for the active SOP                                                                                               |
+| `RAGQueryToolNode`                   | Retrieve approved evidence                                                                                                                                               |
+| `CalculatorToolNode`                 | Run deterministic calculators and return traceable outputs                                                                                                               |
+| Patch validator/updater/checkpointer | Validate section ownership, apply patches atomically, and persist the incremented context revision                                                                       |
+| `Finalizer`                          | Build the draft-artifact patch only after the SOP is complete                                                                                                            |
+| `RationaleAnswerBuilder`             | Use an LLM to tailor an answer from recorded SOP context and deterministically selected numeric facts without changing planning state                                    |
+| Response/approval handlers           | Record output, persist drafts, process review, and automatically run the Memory activation/deactivation transaction after approval                                       |
+| `ProgramTraceLogger`                 | Record actions, context revisions, source IDs, calculations, warnings, errors, and timings                                                                               |
 
 
 Keep transient graph state small:
@@ -559,11 +545,10 @@ Use `FastMCP` to expose thin, typed wrappers over existing backend services. MCP
 - `calculate_volume_load`
 - `calculate_session_duration`
 - `calculate_rest_interval`
-- `calculate_distance_pace_time`
 - `calculate_weekly_frequency`
 - `calculate_progression_increment`
 
-Every calculated numeric prescription in a generated or adapted plan must be created or validated by deterministic calculator tools. The LLM may request raw inputs from the user, but it must not ask the user to calculate 1RM, percentages, loads, rest times, durations, paces, or weekly volume.
+Every calculated numeric prescription in a generated or adapted plan must be created or validated by deterministic calculator tools. The LLM may request raw inputs from the user, but it must not ask the user to calculate 1RM, percentages, loads, rest times, session durations, or weekly volume.
 
 Each calculated value must record its value, unit, inputs and their sources, formula or method, rounding policy, tool name, and tool-call ID. Calculator MCP tools and calculator HTTP endpoints must call the same backend calculator service.
 
@@ -624,7 +609,7 @@ Minimum tests:
 - New-program and revision/adaptation SOP order is enforced.
 - RAG and user-question limits never exceed five per SOP steps.
 - Clarification answers re-enter through section 4.1 and resume the pending step.
-- Rationale explanations are read-only and use recorded SOP support.
+- Rationale explanations are read-only; an LLM uses recorded SOP support while numeric inputs remain grounded in persisted calculator traces.
 - Every visible numeric prescription has a valid calculation trace.
 - Red flags block normal planning; missing evidence and assumptions are disclosed.
 - Missed-session routing distinguishes schedule conflict from recovery limitation and preserves adjustment priority.

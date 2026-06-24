@@ -1,4 +1,4 @@
-"""Readable orchestration service for program generation and adaptation."""
+"""Readable orchestration service for program generation."""
 
 from __future__ import annotations
 
@@ -15,12 +15,19 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError, NotFoundError
-from app.core.llm_provider import OpenAIProvider, ProgramPlanRequest
+from app.core.llm_provider import (
+    OpenAIProvider,
+    ProgramPlanUpdateRequest,
+    ProgramLiftMaxExtractionRequest,
+    ProgramSOPStepDecisionRequest,
+    StructuredOutputError,
+)
 from app.knowledge.service import KnowledgeService
+from app.memory.nodes import render_sections
 from app.memory.schemas import PlanActivationRequest
-from app.memory.service import MemoryService
+from app.memory.service import MemoryService, compact_active_plan_payload
 from app.program.calculators import CalculatorService
-from app.program.graph import run_program_generator_graph
+from app.program.graph import run_program_generator_graph, run_program_rationale_graph
 from app.program.nodes import ProgramContextPatchValidator
 from app.program.schemas import (
     CalculationResult,
@@ -45,7 +52,6 @@ from app.program.schemas import (
 from app.storage.models import (
     CalculationTrace,
     ExercisePrescription,
-    ProgramAdaptation,
     ProgramCitation,
     ProgramContextRecord,
     ProgramRequest,
@@ -66,38 +72,24 @@ NEW_PROGRAM_SOP = [
     "needs_analysis",
     "periodization",
     "planning_model",
-    "programming_decisions",
-    "exercise_selection",
-    "frequency",
-    "exercise_order",
-    "load_and_repetitions",
-    "volume",
+    "programming_exercises_and_order",
+    "programming_intensity_and_volume",
+    "load_calculation",
+    "volume_calculation",
     "rest_periods",
-    "final_review",
 ]
 
-ADAPTATION_SOP = [
-    "classify_trigger",
-    "load_active_baseline",
-    "protect_goals_and_constraints",
-    "analyze_future_effects",
-    "choose_smallest_coherent_change",
-    "recalculate_affected_numbers",
-    "create_reviewable_revision",
-]
+DETERMINISTIC_GENERATION_STEPS = {"load_calculation", "volume_calculation"}
 
 PROGRAM_SECTION_DEFAULTS: dict[str, Any] = {
     "current_user_turn": {},
     "memory_context": {},
     "latest_four_week_summary_notes": [],
-    "retrieved_evidence": [],
+    "retrieved_evidence": {"current_step": None, "items": []},
     "user_clarification_answers": [],
     "sop_progress": {},
     "new_program_working_state": {},
-    "revision_adaptation_working_state": {},
     "draft_artifacts": {},
-    "source_and_trace_references": {},
-    "calculation_results": [],
     "safety_flags_and_budget_warnings": [],
 }
 
@@ -175,15 +167,17 @@ class ProgramService:
             task_type="program_generator",
             include_debug=True,
         )
-        sections["memory_context"] = memory_context.model_dump(mode="json")
+        sections["memory_context"] = _compact_memory_context_for_program_context(
+            memory_context.model_dump(mode="json")
+        )
         summary_response = self.list_weekly_summaries(request.user_id, limit=4)
         sections["latest_four_week_summary_notes"] = [item.model_dump(mode="json") for item in summary_response.notes]
-        self._inherit_active_program_context(context, sections)
-        warnings = [str(item.get("message", item)) for item in memory_context.budget_warnings]
-        warnings.extend(self._context_budget_warnings(sections))
-        sections["safety_flags_and_budget_warnings"] = list(
-            dict.fromkeys(sections.get("safety_flags_and_budget_warnings", []) + warnings)
-        )
+        self._refresh_budget_warnings(sections)
+        warnings = [
+            item
+            for item in sections.get("safety_flags_and_budget_warnings", [])
+            if _is_budget_warning(item)
+        ]
         if context.pending_action == "waiting_for_context_budget_decision":
             normalized = request.message.strip().lower()
             if normalized in {"stop", "close", "stop and close", "cancel"}:
@@ -202,12 +196,31 @@ class ProgramService:
                 return self._turn_response(context, response, trace_id, warnings=warnings)
             if normalized in {"continue", "continue generation", "proceed"}:
                 progress = dict(sections.get("sop_progress", {}))
+                pending_turn = progress.pop("context_budget_pending_turn", None)
+                if pending_turn:
+                    sections["current_user_turn"] = pending_turn
                 progress["context_budget_override"] = True
                 sections["sop_progress"] = progress
                 context.pending_action = None
+                context.status = "open"
+        self._checkpoint(context, sections)
+
+        initial_state = self._graph_state(context)
+        routed = run_program_generator_graph(initial_state, self.llm_provider)
+        route = routed.get("route", "new_program")
+        task_type = "program_generation"
+        context.current_turn_route = route
+        context.active_task_type = task_type
+
+        if route == "explain_plan_rationale":
+            return self._rationale_response(context, started)
+
         budget_exceeded = any(item.startswith("ProgramContext") for item in warnings)
         budget_override = bool(sections.get("sop_progress", {}).get("context_budget_override"))
         if budget_exceeded and not budget_override:
+            progress = dict(sections.get("sop_progress", {}))
+            progress.setdefault("context_budget_pending_turn", sections.get("current_user_turn", {}))
+            sections["sop_progress"] = progress
             context.status = "waiting_for_user"
             context.pending_action = "waiting_for_context_budget_decision"
             self._checkpoint(context, sections)
@@ -218,26 +231,13 @@ class ProgramService:
             trace_id = self._trace(context, "context_budget_warning", {"warnings": warnings})
             self._assistant_message(context, response)
             return self._turn_response(context, response, trace_id, warnings=warnings)
-        self._checkpoint(context, sections)
 
-        initial_state = self._graph_state(context)
-        routed = run_program_generator_graph(initial_state)
-        route = routed.get("route", "new_program")
-        task_type = routed.get("task_type", "program_generation")
-        context.current_turn_route = route
-        context.active_task_type = task_type
-
-        if route == "explain_plan_rationale":
-            return self._rationale_response(context, started)
+        effective_message = str(sections.get("current_user_turn", {}).get("content", request.message))
 
         if route == "new_program":
             self._reset_new_program_sections(sections)
             context.active_sop = "new_program_design"
             context.current_sop_step = NEW_PROGRAM_SOP[0]
-        elif route == "revise_current_plan":
-            self._start_adaptation_sop(sections)
-            context.active_sop = "current_plan_revision_adaptation"
-            context.current_sop_step = ADAPTATION_SOP[0]
         else:
             answers = list(sections.get("user_clarification_answers", []))
             answers.append(sections["current_user_turn"])
@@ -249,26 +249,36 @@ class ProgramService:
             context_id=context.context_id,
             conversation_id=context.conversation_id,
             request_type=route,
-            raw_request=request.message,
+            raw_request=effective_message,
         )
         self.session.add(request_row)
 
         working_key = self._working_key(task_type)
         working = dict(sections.get(working_key, {}))
         collected = dict(working.get("collected_inputs", {}))
-        collected.update(self._extract_inputs(request.message, memory_context.sections.get("profile", "")))
-        if task_type == "program_adaptation":
-            collected = {**self._inputs_from_active_plan(_active_plan_payload(sections.get("memory_context", {}))), **collected}
-        if route in {"new_program", "revise_current_plan"}:
-            working["task_request"] = request.message
+        collected.update(self._extract_inputs(effective_message, memory_context.sections.get("profile", "")))
+        pending_load_names = list(working.get("pending_load_clarifications", []))
+        if pending_load_names:
+            load_references = dict(collected.get("exercise_load_references", {}))
+            load_references.update(_extract_exercise_load_references(effective_message, pending_load_names))
+            if load_references:
+                collected["exercise_load_references"] = load_references
+        if route == "new_program":
+            working["task_request"] = effective_message
         working["collected_inputs"] = collected
+        if working.get("raw_plan"):
+            working["pending_load_clarifications"] = self._missing_weighted_load_references(
+                working["raw_plan"],
+                collected,
+                memory_context.sections.get("profile", ""),
+            )
         sections[working_key] = working
         request_row.goal = str(collected.get("goal", "")) or None
         request_row.constraints_json = _dumps(
             {key: collected.get(key) for key in ("days_per_week", "session_duration_minutes", "equipment", "screening")}
         )
 
-        red_flags = self._red_flags(request.message, memory_context.sections.get("recent_status", ""))
+        red_flags = self._red_flags(effective_message, memory_context.sections.get("recent_status", ""))
         if red_flags:
             return self._blocked_safety_response(context, sections, red_flags, started)
 
@@ -277,15 +287,18 @@ class ProgramService:
             self.settings.program_max_rag_queries + self.settings.program_max_user_questions + 3
         )
         for _ in range(max_actions):
-            state = run_program_generator_graph(self._graph_state(context, route_locked=True))
+            state = run_program_generator_graph(self._graph_state(context, route_locked=True), self.llm_provider)
             action = state.get("next_action", "ask_user")
             if action == "ask_user":
                 return self._ask_for_missing(context, state.get("missing_inputs", []), started)
             if action == "query_rag":
-                self._query_evidence(context, request.message)
+                self._query_evidence(context, effective_message)
                 continue
             if action == "write_step_output":
-                self._write_sop_output(context, request.message)
+                try:
+                    self._write_sop_output(context, effective_message)
+                except StructuredOutputError as exc:
+                    return self._structured_output_error_response(context, exc, started)
                 continue
             if action == "run_calculation":
                 self._calculate_working_plan(context)
@@ -296,6 +309,13 @@ class ProgramService:
 
     def get_context(self, context_id: str) -> ProgramContextResponse:
         return self._context_out(self._get_context(context_id))
+
+    def list_context_ids(self) -> list[str]:
+        contexts = self.session.exec(select(ProgramContextRecord)).all()
+        return [
+            context.context_id
+            for context in sorted(contexts, key=lambda item: item.updated_at, reverse=True)
+        ]
 
     def get_version(self, program_id: str, version_id: str) -> ProgramVersionResponse:
         program = self.session.get(TrainingProgram, program_id)
@@ -321,8 +341,8 @@ class ProgramService:
             periodization=_loads(version.periodization_json, {}),
             planning_model=version.planning_model,
             rationale=version.rationale,
-            assumptions=_loads(version.assumptions_json, []),
-            warnings=_loads(version.warnings_json, []),
+            assumptions=_coerce_string_list(_loads(version.assumptions_json, [])),
+            warnings=_coerce_string_list(_loads(version.warnings_json, [])),
             source_references=_loads(version.source_references_json, {}),
             sessions=session_outputs,
             created_at=version.created_at,
@@ -352,10 +372,6 @@ class ProgramService:
                 context.status = "open"
                 context.pending_action = None
                 self._checkpoint(context, self._sections(context))
-            adaptation = self._adaptation_for_version(version_id)
-            if adaptation:
-                adaptation.approval_status = "rejected"
-                self.session.add(adaptation)
             self.session.add(version)
             self.session.add(program)
             self.session.commit()
@@ -396,10 +412,6 @@ class ProgramService:
                 context.status = "waiting_for_review"
                 context.pending_action = "waiting_for_review"
                 self._checkpoint(context, self._sections(context))
-            adaptation = self._adaptation_for_version(version_id)
-            if adaptation:
-                adaptation.approval_status = "activation_failed"
-                self.session.add(adaptation)
             self.session.add(version)
             self.session.add(program)
             self.session.commit()
@@ -423,10 +435,6 @@ class ProgramService:
             context.status = "open"
             context.pending_action = None
             self._checkpoint(context, self._sections(context))
-        adaptation = self._adaptation_for_version(version_id)
-        if adaptation:
-            adaptation.approval_status = "approved"
-            self.session.add(adaptation)
         self.session.add(version)
         self.session.add(program)
         self.session.commit()
@@ -648,72 +656,6 @@ class ProgramService:
         self.session.refresh(context)
         return context
 
-    def _inherit_active_program_context(
-        self,
-        context: ProgramContextRecord,
-        sections: dict[str, Any],
-    ) -> None:
-        """Link a new conversation context to the active version's audit context."""
-
-        active_plan = _active_plan_payload(sections.get("memory_context", {}))
-        if not active_plan:
-            return
-        snapshot = active_plan.get("plan_snapshot", {})
-        program_id = str(snapshot.get("program_id") or active_plan.get("plan_id") or "")
-        version_id = str(active_plan.get("version_id") or snapshot.get("version_id") or "")
-        if not program_id or not version_id:
-            return
-        if not context.latest_program_id:
-            context.latest_program_id = program_id
-        if not context.latest_version_id:
-            context.latest_version_id = version_id
-        prior_contexts = self.session.exec(
-            select(ProgramContextRecord).where(
-                ProgramContextRecord.user_id == context.user_id,
-                ProgramContextRecord.latest_version_id == version_id,
-                ProgramContextRecord.context_id != context.context_id,
-            )
-        ).all()
-        if not prior_contexts:
-            return
-        prior = sorted(prior_contexts, key=lambda item: item.updated_at, reverse=True)[0]
-        context.parent_context_id = prior.context_id
-        prior_sections = self._sections(prior)
-        for key in (
-            "retrieved_evidence",
-            "sop_progress",
-            "new_program_working_state",
-            "revision_adaptation_working_state",
-            "draft_artifacts",
-            "source_and_trace_references",
-            "calculation_results",
-        ):
-            if not sections.get(key) and prior_sections.get(key):
-                sections[key] = prior_sections[key]
-
-    def _inputs_from_active_plan(self, active_plan: dict[str, Any] | None) -> dict[str, Any]:
-        if not active_plan:
-            return {}
-        snapshot = active_plan.get("plan_snapshot", {})
-        sessions = active_plan.get("planned_sessions", [])
-        needs = snapshot.get("needs_analysis", {})
-        screening = snapshot.get("screening", {})
-        first_session = sessions[0] if sessions else {}
-        week_one_days = {
-            item.get("day_number")
-            for item in sessions
-            if int(item.get("week_number", 1)) == 1 and item.get("day_number") is not None
-        }
-        values = {
-            "goal": snapshot.get("goal"),
-            "days_per_week": len(week_one_days) or None,
-            "session_duration_minutes": first_session.get("duration_minutes"),
-            "experience": needs.get("experience"),
-            "equipment": needs.get("equipment"),
-            "screening": screening.get("status"),
-        }
-        return {key: value for key, value in values.items() if value not in (None, "", [])}
-
     def _get_context(self, context_id: str) -> ProgramContextRecord:
         context = self.session.get(ProgramContextRecord, context_id)
         if not context:
@@ -722,8 +664,75 @@ class ProgramService:
 
     def _sections(self, context: ProgramContextRecord) -> dict[str, Any]:
         sections = _loads(context.sections_json, {})
-        return {key: sections.get(key, default.copy() if isinstance(default, (dict, list)) else default)
-                for key, default in PROGRAM_SECTION_DEFAULTS.items()}
+        normalized = {
+            key: sections.get(key, default.copy() if isinstance(default, (dict, list)) else default)
+            for key, default in PROGRAM_SECTION_DEFAULTS.items()
+        }
+        memory_context = normalized.get("memory_context")
+        if isinstance(memory_context, dict):
+            normalized["memory_context"] = _compact_memory_context_for_program_context(memory_context)
+        working = normalized.get("new_program_working_state")
+        if isinstance(working, dict):
+            normalized["new_program_working_state"] = _compact_calculated_plan_working_state(working)
+        original_retrieved_evidence = normalized.get("retrieved_evidence")
+        retrieved_evidence, sop_progress = _normalize_retrieved_evidence_section(
+            original_retrieved_evidence,
+            context.current_sop_step,
+            normalized.get("sop_progress", {}),
+        )
+        if isinstance(original_retrieved_evidence, list):
+            latest_items = self._latest_step_evidence_items(context.context_id, context.current_sop_step)
+            if latest_items is not None:
+                current_step = str(context.current_sop_step or sop_progress.get("current_step") or "")
+                retrieved_evidence = {"current_step": current_step or None, "items": latest_items}
+                if current_step:
+                    sop_progress.setdefault("evidence_refs_by_step", {})[current_step] = _evidence_refs(latest_items)
+        normalized["retrieved_evidence"] = retrieved_evidence
+        normalized["sop_progress"] = sop_progress
+        self._refresh_budget_warnings(normalized)
+        return normalized
+
+    def _latest_calculation_result_ids(self, context_id: str, fallback: Any) -> list[str]:
+        trace = self.session.exec(
+            select(ProgramTrace).where(
+                ProgramTrace.context_id == context_id,
+                ProgramTrace.action == "run_calculation",
+            )
+        ).all()
+        latest = max(trace, key=lambda item: item.created_at, default=None)
+        if latest is None:
+            return list(dict.fromkeys(fallback if isinstance(fallback, list) else []))
+        rows = self.session.exec(
+            select(CalculationTrace).where(CalculationTrace.trace_id == latest.trace_id)
+        ).all()
+        return [item.calculation_trace_id for item in sorted(rows, key=lambda item: item.created_at)]
+
+    def _latest_step_evidence_items(self, context_id: str, current_step: str | None) -> list[dict[str, Any]] | None:
+        if not current_step:
+            return None
+        traces = self.session.exec(
+            select(ProgramTrace).where(
+                ProgramTrace.context_id == context_id,
+                ProgramTrace.action == "query_rag",
+                ProgramTrace.sop_step == current_step,
+            )
+        ).all()
+        latest = max(traces, key=lambda item: item.created_at, default=None)
+        if latest is None:
+            return None
+        calls = self.session.exec(
+            select(ProgramToolCall).where(
+                ProgramToolCall.trace_id == latest.trace_id,
+                ProgramToolCall.tool_name == "search_knowledge",
+            )
+        ).all()
+        if not calls:
+            return None
+        output = _loads(calls[-1].output_json, {})
+        results = output.get("results", [])
+        if not isinstance(results, list):
+            return None
+        return _dedupe_evidence_items(results)
 
     def _checkpoint(self, context: ProgramContextRecord, sections: dict[str, Any]) -> None:
         previous = _loads(context.sections_json, {})
@@ -747,30 +756,16 @@ class ProgramService:
         self.session.refresh(context)
 
     def _reset_new_program_sections(self, sections: dict[str, Any]) -> None:
+        budget_override = bool(sections.get("sop_progress", {}).get("context_budget_override"))
         for key in (
             "retrieved_evidence",
             "sop_progress",
             "new_program_working_state",
-            "revision_adaptation_working_state",
             "draft_artifacts",
-            "source_and_trace_references",
-            "calculation_results",
         ):
-            sections[key] = [] if key in {"retrieved_evidence", "calculation_results"} else {}
-
-    def _start_adaptation_sop(self, sections: dict[str, Any]) -> None:
-        previous = dict(sections.get("sop_progress", {}))
-        history = list(previous.get("sop_history", []))
-        if previous.get("completed_steps"):
-            history.append(
-                {
-                    "active_sop": previous.get("active_sop"),
-                    "completed_steps": previous.get("completed_steps", []),
-                    "rationale": previous.get("rationale", ""),
-                }
-            )
-        sections["sop_progress"] = {"sop_history": history[-3:]}
-        sections["revision_adaptation_working_state"] = {}
+            sections[key] = {"current_step": None, "items": []} if key == "retrieved_evidence" else {}
+        if budget_override:
+            sections["sop_progress"] = {"context_budget_override": True}
 
     def _context_budget_warnings(self, sections: dict[str, Any]) -> list[str]:
         caps = {
@@ -781,10 +776,7 @@ class ProgramService:
             "user_clarification_answers": 2000,
             "sop_progress": 2000,
             "new_program_working_state": 10000,
-            "revision_adaptation_working_state": 10000,
             "draft_artifacts": 5000,
-            "source_and_trace_references": 5000,
-            "calculation_results": 3000,
             "safety_flags_and_budget_warnings": 1000,
         }
         estimates = {}
@@ -792,7 +784,9 @@ class ProgramService:
             if not value:
                 continue
             if key == "memory_context" and isinstance(value, dict):
-                estimates[key] = int(value.get("token_estimate", max(1, len(str(value.get("rendered_context", ""))) // 4)))
+                estimates[key] = int(
+                    value.get("token_estimate", max(1, len(_render_program_memory_context(value)) // 4))
+                )
             else:
                 estimates[key] = max(1, len(_dumps(value)) // 4)
         warnings = [
@@ -808,8 +802,29 @@ class ProgramService:
             )
         return warnings
 
-    def _working_key(self, task_type: str) -> str:
-        return "revision_adaptation_working_state" if task_type == "program_adaptation" else "new_program_working_state"
+    def _refresh_budget_warnings(self, sections: dict[str, Any]) -> None:
+        retained_warnings = [
+            str(item)
+            for item in sections.get("safety_flags_and_budget_warnings", [])
+            if not _is_budget_warning(item)
+        ]
+        memory_warnings = []
+        memory_context = sections.get("memory_context")
+        if isinstance(memory_context, dict):
+            memory_warnings = [
+                str(item.get("message", item)) if isinstance(item, dict) else str(item)
+                for item in memory_context.get("budget_warnings", [])
+            ]
+        sections["safety_flags_and_budget_warnings"] = list(
+            dict.fromkeys(retained_warnings + memory_warnings)
+        )
+        context_warnings = self._context_budget_warnings(sections)
+        sections["safety_flags_and_budget_warnings"] = list(
+            dict.fromkeys(retained_warnings + memory_warnings + context_warnings)
+        )
+
+    def _working_key(self, task_type: str | None = None) -> str:
+        return "new_program_working_state"
 
     def _extract_inputs(self, message: str, profile_text: str) -> dict[str, Any]:
         combined = f"{profile_text}\n{message}"
@@ -863,7 +878,23 @@ class ProgramService:
             match = re.search(pattern, message, flags=re.IGNORECASE)
             if match:
                 result[key] = int(match.group(1))
+        result.update(self._extract_lift_maxes(message))
         return result
+
+    def _extract_lift_maxes(self, message: str) -> dict[str, float]:
+        if not message.strip():
+            return {}
+        if self.llm_provider and hasattr(self.llm_provider, "extract_program_lift_maxes"):
+            try:
+                extracted = self.llm_provider.extract_program_lift_maxes(
+                    ProgramLiftMaxExtractionRequest(user_message=message)
+                )
+                cleaned = _sanitize_lift_maxes(extracted)
+                if cleaned:
+                    return cleaned
+            except (ConfigurationError, StructuredOutputError, ValueError, TypeError):
+                pass
+        return _extract_lift_maxes(message)
 
     def _red_flags(self, message: str, recent_status: str) -> list[dict[str, str]]:
         text = f"{message}\n{recent_status}".lower()
@@ -898,11 +929,36 @@ class ProgramService:
             )
         self.session.commit()
         response = (
-            "I cannot safely generate or adapt training while these red-flag symptoms are unresolved. "
+            "I cannot safely generate training while these red-flag symptoms are unresolved. "
             "Please seek appropriate medical evaluation or clearance before continuing."
         )
         self._assistant_message(context, response)
         return self._turn_response(context, response, trace_id, warnings=[item["explanation"] for item in flags])
+
+    def _structured_output_error_response(
+        self,
+        context: ProgramContextRecord,
+        exc: StructuredOutputError,
+        started: float,
+    ) -> ProgramTurnResponse:
+        context.status = "open"
+        context.pending_action = None
+        self.session.add(context)
+        self.session.commit()
+        response = (
+            "The chat model returned malformed JSON while drafting the program, so I did not save a new draft. "
+            "I recorded the failure in the program trace. Please retry the same request; if it repeats, narrow "
+            "the requested change for one turn."
+        )
+        trace_id = self._trace(
+            context,
+            "structured_output_error",
+            {"error": str(exc)},
+            errors=[str(exc)],
+            started=started,
+        )
+        self._assistant_message(context, response)
+        return self._turn_response(context, response, trace_id, warnings=[str(exc)])
 
     def _ask_for_missing(
         self,
@@ -928,7 +984,16 @@ class ProgramService:
             "equipment": "available equipment",
             "screening": "current injuries, pain, medical limitations, or confirmation that none apply",
         }
-        question = "Before I design this safely, please provide: " + "; ".join(labels[item] for item in missing) + "."
+        standard_missing = [item for item in missing if not item.startswith("load_reference:")]
+        load_missing = [item.split(":", 1)[1] for item in missing if item.startswith("load_reference:")]
+        requested_details = [labels[item] for item in standard_missing]
+        if load_missing:
+            requested_details.append(
+                "a 1RM or recent weighted set for each weighted exercise: "
+                + ", ".join(load_missing)
+                + '. Reply in the form "Exercise: 80 kg x 8 reps" or "Exercise 1RM: 100 kg"'
+            )
+        question = "Before I design this safely, please provide: " + "; ".join(requested_details) + "."
         trace_id = self._trace(context, "ask_user", {"missing_inputs": missing}, started=started)
         self._assistant_message(context, question)
         return self._turn_response(context, question, trace_id)
@@ -957,20 +1022,12 @@ class ProgramService:
             if existing is None or item.score > existing.score:
                 combined[item.chunk_id] = item
         ranked = sorted(combined.values(), key=lambda item: item.score, reverse=True)
-        evidence = [{**asdict(item), "sop_steps": [step]} for item in ranked[: self.settings.program_evidence_context_top_k]]
+        evidence = [asdict(item) for item in ranked[: self.settings.program_evidence_context_top_k]]
         counters["rag_queries"] = attempt
         progress.setdefault("evidence_sufficient_by_step", {})[step] = bool(evidence)
+        progress.setdefault("evidence_refs_by_step", {})[step] = _evidence_refs(evidence)
         sections["sop_progress"] = progress
-        stored_evidence = list(sections.get("retrieved_evidence", []))
-        by_chunk_id = {item.get("chunk_id"): item for item in stored_evidence}
-        for item in evidence:
-            existing = by_chunk_id.get(item.get("chunk_id"))
-            if existing:
-                existing["sop_steps"] = list(dict.fromkeys(existing.get("sop_steps", []) + [step]))
-            else:
-                stored_evidence.append(item)
-                by_chunk_id[item.get("chunk_id")] = item
-        sections["retrieved_evidence"] = stored_evidence
+        sections["retrieved_evidence"] = {"current_step": step, "items": evidence}
         if not evidence and attempt >= self.settings.program_max_rag_queries:
             warning = (
                 f"No sufficient approved evidence was retrieved for SOP step '{step}' after the query limit; "
@@ -1009,10 +1066,12 @@ class ProgramService:
         self.session.commit()
 
     def _write_sop_output(self, context: ProgramContextRecord, message: str) -> None:
+        self._write_generation_sop_output(context, message)
+
+    def _write_generation_sop_output(self, context: ProgramContextRecord, message: str) -> None:
         sections = self._sections(context)
         working_key = self._working_key(str(context.active_task_type))
         working = dict(sections.get(working_key, {}))
-        active_plan = _active_plan_payload(sections.get("memory_context", {}))
         collected_inputs = dict(working.get("collected_inputs", {}))
         conservative_defaults = {
             "goal": "general fitness",
@@ -1032,44 +1091,108 @@ class ProgramService:
                 "Clarification limit reached; conservative assumptions used: " + ", ".join(assumed)
             )
         working["collected_inputs"] = collected_inputs
-        started = clock.perf_counter()
+        task_request = str(working.get("task_request") or message)
         raw_plan = working.get("raw_plan")
-        if not raw_plan:
-            task_request = str(working.get("task_request") or message)
-            request = ProgramPlanRequest(
-                task_type=str(context.active_task_type),
-                user_message=task_request,
-                collected_inputs=collected_inputs,
-                memory_context=str(sections.get("memory_context", {}).get("rendered_context", "")),
-                weekly_summaries=sections.get("latest_four_week_summary_notes", []),
-                evidence=sections.get("retrieved_evidence", []),
-                active_plan=active_plan,
-            )
-            raw_plan = self.llm_provider.generate_program_plan(request)
-            self._validate_raw_plan(raw_plan)
+        if not isinstance(raw_plan, dict) or not raw_plan:
+            raw_plan = self._empty_raw_plan(task_request, collected_inputs)
             working["raw_plan"] = raw_plan
-            if context.active_task_type == "program_adaptation":
-                working["revision_trigger"] = task_request
-                working["trigger_classification"] = _classify_adaptation_trigger(task_request)
-                active_snapshot = (active_plan or {}).get("plan_snapshot", {})
-                active_goal = active_snapshot.get("goal")
-                working["protected_goals"] = [active_goal] if active_goal else []
-                working["changed_elements"] = raw_plan.get("changed_elements", [])
-                working["unchanged_elements"] = raw_plan.get("unchanged_elements", [])
-        sop = ADAPTATION_SOP if context.active_task_type == "program_adaptation" else NEW_PROGRAM_SOP
+
+        sop = NEW_PROGRAM_SOP
+        step = str(context.current_sop_step or sop[0])
         progress = dict(sections.get("sop_progress", {}))
         progress.setdefault("completed_steps", [])
         progress.setdefault("decisions", {})
         progress["active_sop"] = context.active_sop
-        progress["rationale"] = raw_plan.get("rationale", "")
         progress["support"] = {
-            "evidence_chunk_ids": [item.get("chunk_id") for item in sections.get("retrieved_evidence", [])],
+            "evidence_chunk_ids": [item.get("chunk_id") for item in _all_evidence_refs(progress)],
             "memory_ids": sections.get("memory_context", {}).get("memory_ids", []),
         }
-        working.setdefault("step_outputs", {})
-        step = str(context.current_sop_step or sop[0])
-        output = self._sop_step_output(step, raw_plan, working.get("collected_inputs", {}), active_plan, working)
-        working["step_outputs"][step] = output
+        started = clock.perf_counter()
+
+        if step in DETERMINISTIC_GENERATION_STEPS:
+            if step == "load_calculation":
+                working["pending_load_clarifications"] = self._missing_weighted_load_references(
+                    raw_plan,
+                    collected_inputs,
+                    sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
+                )
+                if working["pending_load_clarifications"]:
+                    sections[working_key] = working
+                    sections["sop_progress"] = progress
+                    self._checkpoint(context, sections)
+                    return
+                trace_id = self._trace(context, "run_calculation", {"title": raw_plan.get("title")})
+                working["calculation_artifacts"] = self._materialize_plan(
+                    raw_plan,
+                    collected_inputs,
+                    sections.get("memory_context", {}),
+                    trace_id,
+                    periodization=_periodization_from_sop_progress(progress, raw_plan),
+                )
+                working.pop("calculated_plan", None)
+                output = self._load_calculation_step_output(working["calculation_artifacts"])
+            else:
+                artifacts = working.get("calculation_artifacts")
+                if not isinstance(artifacts, dict):
+                    trace_id = self._trace(context, "run_calculation", {"title": raw_plan.get("title")})
+                    artifacts = self._materialize_plan(
+                        raw_plan,
+                        collected_inputs,
+                        sections.get("memory_context", {}),
+                        trace_id,
+                        periodization=_periodization_from_sop_progress(progress, raw_plan),
+                    )
+                    working["calculation_artifacts"] = artifacts
+                output = self._volume_calculation_step_output(artifacts)
+        else:
+            decision_request = ProgramSOPStepDecisionRequest(
+                task_type=str(context.active_task_type),
+                sop_step=step,
+                user_message=task_request,
+                collected_inputs=collected_inputs,
+                memory_context=_render_program_memory_context(sections.get("memory_context", {})),
+                weekly_summaries=sections.get("latest_four_week_summary_notes", []),
+                evidence=_current_evidence_items(sections),
+                previous_decisions=dict(progress.get("decisions", {})),
+                raw_plan=raw_plan,
+            )
+            output = self.llm_provider.generate_program_sop_step_decision(decision_request)
+            updated_plan = self.llm_provider.update_program_plan(
+                ProgramPlanUpdateRequest(
+                    sop_step=step,
+                    decision=output,
+                    raw_plan=raw_plan,
+                    collected_inputs=collected_inputs,
+                    previous_decisions=dict(progress.get("decisions", {})),
+                )
+            )
+            self._validate_raw_plan_structure(updated_plan, require_sessions=step in {
+                "programming_exercises_and_order",
+                "programming_intensity_and_volume",
+                "rest_periods",
+            })
+            raw_plan = _strip_raw_plan_sop_metadata(updated_plan)
+            working["raw_plan"] = raw_plan
+            working["pending_load_clarifications"] = self._missing_weighted_load_references(
+                raw_plan,
+                collected_inputs,
+                sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
+            )
+            progress["rationale"] = raw_plan.get("rationale", "")
+
+        if step == "rest_periods" and "calculation_artifacts" not in working:
+            trace_id = self._trace(context, "run_calculation", {"title": raw_plan.get("title")})
+            working["calculation_artifacts"] = self._materialize_plan(
+                raw_plan,
+                collected_inputs,
+                sections.get("memory_context", {}),
+                trace_id,
+                periodization=_periodization_from_sop_progress(progress, raw_plan),
+            )
+            working.pop("calculated_plan", None)
+        if step == "rest_periods":
+            output = self._rest_periods_step_output(working.get("calculation_artifacts", {}))
+
         if step not in progress["completed_steps"]:
             progress["completed_steps"].append(step)
         progress["decisions"][step] = output
@@ -1091,49 +1214,198 @@ class ProgramService:
             latency_ms=int((clock.perf_counter() - started) * 1000),
         )
 
+    def _empty_raw_plan(self, task_request: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        days = int(max(1, min(7, inputs.get("days_per_week", 3))))
+        duration = int(max(20, min(180, inputs.get("session_duration_minutes", 60))))
+        return {
+            "schema": "raw_training_plan_v1",
+            "title": "",
+            "goal": inputs.get("goal", ""),
+            "sport": "strength",
+            "rationale": "",
+            "task_request": task_request,
+            "templates": {
+                "session": {
+                    "name": "",
+                    "goal": "",
+                    "duration_minutes": duration,
+                    "exercises": [],
+                },
+                "exercise": {
+                    "name": "",
+                    "mode": "resistance",
+                    "load_type": "weighted",
+                    "sets": 0,
+                    "reps": 0,
+                    "intensity_percent": None,
+                    "rpe": None,
+                    "rest_seconds": None,
+                    "notes": "",
+                    "sets_template": [],
+                },
+                "set": {
+                    "set_number": 1,
+                    "reps": 0,
+                    "load_kg": None,
+                    "intensity_percent": None,
+                    "rpe": None,
+                    "rest_seconds": None,
+                },
+            },
+            "sessions": [],
+            "assumptions": [],
+            "warnings": [],
+        }
+
+    def _validate_raw_plan_structure(self, raw_plan: dict[str, Any], require_sessions: bool = False) -> None:
+        if not isinstance(raw_plan, dict):
+            raise ValueError("PlanUpdater returned a non-object raw_plan.")
+        templates = raw_plan.get("templates")
+        if not isinstance(templates, dict):
+            raise ValueError("PlanUpdater removed raw_plan.templates.")
+        for name in ("session", "exercise", "set"):
+            if not isinstance(templates.get(name), dict):
+                raise ValueError(f"PlanUpdater removed raw_plan.templates.{name}.")
+        sessions = raw_plan.get("sessions", [])
+        if sessions is None:
+            raw_plan["sessions"] = []
+            sessions = []
+        if not isinstance(sessions, list):
+            raise ValueError("PlanUpdater returned raw_plan.sessions as a non-list.")
+        if require_sessions and not sessions:
+            raise ValueError("PlanUpdater did not create any session templates.")
+        for session in sessions:
+            if not isinstance(session.get("exercises", []), list):
+                raise ValueError("PlanUpdater returned a session with non-list exercises.")
+            for exercise in session.get("exercises", []):
+                load_type = str(exercise.get("load_type") or "").strip().lower()
+                if not load_type:
+                    load_type = "bodyweight" if _is_bodyweight_exercise(exercise) else "weighted"
+                    exercise["load_type"] = load_type
+                if load_type not in {"weighted", "bodyweight"}:
+                    raise ValueError(
+                        f"Exercise '{exercise.get('name', '')}' has invalid load_type '{load_type}'."
+                    )
+
+    def _load_calculation_step_output(self, artifacts: dict[str, Any]) -> dict[str, Any]:
+        by_exercise: dict[str, dict[str, Any]] = {}
+        bodyweight: set[str] = set()
+        for session in artifacts.get("calculated_sessions", []):
+            for exercise in session.get("exercises", []):
+                first_set = next(iter(exercise.get("sets", [])), {})
+                name = str(exercise.get("name", ""))
+                if first_set.get("load_kg") is None:
+                    bodyweight.add(name)
+                    continue
+                entry = by_exercise.setdefault(
+                    name,
+                    {"exercise": name, "min_load_kg": None, "max_load_kg": None, "example_reps": first_set.get("reps")},
+                )
+                load = float(first_set.get("load_kg"))
+                entry["min_load_kg"] = load if entry["min_load_kg"] is None else min(entry["min_load_kg"], load)
+                entry["max_load_kg"] = load if entry["max_load_kg"] is None else max(entry["max_load_kg"], load)
+        return {
+            "weighted_load_summary": list(by_exercise.values()),
+            "bodyweight_or_unloaded_exercises": sorted(bodyweight),
+        }
+
+    def _volume_calculation_step_output(self, artifacts: dict[str, Any]) -> dict[str, Any]:
+        exercise_totals: dict[str, dict[str, Any]] = {}
+        for session in artifacts.get("calculated_sessions", []):
+            for exercise in session.get("exercises", []):
+                name = str(exercise.get("name", ""))
+                unit = str(exercise.get("volume_unit", ""))
+                key = f"{name}:{unit}"
+                entry = exercise_totals.setdefault(
+                    key,
+                    {"exercise": name, "volume_unit": unit, "total_volume": 0.0},
+                )
+                entry["total_volume"] += float(exercise.get("volume") or 0)
+        return {
+            "exercise_volume_summary": list(exercise_totals.values()),
+            "weekly_volume_load_kg": artifacts.get("calculated_periodization", {}).get("weekly_volume_load_kg", {}),
+        }
+
+    def _rest_periods_step_output(self, artifacts: dict[str, Any]) -> list[dict[str, Any]]:
+        rests: dict[str, dict[str, Any]] = {}
+        for session in artifacts.get("calculated_sessions", []):
+            for exercise in session.get("exercises", []):
+                first_set = next(iter(exercise.get("sets", [])), {})
+                name = str(exercise.get("name", ""))
+                rests[name] = {"exercise": name, "rest_seconds": first_set.get("rest_seconds")}
+        return list(rests.values())
+
     def _validate_raw_plan(self, raw_plan: dict[str, Any]) -> None:
         if not raw_plan.get("title") or not raw_plan.get("sessions"):
             raise ValueError("Program generator returned a plan without title or sessions.")
         if not isinstance(raw_plan["sessions"], list):
             raise ValueError("Program sessions must be a list.")
+        for session in raw_plan["sessions"]:
+            for exercise in session.get("exercises", []):
+                load_type = str(exercise.get("load_type") or "").strip().lower()
+                if not load_type:
+                    load_type = "bodyweight" if _is_bodyweight_exercise(exercise) else "weighted"
+                    exercise["load_type"] = load_type
+                if load_type not in {"weighted", "bodyweight"}:
+                    raise ValueError(
+                        f"Exercise '{exercise.get('name', '')}' has invalid load_type '{load_type}'."
+                    )
 
-    def _sop_step_output(
+    def _missing_weighted_load_references(
         self,
-        step: str,
         raw_plan: dict[str, Any],
         inputs: dict[str, Any],
-        active_plan: dict[str, Any] | None,
-        working: dict[str, Any],
-    ) -> Any:
-        """Select the recorded decision for one ordered SOP step."""
+        profile: str,
+    ) -> list[str]:
+        missing: list[str] = []
+        seen: set[str] = set()
+        references = inputs.get("exercise_load_references", {})
+        for session in raw_plan.get("sessions", []):
+            for exercise in session.get("exercises", []):
+                name = str(exercise.get("name", "")).strip()
+                key = _normalize_exercise_name(name)
+                if not name or key in seen or _is_bodyweight_exercise(exercise):
+                    continue
+                seen.add(key)
+                one_rm, _ = _one_rm_for_exercise(name, profile, inputs)
+                if one_rm or references.get(key):
+                    continue
+                missing.append(name)
+        return missing
 
-        sessions = raw_plan.get("sessions", [])
-        exercises = [item for session in sessions for item in session.get("exercises", [])]
-        outputs = {
-            "consultation_and_screening": raw_plan.get("screening", {"status": inputs.get("screening")}),
-            "needs_analysis": raw_plan.get("needs_analysis", inputs),
-            "periodization": raw_plan.get("periodization", {}),
-            "planning_model": raw_plan.get("periodization", {}).get("model", "parallel"),
-            "programming_decisions": [{"name": item.get("name"), "goal": item.get("goal")} for item in sessions],
-            "exercise_selection": [item.get("name") for item in exercises],
-            "frequency": inputs.get("days_per_week"),
-            "exercise_order": [[item.get("name") for item in session.get("exercises", [])] for session in sessions],
-            "load_and_repetitions": [
-                {"exercise": item.get("name"), "reps": item.get("reps"), "intensity_percent": item.get("intensity_percent")}
-                for item in exercises
-            ],
-            "volume": [{"exercise": item.get("name"), "sets": item.get("sets"), "reps": item.get("reps")} for item in exercises],
-            "rest_periods": [{"exercise": item.get("name"), "rest_seconds": item.get("rest_seconds")} for item in exercises],
-            "final_review": {"assumptions": raw_plan.get("assumptions", []), "warnings": raw_plan.get("warnings", [])},
-            "classify_trigger": working.get("trigger_classification", {}),
-            "load_active_baseline": {"plan_id": (active_plan or {}).get("plan_id"), "version_id": (active_plan or {}).get("version_id")},
-            "protect_goals_and_constraints": raw_plan.get("unchanged_elements", []),
-            "analyze_future_effects": raw_plan.get("rationale", ""),
-            "choose_smallest_coherent_change": raw_plan.get("changed_elements", []),
-            "recalculate_affected_numbers": [item.get("name") for item in exercises],
-            "create_reviewable_revision": {"title": raw_plan.get("title"), "warnings": raw_plan.get("warnings", [])},
-        }
-        return outputs.get(step, {})
+    def _training_max_for_exercise(
+        self,
+        exercise_name: str,
+        profile: str,
+        inputs: dict[str, Any],
+        trace_id: str,
+        cache: dict[str, tuple[float | None, str]],
+    ) -> tuple[float | None, str]:
+        key = _normalize_exercise_name(exercise_name)
+        if key in cache:
+            return cache[key]
+        one_rm, source = _one_rm_for_exercise(exercise_name, profile, inputs)
+        if one_rm is not None:
+            cache[key] = (one_rm, source)
+            return cache[key]
+        reference = inputs.get("exercise_load_references", {}).get(key)
+        if not reference:
+            cache[key] = (None, "missing_load_reference")
+            return cache[key]
+        weight = float(reference["weight_kg"])
+        reps = int(reference.get("reps", 1))
+        if reps == 1:
+            cache[key] = (weight, f"user_reported_1rm:{key}")
+            return cache[key]
+        estimate_trace = self._calculation(
+            trace_id,
+            "estimate_repetition_max",
+            {"weight": weight, "reps": reps, "method": "epley", "unit": "kg"},
+            [f"user_reported_recent_performance:{key}"],
+        )
+        estimated = self._calculation_value(estimate_trace)
+        cache[key] = (estimated, estimate_trace)
+        return cache[key]
 
     def _calculate_working_plan(self, context: ProgramContextRecord) -> None:
         sections = self._sections(context)
@@ -1142,15 +1414,16 @@ class ProgramService:
         raw = working["raw_plan"]
         inputs = working.get("collected_inputs", {})
         trace_id = self._trace(context, "run_calculation", {"title": raw.get("title")})
-        calculated = self._materialize_plan(raw, inputs, sections.get("memory_context", {}), trace_id)
-        working["calculated_plan"] = calculated
-        sections[working_key] = working
-        calculation_ids = [item.calculation_trace_id for item in self.session.exec(
-            select(CalculationTrace).where(CalculationTrace.trace_id == trace_id)
-        ).all()]
-        sections["calculation_results"] = list(
-            dict.fromkeys(sections.get("calculation_results", []) + calculation_ids)
+        artifacts = self._materialize_plan(
+            raw,
+            inputs,
+            sections.get("memory_context", {}),
+            trace_id,
+            periodization=_periodization_from_sop_progress(sections.get("sop_progress", {}), raw),
         )
+        working["calculation_artifacts"] = artifacts
+        working.pop("calculated_plan", None)
+        sections[working_key] = working
         self._checkpoint(context, sections)
 
     def _materialize_plan(
@@ -1159,8 +1432,10 @@ class ProgramService:
         inputs: dict[str, Any],
         memory_context: dict[str, Any],
         trace_id: str,
+        periodization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        weeks = int(max(1, min(12, raw.get("periodization", {}).get("weeks", 4))))
+        periodization = periodization if isinstance(periodization, dict) else raw.get("periodization", {})
+        weeks = int(max(1, min(12, periodization.get("weeks", 4))))
         days = int(max(1, min(7, inputs.get("days_per_week", len(raw.get("sessions", [])) or 3))))
         templates = list(raw.get("sessions", []))[:days]
         if not templates:
@@ -1177,6 +1452,7 @@ class ProgramService:
         )
         weekly_workload: dict[str, float] = {str(week): 0.0 for week in range(1, weeks + 1)}
         sessions: list[dict[str, Any]] = []
+        training_max_cache: dict[str, tuple[float | None, str]] = {}
         for week in range(1, weeks + 1):
             for day_index, template in enumerate(templates, start=1):
                 session_id = f"psess_{uuid4().hex[:12]}"
@@ -1189,115 +1465,85 @@ class ProgramService:
                 exercises = []
                 for exercise_index, exercise in enumerate(template.get("exercises", []), start=1):
                     exercise_id = f"pex_{uuid4().hex[:12]}"
-                    mode = str(exercise.get("mode", "resistance"))
+                    mode = "resistance"
                     sets_count = int(max(1, min(10, exercise.get("sets", 3))))
                     set_count_trace = self._calculation(
                         trace_id, "calculate_expression", {"expression": str(sets_count), "unit": "sets"}, ["programming_decision"]
                     )
                     sets = []
                     exercise_load = None
-                    is_aerobic = mode == "aerobic"
-                    exercise_reps = None if is_aerobic else int(max(1, min(100, exercise.get("reps", 8))))
+                    exercise_reps = int(max(1, min(100, exercise.get("reps", 8))))
+                    is_bodyweight = _is_bodyweight_exercise(exercise)
+                    one_rm, one_rm_source = self._training_max_for_exercise(
+                        str(exercise.get("name", "")),
+                        profile,
+                        inputs,
+                        trace_id,
+                        training_max_cache,
+                    )
+                    if not is_bodyweight and one_rm is None:
+                        raise ValueError(
+                            f"Weighted exercise '{exercise.get('name', '')}' has no 1RM or recent performance record."
+                        )
+                    reps = exercise_reps
+                    rep_trace = self._calculation(
+                        trace_id, "calculate_expression", {"expression": str(reps), "unit": "reps"}, ["programming_decision"]
+                    )
+                    raw_intensity = exercise.get("intensity_percent")
+                    base_intensity = float(max(1, min(100, raw_intensity if raw_intensity is not None else 70)))
+                    intensity_trace = self._calculation(
+                        trace_id,
+                        "calculate_expression",
+                        {"expression": str(base_intensity), "unit": "%1RM"},
+                        ["programming_decision"],
+                    )
+                    rest_trace = self._calculation(
+                        trace_id,
+                        "calculate_rest_interval",
+                        {"goal": template.get("goal", raw.get("goal", "general fitness")), "compound": exercise_index <= 2},
+                        ["session_goal"],
+                    )
+                    rpe = float(max(1, min(10, exercise.get("rpe", 7))))
+                    rpe_trace = self._calculation(
+                        trace_id, "calculate_expression", {"expression": str(rpe), "unit": "RPE"}, ["programming_decision"]
+                    )
+                    load_kg = None
+                    intensity = base_intensity
+                    trace_ids = [set_count_trace, rep_trace, intensity_trace, rest_trace, rpe_trace]
+                    if not is_bodyweight and one_rm:
+                        progressed = self._calculation(
+                            trace_id,
+                            "calculate_progression_increment",
+                            {"current_value": base_intensity, "percentage": (week - 1) * 1.5, "unit": "%1RM"},
+                            ["periodization_week"],
+                        )
+                        progressed_value = self.session.get(CalculationTrace, progressed)
+                        progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", base_intensity))
+                        percentage_trace = self._calculation(
+                            trace_id,
+                            "calculate_percentage_load",
+                            {"one_rm": one_rm, "percentage": min(progressed_percent, 95), "unit": "kg"},
+                            [one_rm_source, "program_intensity"],
+                        )
+                        percentage_row = self.session.get(CalculationTrace, percentage_trace)
+                        unrounded = float(_loads(percentage_row.result_json, {}).get("value", 0))
+                        rounded_trace = self._calculation(
+                            trace_id,
+                            "round_training_load",
+                            {
+                                "load": unrounded,
+                                "increment": self._load_rounding_increment(str(exercise.get("name", "")), inputs),
+                                "unit": "kg",
+                            },
+                            [percentage_trace],
+                        )
+                        rounded_row = self.session.get(CalculationTrace, rounded_trace)
+                        load_kg = float(_loads(rounded_row.result_json, {}).get("value", 0))
+                        exercise_load = load_kg
+                        intensity = min(progressed_percent, 95)
+                        trace_ids.extend([progressed, percentage_trace, rounded_trace])
+                    rest_seconds = int(self._calculation_value(rest_trace))
                     for set_number in range(1, sets_count + 1):
-                        reps = exercise_reps
-                        rep_trace = None if reps is None else self._calculation(
-                            trace_id, "calculate_expression", {"expression": str(reps), "unit": "reps"}, ["programming_decision"]
-                        )
-                        raw_intensity = exercise.get("intensity_percent")
-                        intensity = None if raw_intensity is None and is_aerobic else float(
-                            max(1, min(100, raw_intensity if raw_intensity is not None else 70))
-                        )
-                        intensity_trace = None if intensity is None else self._calculation(
-                            trace_id,
-                            "calculate_expression",
-                            {"expression": str(intensity), "unit": "%max" if is_aerobic else "%1RM"},
-                            ["programming_decision"],
-                        )
-                        rest_trace = self._calculation(
-                            trace_id,
-                            "calculate_rest_interval",
-                            {"goal": template.get("goal", raw.get("goal", "general fitness")), "compound": exercise_index <= 2},
-                            ["session_goal"],
-                        )
-                        rpe = float(max(1, min(10, exercise.get("rpe", 7))))
-                        rpe_trace = self._calculation(
-                            trace_id, "calculate_expression", {"expression": str(rpe), "unit": "RPE"}, ["programming_decision"]
-                        )
-                        load_kg = None
-                        trace_ids = [item for item in (set_count_trace, rep_trace, intensity_trace, rest_trace, rpe_trace) if item]
-                        duration_seconds = None
-                        distance_meters = None
-                        pace_seconds_per_km = None
-                        if is_aerobic:
-                            proposed_duration = int(
-                                exercise.get("duration_seconds")
-                                or max(
-                                    60,
-                                    int(
-                                        template.get("duration_minutes", 30)
-                                        * 60
-                                        / max(1, len(template.get("exercises", [])) * sets_count)
-                                    ),
-                                )
-                            )
-                            raw_pace = int(exercise.get("pace_seconds_per_km") or 360)
-                            pace_increment = self.settings.program_pace_rounding_seconds_per_km
-                            proposed_pace = int(round(raw_pace / pace_increment) * pace_increment)
-                            duration_trace = self._calculation(
-                                trace_id,
-                                "calculate_expression",
-                                {"expression": str(proposed_duration), "unit": "s"},
-                                ["programming_decision", "session_duration"],
-                            )
-                            pace_trace = self._calculation(
-                                trace_id,
-                                "calculate_expression",
-                                {"expression": str(proposed_pace), "unit": "s/km"},
-                                ["programming_decision"],
-                            )
-                            distance_trace = self._calculation(
-                                trace_id,
-                                "calculate_distance_pace_time",
-                                {"duration_seconds": proposed_duration, "pace_seconds_per_km": proposed_pace},
-                                [duration_trace, pace_trace],
-                            )
-                            duration_seconds = int(self._calculation_value(duration_trace))
-                            pace_seconds_per_km = int(self._calculation_value(pace_trace))
-                            distance_meters = self._calculation_value(distance_trace)
-                            trace_ids.extend([duration_trace, pace_trace, distance_trace])
-                        one_rm = _one_rm_for_exercise(str(exercise.get("name", "")), profile)
-                        if one_rm and not is_aerobic:
-                            progressed = self._calculation(
-                                trace_id,
-                                "calculate_progression_increment",
-                                {"current_value": intensity, "percentage": (week - 1) * 1.5, "unit": "%1RM"},
-                                ["periodization_week"],
-                            )
-                            progressed_value = self.session.get(CalculationTrace, progressed)
-                            progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", intensity))
-                            percentage_trace = self._calculation(
-                                trace_id,
-                                "calculate_percentage_load",
-                                {"one_rm": one_rm, "percentage": min(progressed_percent, 95), "unit": "kg"},
-                                ["profile_1rm", "program_intensity"],
-                            )
-                            percentage_row = self.session.get(CalculationTrace, percentage_trace)
-                            unrounded = float(_loads(percentage_row.result_json, {}).get("value", 0))
-                            rounded_trace = self._calculation(
-                                trace_id,
-                                "round_training_load",
-                                {
-                                    "load": unrounded,
-                                    "increment": self._load_rounding_increment(str(exercise.get("name", "")), inputs),
-                                    "unit": "kg",
-                                },
-                                [percentage_trace],
-                            )
-                            rounded_row = self.session.get(CalculationTrace, rounded_trace)
-                            load_kg = float(_loads(rounded_row.result_json, {}).get("value", 0))
-                            exercise_load = load_kg
-                            intensity = min(progressed_percent, 95)
-                            trace_ids.extend([progressed, percentage_trace, rounded_trace])
                         sets.append(
                             {
                                 "set_id": f"pset_{uuid4().hex[:12]}",
@@ -1306,23 +1552,11 @@ class ProgramService:
                                 "load_kg": load_kg,
                                 "intensity_percent": intensity,
                                 "rpe": rpe,
-                                "rest_seconds": int(self._calculation_value(rest_trace)),
-                                "duration_seconds": duration_seconds,
-                                "distance_meters": distance_meters,
-                                "pace_seconds_per_km": pace_seconds_per_km,
-                                "calculation_trace_ids": trace_ids,
+                                "rest_seconds": rest_seconds,
+                                "calculation_trace_ids": list(trace_ids),
                             }
                         )
-                    if is_aerobic:
-                        distance_per_set = float(sets[0].get("distance_meters") or 0)
-                        volume_trace = self._calculation(
-                            trace_id,
-                            "calculate_expression",
-                            {"expression": f"{sets_count} * {distance_per_set}", "unit": "m"},
-                            [set_count_trace, "set_distance_traces"],
-                        )
-                        volume_unit = "m"
-                    elif exercise_load is not None:
+                    if exercise_load is not None:
                         volume_trace = self._calculation(
                             trace_id,
                             "calculate_volume_load",
@@ -1368,10 +1602,10 @@ class ProgramService:
                     }
                 )
         return {
-            **raw,
-            "sessions": sessions,
-            "periodization": {
-                **raw.get("periodization", {}),
+            "schema": "calculated_plan_delta_v1",
+            "calculation_run_trace_id": trace_id,
+            "calculated_sessions": sessions,
+            "calculated_periodization": {
                 "weeks": weeks,
                 "sessions_per_week": days,
                 "frequency_calculation_trace_id": frequency_trace,
@@ -1430,19 +1664,16 @@ class ProgramService:
     def _finalize(self, context: ProgramContextRecord, started: float) -> ProgramTurnResponse:
         sections = self._sections(context)
         working = sections[self._working_key(str(context.active_task_type))]
-        plan = working["calculated_plan"]
-        program_id = context.latest_program_id if context.active_task_type == "program_adaptation" else None
-        program = self.session.get(TrainingProgram, program_id) if program_id else None
-        if not program:
-            program = TrainingProgram(
-                program_id=f"prog_{uuid4().hex[:12]}",
-                user_id=context.user_id,
-                title=str(plan["title"]),
-                goal=str(plan.get("goal", "general fitness")),
-                sport=str(plan.get("sport", "general_fitness")),
-            )
-            self.session.add(program)
-            self.session.flush()
+        plan = _build_calculated_plan_from_sections(working, sections)
+        program = TrainingProgram(
+            program_id=f"prog_{uuid4().hex[:12]}",
+            user_id=context.user_id,
+            title=str(plan["title"]),
+            goal=str(plan.get("goal", "general fitness")),
+            sport=str(plan.get("sport", "general_fitness")),
+        )
+        self.session.add(program)
+        self.session.flush()
         existing_versions = self.session.exec(
             select(ProgramVersion).where(ProgramVersion.program_id == program.program_id)
         ).all()
@@ -1451,50 +1682,32 @@ class ProgramService:
             version_id=f"pver_{uuid4().hex[:12]}",
             program_id=program.program_id,
             version_number=version_number,
-            status="draft_adaptation" if context.active_task_type == "program_adaptation" else "draft",
-            reason="adaptation" if context.active_task_type == "program_adaptation" else "new_program",
+            status="draft",
+            reason="new_program",
             screening_json=_dumps(plan.get("screening", {})),
             needs_analysis_json=_dumps(plan.get("needs_analysis", {})),
             periodization_json=_dumps(plan.get("periodization", {})),
-            planning_model=str(plan.get("periodization", {}).get("model", "parallel")),
+            planning_model=str(plan.get("planning_model") or plan.get("periodization", {}).get("model", "parallel")),
             rationale=str(plan.get("rationale", "")),
-            assumptions_json=_dumps(plan.get("assumptions", [])),
-            warnings_json=_dumps(plan.get("warnings", []) + sections.get("safety_flags_and_budget_warnings", [])),
+            assumptions_json=_dumps(_coerce_string_list(plan.get("assumptions", []))),
+            warnings_json=_dumps(
+                _coerce_string_list(plan.get("warnings", []))
+                + _coerce_string_list(sections.get("safety_flags_and_budget_warnings", []))
+            ),
             source_references_json=_dumps(
                 {
                     "memory_trace_id": sections.get("memory_context", {}).get("trace_id"),
                     "memory_ids": sections.get("memory_context", {}).get("memory_ids", []),
                     "evidence": [
                         {"source_id": item.get("source_id"), "chunk_id": item.get("chunk_id")}
-                        for item in sections.get("retrieved_evidence", [])
+                        for item in _all_evidence_refs(sections.get("sop_progress", {}))
                     ],
-                    "calculation_trace_ids": sections.get("calculation_results", []),
                 }
             ),
         )
         self.session.add(version)
         for session_data in plan["sessions"]:
             self._store_session(version.version_id, session_data)
-        if context.active_task_type == "program_adaptation" and context.latest_version_id:
-            self.session.add(
-                ProgramAdaptation(
-                    adaptation_id=f"padapt_{uuid4().hex[:12]}",
-                    from_version_id=context.latest_version_id,
-                    to_version_id=version.version_id,
-                    trigger=str(working.get("revision_trigger", "user_feedback")),
-                    user_feedback=str(sections.get("current_user_turn", {}).get("content", "")),
-                    changed_json=_dumps(working.get("changed_elements", [])),
-                    unchanged_json=_dumps(working.get("unchanged_elements", [])),
-                    rationale=version.rationale,
-                    evidence_references_json=_dumps(
-                        [
-                            {"source_id": item.get("source_id"), "chunk_id": item.get("chunk_id")}
-                            for item in sections.get("retrieved_evidence", [])
-                        ]
-                    ),
-                    calculation_trace_ids_json=_dumps(sections.get("calculation_results", [])),
-                )
-            )
         program.latest_version_id = version.version_id
         program.generation_status = version.status
         program.updated_at = utc_now()
@@ -1508,11 +1721,6 @@ class ProgramService:
             "program_id": program.program_id,
             "version_id": version.version_id,
             "version_number": version.version_number,
-        }
-        sections["source_and_trace_references"] = {
-            "memory_trace_id": sections.get("memory_context", {}).get("trace_id"),
-            "evidence_chunk_ids": [item.get("chunk_id") for item in sections.get("retrieved_evidence", [])],
-            "calculation_trace_ids": sections.get("calculation_results", []),
         }
         self.session.add(program)
         self.session.add(context)
@@ -1570,9 +1778,6 @@ class ProgramService:
                         intensity_percent=set_data.get("intensity_percent"),
                         rpe=set_data.get("rpe"),
                         rest_seconds=int(set_data["rest_seconds"]),
-                        duration_seconds=set_data.get("duration_seconds"),
-                        distance_meters=set_data.get("distance_meters"),
-                        pace_seconds_per_km=set_data.get("pace_seconds_per_km"),
                         calculation_trace_ids_json=_dumps(set_data.get("calculation_trace_ids", [])),
                     )
                 )
@@ -1607,9 +1812,6 @@ class ProgramService:
                             intensity_percent=item.intensity_percent,
                             rpe=item.rpe,
                             rest_seconds=item.rest_seconds,
-                            duration_seconds=item.duration_seconds,
-                            distance_meters=item.distance_meters,
-                            pace_seconds_per_km=item.pace_seconds_per_km,
                             calculation_trace_ids=_loads(item.calculation_trace_ids_json, []),
                         )
                         for item in sorted(sets, key=lambda row: row.set_number)
@@ -1633,10 +1835,228 @@ class ProgramService:
         rationale = str(sections.get("sop_progress", {}).get("rationale", "")).strip()
         if not rationale and context.latest_program_id and context.latest_version_id:
             rationale = self.get_version(context.latest_program_id, context.latest_version_id).rationale
-        response = rationale or "No recorded plan rationale is available in this ProgramContext yet."
-        trace_id = self._trace(context, "explain_plan_rationale", {"read_only": True}, started=started)
+        question = str(sections.get("current_user_turn", {}).get("content", ""))
+        working_memory = str(
+            sections.get("memory_context", {}).get("sections", {}).get("working_memory", "")
+        )
+        recent_conversation = working_memory[-6000:]
+        numeric_facts = self._numeric_rationale_facts(context, question, recent_conversation)
+        rationale_context = {
+            "context_status": context.status,
+            "active_task_type": context.active_task_type,
+            "active_sop": context.active_sop,
+            "current_sop_step": context.current_sop_step,
+            "pending_action": context.pending_action,
+            "latest_program_id": context.latest_program_id,
+            "latest_version_id": context.latest_version_id,
+            "review_status": context.review_status,
+            "approval_status": context.approval_status,
+            "sop_progress": sections.get("sop_progress", {}),
+            "retrieved_evidence": sections.get("retrieved_evidence", []),
+            "safety_flags_and_budget_warnings": sections.get("safety_flags_and_budget_warnings", []),
+            "recent_program_conversation": recent_conversation,
+            "recorded_rationale": rationale,
+        }
+        result = run_program_rationale_graph(
+            {
+                "rationale_question": question,
+                "rationale_context": rationale_context,
+                "numeric_rationale_facts": numeric_facts,
+            },
+            self.llm_provider,
+        )
+        response = str(result["rationale_answer"])
+        trace_id = self._trace(
+            context,
+            "explain_plan_rationale",
+            {"read_only": True, "builder": "llm", "numeric_facts_used": bool(numeric_facts)},
+            started=started,
+        )
         self._assistant_message(context, response)
         return self._turn_response(context, response, trace_id)
+
+    def _numeric_rationale_facts(
+        self,
+        context: ProgramContextRecord,
+        question: str,
+        recent_conversation: str = "",
+    ) -> dict[str, Any]:
+        """Select a visible load and return its persisted calculation facts."""
+
+        if not context.latest_program_id or not context.latest_version_id:
+            return {}
+        lowered = question.lower()
+        if not any(
+            term in lowered
+            for term in ("weight", "load", "number", "calculate", "calculation", "intensity", "percent", "%", " kg", "rep")
+        ):
+            return {}
+        version = self.get_version(context.latest_program_id, context.latest_version_id)
+        exercise_scores = {
+            exercise.exercise_id: _exercise_question_match_score(exercise.name, question)
+            for planned_session in version.sessions
+            for exercise in planned_session.exercises
+        }
+        exercise_term = _best_exercise_term(version, exercise_scores)
+        if not exercise_term and recent_conversation:
+            recent_scores = {
+                exercise.exercise_id: _exercise_question_match_score(exercise.name, recent_conversation)
+                for planned_session in version.sessions
+                for exercise in planned_session.exercises
+            }
+            exercise_term = _best_exercise_term(version, recent_scores)
+            exercise_scores = recent_scores if exercise_term else exercise_scores
+        matched_exercise_ids = {exercise_id for exercise_id, score in exercise_scores.items() if score > 0}
+        mentioned_reps = [
+            int(value)
+            for value in re.findall(r"(\d+)\s*(?:self[-\s]*weight\s*)?(?:pull[-\s]*ups?|reps?|repetitions?)", lowered)
+        ]
+        mentioned_rpes = [
+            float(value)
+            for value in re.findall(r"\brpe\s*(\d+(?:\.\d+)?)\b", lowered)
+        ]
+        wants_bodyweight = bool(
+            re.search(r"\b(body\s*weight|bodyweight|self[-\s]*weight|unweighted)\b", lowered)
+        )
+        candidates = []
+        for planned_session in version.sessions:
+            for exercise in planned_session.exercises:
+                exercise_score = exercise_scores.get(exercise.exercise_id, 0)
+                if matched_exercise_ids and exercise.exercise_id not in matched_exercise_ids:
+                    continue
+                bodyweight = _is_bodyweight_exercise({"name": exercise.name, "notes": exercise.notes})
+                for prescribed_set in exercise.sets:
+                    if not matched_exercise_ids and prescribed_set.load_kg is None:
+                        continue
+                    candidates.append((planned_session, exercise, prescribed_set, exercise_score, bodyweight))
+        if not candidates:
+            return {}
+        mentioned_loads = [float(value) for value in re.findall(r"(\d+(?:\.\d+)?)\s*kg", question, re.IGNORECASE)]
+        mentioned_percentages = [
+            float(value)
+            for value in re.findall(r"(\d+(?:\.\d+)?)\s*%", question, re.IGNORECASE)
+        ]
+        if mentioned_percentages:
+            candidates_with_intensity = [item for item in candidates if item[2].intensity_percent is not None]
+            chosen = min(
+                candidates_with_intensity or candidates,
+                key=lambda item: min(
+                    abs(float(item[2].intensity_percent or 0) - value)
+                    for value in mentioned_percentages
+                ),
+            )
+        elif mentioned_loads:
+            candidates_with_load = [item for item in candidates if item[2].load_kg is not None]
+            chosen = min(
+                candidates_with_load or candidates,
+                key=lambda item: min(
+                    abs(float(item[2].load_kg) - value) if item[2].load_kg is not None else 1_000_000
+                    for value in mentioned_loads
+                ),
+            )
+        elif mentioned_reps or mentioned_rpes or matched_exercise_ids:
+            chosen = max(
+                candidates,
+                key=lambda item: _prescription_question_score(
+                    item[2],
+                    exercise_score=item[3],
+                    is_bodyweight=item[4],
+                    mentioned_reps=mentioned_reps,
+                    mentioned_rpes=mentioned_rpes,
+                    wants_bodyweight=wants_bodyweight,
+                ),
+            )
+        else:
+            chosen = max(candidates, key=lambda item: float(item[2].load_kg or 0))
+        planned_session, exercise, prescribed_set, _, is_bodyweight = chosen
+        traces = [
+            self.session.get(CalculationTrace, trace_id)
+            for trace_id in prescribed_set.calculation_trace_ids
+        ]
+        traces = [trace for trace in traces if trace is not None]
+        progression = next((trace for trace in traces if trace.tool_name == "calculate_progression_increment"), None)
+        percentage = next((trace for trace in traces if trace.tool_name == "calculate_percentage_load"), None)
+        rounding = next((trace for trace in traces if trace.tool_name == "round_training_load"), None)
+        facts: dict[str, Any] = {
+            "selected_prescription": {
+                "exercise": exercise.name,
+                "week": planned_session.week_number,
+                "day": planned_session.day_number,
+                "session_id": planned_session.session_id,
+                "set_id": prescribed_set.set_id,
+                "load_kg": prescribed_set.load_kg,
+                "reps": prescribed_set.reps,
+                "intensity_percent": prescribed_set.intensity_percent,
+                "rpe": prescribed_set.rpe,
+                "rest_seconds": prescribed_set.rest_seconds,
+                "notes": exercise.notes,
+                "is_bodyweight": is_bodyweight,
+            },
+            "selection": {
+                "exercise_term": exercise_term,
+                "weights_mentioned_kg": mentioned_loads,
+                "intensities_mentioned_percent": mentioned_percentages,
+                "reps_mentioned": mentioned_reps,
+                "rpes_mentioned": mentioned_rpes,
+                "rule": (
+                    "closest mentioned intensity"
+                    if mentioned_percentages
+                    else "closest mentioned load"
+                    if mentioned_loads
+                    else "best exercise/reps/RPE match"
+                    if mentioned_reps or mentioned_rpes or matched_exercise_ids
+                    else "heaviest matching loaded set"
+                ),
+            },
+            "calculation_chain": [
+                {
+                    "calculation_id": trace.calculation_trace_id,
+                    "tool_name": trace.tool_name,
+                    "inputs": _loads(trace.inputs_json, {}),
+                    "result": _loads(trace.result_json, {}),
+                    "formula": trace.formula,
+                    "unit": trace.unit,
+                    "rounding_policy": trace.rounding_policy,
+                    "source_references": _loads(trace.source_references_json, []),
+                }
+                for trace in traces
+            ],
+            "matched_prescriptions": _matched_prescription_facts(
+                candidates,
+                mentioned_reps=mentioned_reps,
+                mentioned_rpes=mentioned_rpes,
+                wants_bodyweight=wants_bodyweight,
+            ),
+            "reported_bodyweight_performance": _extract_bodyweight_performance_claims(question),
+        }
+        for name, trace in (
+            ("progression", progression),
+            ("percentage_load", percentage),
+            ("rounding", rounding),
+        ):
+            if trace:
+                facts[name] = {
+                    "tool_name": trace.tool_name,
+                    "inputs": _loads(trace.inputs_json, {}),
+                    "result": _loads(trace.result_json, {}),
+                    "formula": trace.formula,
+                    "unit": trace.unit,
+                    "rounding_policy": trace.rounding_policy,
+                    "source_references": _loads(trace.source_references_json, []),
+                }
+        if percentage:
+            percentage_inputs = _loads(percentage.inputs_json, {})
+            reported_maxes = self._extract_lift_maxes(question)
+            lift_key = _lift_key_for_exercise(exercise.name)
+            reported = reported_maxes.get(lift_key) if lift_key else None
+            used = float(percentage_inputs.get("one_rm", 0))
+            facts["one_rm_comparison"] = {
+                "lift_key": lift_key,
+                "saved_plan_one_rm_kg": used,
+                "reported_in_current_question_kg": reported,
+                "source_conflict": bool(reported and abs(reported - used) > 0.01),
+            }
+        return facts
 
     def _trace(
         self,
@@ -1703,6 +2123,8 @@ class ProgramService:
         trace_id: str,
         warnings: list[str] | None = None,
     ) -> ProgramTurnResponse:
+        sections = self._sections(context)
+        draft = sections.get("draft_artifacts", {})
         return ProgramTurnResponse(
             conversation_id=context.conversation_id,
             context_id=context.context_id,
@@ -1711,10 +2133,10 @@ class ProgramService:
             status=context.status,
             response=response,
             pending_action=context.pending_action,
-            draft_program_id=context.latest_program_id,
-            draft_version_id=context.latest_version_id,
+            draft_program_id=draft.get("program_id"),
+            draft_version_id=draft.get("version_id"),
             trace_id=trace_id,
-            warnings=warnings or list(self._sections(context).get("safety_flags_and_budget_warnings", [])),
+            warnings=warnings or list(sections.get("safety_flags_and_budget_warnings", [])),
         )
 
     def _context_out(self, context: ProgramContextRecord) -> ProgramContextResponse:
@@ -1744,11 +2166,6 @@ class ProgramService:
             select(ProgramContextRecord).where(ProgramContextRecord.latest_version_id == version_id)
         ).first()
 
-    def _adaptation_for_version(self, version_id: str) -> ProgramAdaptation | None:
-        return self.session.exec(
-            select(ProgramAdaptation).where(ProgramAdaptation.to_version_id == version_id)
-        ).first()
-
     def _summary_out(self, item: TrainingSummaryNote) -> TrainingSummaryNoteOut:
         return TrainingSummaryNoteOut(
             summary_id=item.summary_id,
@@ -1775,22 +2192,330 @@ def _active_plan_payload(memory_context: dict[str, Any]) -> dict[str, Any] | Non
         return None
 
 
-def _classify_adaptation_trigger(message: str) -> dict[str, Any]:
-    text = message.lower()
-    if re.search(r"\b(meeting|schedule|calendar|travel|work conflict|overlap|busy)\b", text):
-        category = "schedule_conflict"
-    elif re.search(r"\b(fatigue|tired|sore|sleep|under.recover|recovery)\b", text):
-        category = "recovery_limitation"
-    elif re.search(r"\b(pain|injury|ill|sick)\b", text):
-        category = "pain_illness_or_safety"
-    elif re.search(r"\b(missed|cannot do|can't do|couldn't do)\b", text):
-        category = "missed_session_reason_unclear"
-    else:
-        category = "general_revision"
+def _compact_memory_context_for_program_context(memory_context: dict[str, Any]) -> dict[str, Any]:
+    """Store a compact ProgramContext copy without changing the Memory block contract."""
+
+    compacted = dict(memory_context)
+    compacted.pop("rendered_context", None)
+    compacted.pop("debug", None)
+    memory_sections = compacted.get("sections")
+    if isinstance(memory_sections, dict):
+        sections = dict(memory_sections)
+        active_plan = sections.get("active_plan_progress")
+        if isinstance(active_plan, str):
+            sections["active_plan_progress"] = _strip_plan_calculation_trace_ids(active_plan)
+        compacted["sections"] = sections
+    return compacted
+
+
+def _render_program_memory_context(memory_context: dict[str, Any]) -> str:
+    rendered_context = memory_context.get("rendered_context")
+    if isinstance(rendered_context, str) and rendered_context.strip():
+        return _strip_active_plan_calculation_trace_ids(rendered_context)
+    memory_sections = memory_context.get("sections")
+    if not isinstance(memory_sections, dict):
+        return ""
+    return render_sections(
+        {
+            str(name): _stringify_memory_context_section(value)
+            for name, value in memory_sections.items()
+        }
+    )
+
+
+def _stringify_memory_context_section(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value in (None, "", [], {}):
+        return ""
+    return _dumps(value)
+
+
+def _compact_calculated_plan_working_state(working: dict[str, Any]) -> dict[str, Any]:
+    compacted = dict(working)
+    compacted.pop("step_outputs", None)
+    if "calculated_plan" not in compacted or compacted.get("calculation_artifacts"):
+        return compacted
+    calculated_plan = compacted.get("calculated_plan")
+    if not isinstance(calculated_plan, dict):
+        return compacted
+    compacted["calculation_artifacts"] = _calculation_artifacts_from_calculated_plan(
+        calculated_plan,
+        compacted.get("raw_plan", {}),
+    )
+    compacted.pop("calculated_plan", None)
+    return compacted
+
+
+def _calculation_artifacts_from_calculated_plan(
+    calculated_plan: dict[str, Any],
+    raw_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_periodization = (raw_plan or {}).get("periodization", {})
+    calculated_periodization = calculated_plan.get("periodization", {})
     return {
-        "category": category,
-        "adjustment_priority": ["frequency", "volume", "intensity", "exercise_selection_or_order", "rest"],
+        "schema": "calculated_plan_delta_v1",
+        "calculated_sessions": calculated_plan.get("sessions", []),
+        "calculated_periodization": {
+            key: value
+            for key, value in calculated_periodization.items()
+            if not isinstance(raw_periodization, dict) or raw_periodization.get(key) != value
+        },
     }
+
+
+RAW_PLAN_SOP_METADATA_KEYS = {
+    "screening",
+    "needs_analysis",
+    "periodization",
+    "planning_model",
+    "changed_elements",
+    "unchanged_elements",
+}
+
+
+def _strip_raw_plan_sop_metadata(raw_plan: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(raw_plan or {})
+    for key in RAW_PLAN_SOP_METADATA_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(working.get("calculated_plan"), dict):
+        raw_plan = dict(working["calculated_plan"])
+    else:
+        raw_plan = _strip_raw_plan_sop_metadata(dict(working.get("raw_plan") or {}))
+    artifacts = working.get("calculation_artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("Calculated plan is missing calculation artifacts.")
+    calculated_sessions = artifacts.get("calculated_sessions")
+    if not isinstance(calculated_sessions, list):
+        raise ValueError("Calculation artifacts are missing calculated_sessions.")
+    calculated_periodization = artifacts.get("calculated_periodization", {})
+    if not isinstance(calculated_periodization, dict):
+        raise ValueError("Calculation artifacts have invalid calculated_periodization.")
+    metadata = _program_metadata_from_sop_progress(sections.get("sop_progress", {}), working, raw_plan)
+    periodization = {
+        **metadata["periodization"],
+        **calculated_periodization,
+    }
+    return {
+        **raw_plan,
+        "screening": metadata["screening"],
+        "needs_analysis": metadata["needs_analysis"],
+        "periodization": periodization,
+        "planning_model": metadata["planning_model"],
+        "rationale": metadata["rationale"],
+        "assumptions": metadata["assumptions"],
+        "warnings": metadata["warnings"],
+        "sessions": calculated_sessions,
+    }
+
+
+def _program_metadata_from_sop_progress(
+    sop_progress: dict[str, Any],
+    working: dict[str, Any],
+    raw_plan: dict[str, Any],
+) -> dict[str, Any]:
+    legacy_raw = working.get("raw_plan", {}) if isinstance(working.get("raw_plan"), dict) else {}
+    legacy_metadata = working.get("plan_metadata", {}) if isinstance(working.get("plan_metadata"), dict) else {}
+    screening_decision = _sop_decision_payload(sop_progress, "consultation_and_screening")
+    needs_decision = _sop_decision_payload(sop_progress, "needs_analysis")
+    periodization_decision = _periodization_from_sop_progress(sop_progress, legacy_metadata or legacy_raw)
+    planning_decision = _sop_decision_payload(sop_progress, "planning_model")
+    planning_model = planning_decision.get("planning_model", planning_decision) if isinstance(planning_decision, dict) else {}
+    if not isinstance(planning_model, dict):
+        planning_model = {"model": str(planning_model)}
+    if planning_model.get("model") and not periodization_decision.get("model"):
+        periodization_decision["model"] = planning_model.get("model")
+    screening = screening_decision.get("screening", screening_decision) if isinstance(screening_decision, dict) else {}
+    needs_analysis = needs_decision.get("needs_analysis", needs_decision) if isinstance(needs_decision, dict) else {}
+    return {
+        "screening": (
+            screening
+            if isinstance(screening, dict) and screening
+            else legacy_metadata.get("screening", legacy_raw.get("screening", {}))
+        ),
+        "needs_analysis": (
+            needs_analysis
+            if isinstance(needs_analysis, dict) and needs_analysis
+            else legacy_metadata.get("needs_analysis", legacy_raw.get("needs_analysis", {}))
+        ),
+        "periodization": periodization_decision,
+        "planning_model": str(
+            planning_model.get("model")
+            or legacy_metadata.get("planning_model")
+            or periodization_decision.get("model")
+            or "parallel"
+        ),
+        "rationale": str(raw_plan.get("rationale") or sop_progress.get("rationale") or ""),
+        "assumptions": _coerce_string_list(raw_plan.get("assumptions", [])),
+        "warnings": _coerce_string_list(raw_plan.get("warnings", [])),
+    }
+
+
+def _metadata_from_legacy_raw_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
+    periodization = raw_plan.get("periodization", {}) if isinstance(raw_plan.get("periodization"), dict) else {}
+    planning_model = raw_plan.get("planning_model")
+    if isinstance(planning_model, dict):
+        planning_model = planning_model.get("model")
+    return {
+        "screening": raw_plan.get("screening", {}) if isinstance(raw_plan.get("screening"), dict) else {},
+        "needs_analysis": raw_plan.get("needs_analysis", {}) if isinstance(raw_plan.get("needs_analysis"), dict) else {},
+        "periodization": periodization,
+        "planning_model": str(planning_model or periodization.get("model") or "parallel"),
+    }
+
+
+def _periodization_from_sop_progress(sop_progress: dict[str, Any], raw_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw_plan = raw_plan if isinstance(raw_plan, dict) else {}
+    decision = _sop_decision_payload(sop_progress, "periodization")
+    periodization = decision.get("periodization", decision) if isinstance(decision, dict) else {}
+    if not isinstance(periodization, dict) or not periodization:
+        periodization = raw_plan.get("periodization", {}) if isinstance(raw_plan.get("periodization"), dict) else {}
+    if not periodization:
+        periodization = {"weeks": 4, "macrocycle": "four_week_block", "phases": []}
+    return dict(periodization)
+
+
+def _sop_decision_payload(sop_progress: dict[str, Any], step: str) -> dict[str, Any]:
+    decisions = sop_progress.get("decisions", {}) if isinstance(sop_progress, dict) else {}
+    output = decisions.get(step, {}) if isinstance(decisions, dict) else {}
+    if not isinstance(output, dict):
+        return {}
+    decision = output.get("decision", output)
+    return decision if isinstance(decision, dict) else {}
+
+
+def _normalize_retrieved_evidence_section(
+    retrieved_evidence: Any,
+    current_step: str | None,
+    sop_progress: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    progress = dict(sop_progress) if isinstance(sop_progress, dict) else {}
+    raw_refs_by_step = progress.get("evidence_refs_by_step", {})
+    if not isinstance(raw_refs_by_step, dict):
+        raw_refs_by_step = {}
+    refs_by_step = {
+        str(step): list(refs) if isinstance(refs, list) else []
+        for step, refs in raw_refs_by_step.items()
+    }
+    step = str(current_step or progress.get("current_step") or "")
+    if isinstance(retrieved_evidence, list):
+        current_items: list[dict[str, Any]] = []
+        current_chunk_ids: set[str] = set()
+        for item in retrieved_evidence:
+            if not isinstance(item, dict):
+                continue
+            item_steps = item.get("sop_steps")
+            if isinstance(item_steps, list):
+                for item_step in item_steps:
+                    refs_by_step.setdefault(str(item_step), [])
+                    _append_unique_ref(refs_by_step[str(item_step)], item)
+            if step and (not isinstance(item_steps, list) or step in item_steps):
+                chunk_id = str(item.get("chunk_id") or "")
+                if chunk_id not in current_chunk_ids:
+                    current_items.append(_evidence_item_without_sop_steps(item))
+                    current_chunk_ids.add(chunk_id)
+        progress["evidence_refs_by_step"] = refs_by_step
+        return {"current_step": step or None, "items": current_items}, progress
+    if isinstance(retrieved_evidence, dict):
+        packet_step = str(retrieved_evidence.get("current_step") or step or "")
+        items = _dedupe_evidence_items(retrieved_evidence.get("items", []))
+        if packet_step and items:
+            refs_by_step.setdefault(packet_step, [])
+            for item in items:
+                _append_unique_ref(refs_by_step[packet_step], item)
+            progress["evidence_refs_by_step"] = refs_by_step
+        return {"current_step": packet_step or None, "items": items}, progress
+    return {"current_step": step or None, "items": []}, progress
+
+
+def _current_evidence_items(sections: dict[str, Any]) -> list[dict[str, Any]]:
+    retrieved = sections.get("retrieved_evidence", {})
+    if isinstance(retrieved, dict):
+        return _dedupe_evidence_items(retrieved.get("items", []))
+    if isinstance(retrieved, list):
+        return _dedupe_evidence_items(retrieved)
+    return []
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    items: list[str] = []
+
+    def add(item: Any) -> None:
+        if item in (None, ""):
+            return
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                items.append(text)
+            return
+        if isinstance(item, list):
+            for child in item:
+                add(child)
+            return
+        if isinstance(item, dict):
+            text = _dumps(item)
+        else:
+            text = str(item)
+        if text:
+            items.append(text)
+
+    add(value)
+    return items
+
+
+def _dedupe_evidence_items(items: Any) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen_chunk_ids: set[str] = set()
+    if not isinstance(items, list):
+        return deduped
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        chunk_id = str(item.get("chunk_id") or "")
+        if chunk_id in seen_chunk_ids:
+            continue
+        deduped.append(_evidence_item_without_sop_steps(item))
+        seen_chunk_ids.add(chunk_id)
+    return deduped
+
+
+def _evidence_refs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for item in items:
+        _append_unique_ref(refs, item)
+    return refs
+
+
+def _all_evidence_refs(sop_progress: dict[str, Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    refs_by_step = sop_progress.get("evidence_refs_by_step", {}) if isinstance(sop_progress, dict) else {}
+    if not isinstance(refs_by_step, dict):
+        return refs
+    for step_refs in refs_by_step.values():
+        if not isinstance(step_refs, list):
+            continue
+        for item in step_refs:
+            if isinstance(item, dict):
+                _append_unique_ref(refs, item)
+    return refs
+
+
+def _append_unique_ref(refs: list[dict[str, Any]], item: dict[str, Any]) -> None:
+    ref = {"source_id": item.get("source_id"), "chunk_id": item.get("chunk_id")}
+    if not ref["chunk_id"]:
+        return
+    if ref not in refs:
+        refs.append(ref)
+
+
+def _evidence_item_without_sop_steps(item: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(item)
+    cleaned.pop("sop_steps", None)
+    return cleaned
 
 
 def _count_logged_sets(exercises: list[dict[str, Any]], sets_summary: dict[str, Any]) -> int:
@@ -1843,22 +2568,398 @@ def _weekly_plan_signals(active_plan: Any, week_start: date, week_end: date) -> 
     return len(planned_ids), completed, list(dict.fromkeys(change_types))
 
 
-def _one_rm_for_exercise(exercise_name: str, profile: str) -> float | None:
+def _extract_lift_maxes(message: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    lift_aliases = (
+        ("bench press", "bench_press_1rm_kg"),
+        ("bench", "bench_press_1rm_kg"),
+        ("squat", "squat_1rm_kg"),
+        ("deadlift", "deadlift_1rm_kg"),
+        ("overhead press", "overhead_press_1rm_kg"),
+    )
+    exact_keys: set[str] = set()
+    for _, key in lift_aliases:
+        named = re.search(rf"{re.escape(key)}\s*[:=]\s*(\d+(?:\.\d+)?)", message, re.IGNORECASE)
+        if named:
+            values[key] = float(named.group(1))
+            exact_keys.add(key)
+
+    sbd = re.search(
+        r"\bSBD\b\D{0,12}(\d+(?:\.\d+)?)\s*kg?\D{0,12}(\d+(?:\.\d+)?)\s*kg?\D{0,12}(\d+(?:\.\d+)?)\s*kg?",
+        message,
+        re.IGNORECASE,
+    )
+    if sbd:
+        for key, group_index in (
+            ("squat_1rm_kg", 1),
+            ("bench_press_1rm_kg", 2),
+            ("deadlift_1rm_kg", 3),
+        ):
+            values.setdefault(key, float(sbd.group(group_index)))
+
+    max_marker = r"(?:1\s*rm|one\s*rep\s*max|max|\bpr\b|personal\s+record)"
+    for lift_name, key in lift_aliases:
+        if key in exact_keys:
+            continue
+        for lift_match in re.finditer(rf"\b{re.escape(lift_name)}\b", message, re.IGNORECASE):
+            segment = message[lift_match.start() : lift_match.start() + 100]
+            segment = re.split(r"[\n.;]", segment, maxsplit=1)[0]
+            direct = re.search(
+                rf"\b{re.escape(lift_name)}\b\s*{max_marker}\s*[:=]?\s*(\d+(?:\.\d+)?)\s*kg",
+                segment,
+                re.IGNORECASE,
+            )
+            marked = re.search(
+                rf"\b{re.escape(lift_name)}\b[^\n.;]{{0,50}}?{max_marker}[^\n.;]{{0,25}}?(\d+(?:\.\d+)?)\s*kg",
+                segment,
+                re.IGNORECASE,
+            )
+            match = direct or marked
+            if match:
+                values[key] = float(match.group(1))
+                break
+
+    for lift_name, key in lift_aliases:
+        if key in exact_keys:
+            continue
+        natural = re.search(
+            rf"{max_marker}[^\n.;]{{0,35}}?\b{re.escape(lift_name)}\b[^\n.;]{{0,35}}?(\d+(?:\.\d+)?)\s*kg",
+            message,
+            re.IGNORECASE,
+        )
+        if natural:
+            values[key] = float(natural.group(1))
+    return values
+
+
+def _sanitize_lift_maxes(value: Any) -> dict[str, float]:
+    allowed = {
+        "squat_1rm_kg",
+        "bench_press_1rm_kg",
+        "deadlift_1rm_kg",
+        "overhead_press_1rm_kg",
+    }
+    if not isinstance(value, dict):
+        return {}
+    cleaned: dict[str, float] = {}
+    for key, raw in value.items():
+        if key not in allowed:
+            continue
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= parsed <= 500:
+            cleaned[key] = parsed
+    return cleaned
+
+
+def _lift_key_for_exercise(exercise_name: str) -> str | None:
+    normalized = exercise_name.lower()
+    for term, key in (
+        ("bench", "bench_press_1rm_kg"),
+        ("squat", "squat_1rm_kg"),
+        ("deadlift", "deadlift_1rm_kg"),
+        ("overhead", "overhead_press_1rm_kg"),
+    ):
+        if term in normalized:
+            return key
+    return None
+
+
+def _best_exercise_term(version: ProgramVersionResponse, exercise_scores: dict[str, int]) -> str | None:
+    best_name = None
+    best_score = 0
+    for planned_session in version.sessions:
+        for exercise in planned_session.exercises:
+            score = exercise_scores.get(exercise.exercise_id, 0)
+            if score > best_score:
+                best_name = exercise.name
+                best_score = score
+    return best_name.lower() if best_name and best_score > 0 else None
+
+
+def _exercise_question_match_score(exercise_name: str, question: str) -> int:
+    lowered = question.lower()
+    score = 0
+    for alias in _exercise_aliases(exercise_name):
+        if alias and alias in lowered:
+            score = max(score, 100 + len(alias))
+    name_tokens = set(_match_tokens(exercise_name))
+    question_tokens = set(_match_tokens(question))
+    if name_tokens and name_tokens <= question_tokens:
+        score = max(score, 60 + len(name_tokens) * 5)
+    elif name_tokens:
+        overlap = name_tokens & question_tokens
+        if overlap and len(overlap) >= min(2, len(name_tokens)):
+            score = max(score, 20 + len(overlap) * 5)
+        distinctive_overlap = overlap & {"bench", "squat", "deadlift", "overhead", "pull"}
+        if distinctive_overlap:
+            score = max(score, 45 + len(distinctive_overlap) * 5)
+    return score
+
+
+def _exercise_aliases(exercise_name: str) -> list[str]:
+    base = exercise_name.lower().strip()
+    aliases = {base, base.replace("-", " "), base.replace("-", ""), _normalize_exercise_name(base).replace("_", " ")}
+    if "pull" in base and "up" in base:
+        aliases.update({"pull-up", "pull up", "pullup", "pull-ups", "pull ups", "pullups"})
+        if "paused" in base:
+            aliases.update({"paused pull-up", "paused pull up", "paused pullup", "paused self-weight pull-up"})
+        if "weighted" in base:
+            aliases.update({"weighted pull-up", "weighted pull up", "weighted pullup"})
+    return sorted(aliases, key=len, reverse=True)
+
+
+def _match_tokens(text: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r"[a-z0-9]+", text.lower().replace("-", " ")):
+        if token in {"self", "weight", "body", "bodyweight", "the", "your", "plan", "sets", "set"}:
+            continue
+        if token == "ups":
+            token = "up"
+        elif token == "pullups":
+            token = "pullup"
+        elif token.endswith("s") and len(token) > 3:
+            token = token[:-1]
+        if token == "pullup":
+            tokens.extend(["pull", "up"])
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _prescription_question_score(
+    prescribed_set: SetPrescriptionOut,
+    exercise_score: int,
+    is_bodyweight: bool,
+    mentioned_reps: list[int],
+    mentioned_rpes: list[float],
+    wants_bodyweight: bool,
+) -> float:
+    score = float(exercise_score)
+    if mentioned_reps and prescribed_set.reps is not None:
+        score += max(0.0, 30.0 - min(abs(prescribed_set.reps - reps) for reps in mentioned_reps) * 6.0)
+    if mentioned_rpes and prescribed_set.rpe is not None:
+        score += max(0.0, 20.0 - min(abs(float(prescribed_set.rpe) - rpe) for rpe in mentioned_rpes) * 8.0)
+    if wants_bodyweight and is_bodyweight and prescribed_set.load_kg is None:
+        score += 25.0
+    if prescribed_set.load_kg is not None:
+        score += 2.0
+    return score
+
+
+def _matched_prescription_facts(
+    candidates: list[tuple[Any, Any, SetPrescriptionOut, int, bool]],
+    mentioned_reps: list[int],
+    mentioned_rpes: list[float],
+    wants_bodyweight: bool,
+) -> list[dict[str, Any]]:
+    ranked = sorted(
+        candidates,
+        key=lambda item: _prescription_question_score(
+            item[2],
+            exercise_score=item[3],
+            is_bodyweight=item[4],
+            mentioned_reps=mentioned_reps,
+            mentioned_rpes=mentioned_rpes,
+            wants_bodyweight=wants_bodyweight,
+        ),
+        reverse=True,
+    )
+    facts: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None, float | None, float | None]] = set()
+    mentioned_reps_set = set(mentioned_reps)
+    for planned_session, exercise, prescribed_set, _, is_bodyweight in ranked:
+        if mentioned_reps_set and prescribed_set.reps not in mentioned_reps_set:
+            continue
+        if not mentioned_reps_set and mentioned_rpes and prescribed_set.rpe is not None:
+            if all(abs(float(prescribed_set.rpe) - rpe) > 0.01 for rpe in mentioned_rpes):
+                continue
+        key = (exercise.name, prescribed_set.reps, prescribed_set.rpe, prescribed_set.load_kg)
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(
+            {
+                "exercise": exercise.name,
+                "week": planned_session.week_number,
+                "day": planned_session.day_number,
+                "session_id": planned_session.session_id,
+                "set_id": prescribed_set.set_id,
+                "reps": prescribed_set.reps,
+                "load_kg": prescribed_set.load_kg,
+                "intensity_percent": prescribed_set.intensity_percent,
+                "rpe": prescribed_set.rpe,
+                "rest_seconds": prescribed_set.rest_seconds,
+                "notes": exercise.notes,
+                "is_bodyweight": is_bodyweight,
+                "calculation_trace_ids": prescribed_set.calculation_trace_ids,
+            }
+        )
+        if len(facts) >= 8:
+            break
+    return facts
+
+
+def _extract_bodyweight_performance_claims(question: str) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for match in re.finditer(
+        r"(?:more than|over|at least|>=|>)?\s*(\d+)\s*(?:self[-\s]*weight|body\s*weight|bodyweight)?\s*pull[-\s]*ups?",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        claims.append({"exercise": "pull-up", "reps": int(match.group(1)), "text": match.group(0).strip()})
+    return claims
+
+
+def _strip_active_plan_calculation_trace_ids(rendered_context: str) -> str:
+    marker = "## Active Plan Progress"
+    section_start = rendered_context.find(marker)
+    if section_start < 0:
+        return rendered_context
+    section_end = rendered_context.find("\n\n## ", section_start + len(marker))
+    if section_end < 0:
+        section_end = len(rendered_context)
+    original_section = rendered_context[section_start:section_end]
+    cleaned_section = _strip_plan_calculation_trace_ids(original_section)
+    return rendered_context[:section_start] + cleaned_section + rendered_context[section_end:]
+
+
+def _is_budget_warning(value: Any) -> bool:
+    text = str(value)
+    return text.startswith(("ProgramContext section ", "ProgramContext is about ", "Memory section ", "Memory context is about "))
+
+
+def _strip_plan_calculation_trace_ids(plan_text: str) -> str:
+    json_start = plan_text.find("{")
+    if json_start < 0:
+        return plan_text
+    prefix = plan_text[:json_start]
+    try:
+        payload = json.loads(plan_text[json_start:])
+    except (json.JSONDecodeError, TypeError):
+        return plan_text
+    if isinstance(payload, dict) and payload.get("format") != "compact_active_plan_v1":
+        return prefix + json.dumps(
+            compact_active_plan_payload(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    plan_snapshot = payload.get("plan_snapshot") if isinstance(payload, dict) else None
+    source_references = plan_snapshot.get("source_references") if isinstance(plan_snapshot, dict) else None
+    if not isinstance(source_references, dict) or "calculation_trace_ids" not in source_references:
+        return plan_text
+    source_references = dict(source_references)
+    source_references.pop("calculation_trace_ids", None)
+    plan_snapshot = dict(plan_snapshot)
+    plan_snapshot["source_references"] = source_references
+    payload = dict(payload)
+    payload["plan_snapshot"] = plan_snapshot
+    return prefix + _dumps(payload)
+
+
+def _one_rm_for_exercise(
+    exercise_name: str,
+    profile: str,
+    task_inputs: dict[str, Any] | None = None,
+) -> tuple[float | None, str]:
     normalized = exercise_name.lower()
     keys = {
         "bench": "bench_press_1rm_kg",
         "squat": "squat_1rm_kg",
         "deadlift": "deadlift_1rm_kg",
         "overhead": "overhead_press_1rm_kg",
-        "press": "overhead_press_1rm_kg",
     }
     for term, key in keys.items():
         if term not in normalized:
             continue
+        if task_inputs and task_inputs.get(key) not in (None, ""):
+            return float(task_inputs[key]), "current_user_turn_1rm"
         match = re.search(rf"{re.escape(key)}:\s*([0-9]+(?:\.[0-9]+)?)", profile)
         if match:
-            return float(match.group(1))
-    return None
+            return float(match.group(1)), "profile_1rm"
+    return None, "missing_1rm"
+
+
+def _normalize_exercise_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _is_bodyweight_exercise(exercise: dict[str, Any]) -> bool:
+    load_type = str(exercise.get("load_type", "")).strip().lower()
+    if load_type == "weighted":
+        return False
+    if load_type == "bodyweight":
+        return True
+    text = f"{exercise.get('name', '')} {exercise.get('notes', '')}".lower()
+    if "weighted" in text or "external load" in text:
+        return False
+    return any(
+        term in text
+        for term in (
+            "bodyweight",
+            "body weight",
+            "pull-up",
+            "pull up",
+            "pullup",
+            "push-up",
+            "push up",
+            "pushup",
+            "plank",
+            "archer",
+            "inverted row",
+        )
+    )
+
+
+def _extract_exercise_load_references(
+    message: str,
+    exercise_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    references: dict[str, dict[str, Any]] = {}
+    for exercise_name in exercise_names:
+        aliases = [exercise_name]
+        normalized = exercise_name.lower()
+        if "overhead press" in normalized:
+            aliases.append("OHP")
+        if "back squat" in normalized:
+            aliases.append("squat")
+        segment = ""
+        for alias in aliases:
+            match = re.search(re.escape(alias), message, re.IGNORECASE)
+            if match:
+                segment = message[match.start() : match.start() + 140]
+                break
+        if not segment:
+            continue
+        one_rm_match = re.search(
+            r"(?:1\s*rm|pr|max)\D{0,20}(\d+(?:\.\d+)?)\s*kg",
+            segment,
+            re.IGNORECASE,
+        )
+        if one_rm_match:
+            references[_normalize_exercise_name(exercise_name)] = {
+                "exercise_name": exercise_name,
+                "weight_kg": float(one_rm_match.group(1)),
+                "reps": 1,
+                "source": "current_user_turn_1rm",
+            }
+            continue
+        performance_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*kg\s*(?:x|for)\s*(\d+)\s*(?:reps?)?",
+            segment,
+            re.IGNORECASE,
+        )
+        if performance_match:
+            references[_normalize_exercise_name(exercise_name)] = {
+                "exercise_name": exercise_name,
+                "weight_kg": float(performance_match.group(1)),
+                "reps": int(performance_match.group(2)),
+                "source": "current_user_turn_recent_performance",
+            }
+    return references
 
 
 def _next_monday(now: datetime) -> datetime:

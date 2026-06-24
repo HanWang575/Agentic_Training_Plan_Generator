@@ -492,29 +492,7 @@ class SetPrescription(SQLModel, table=True):
     intensity_percent: Optional[float] = None
     rpe: Optional[float] = None
     rest_seconds: int
-    duration_seconds: Optional[int] = None
-    distance_meters: Optional[float] = None
-    pace_seconds_per_km: Optional[int] = None
     calculation_trace_ids_json: str = "[]"
-
-
-class ProgramAdaptation(SQLModel, table=True):
-    """Audit link from an active version to its proposed replacement."""
-
-    __tablename__ = "program_adaptations"
-
-    adaptation_id: str = Field(primary_key=True, index=True)
-    from_version_id: str = Field(index=True, foreign_key="program_versions.version_id")
-    to_version_id: str = Field(index=True, foreign_key="program_versions.version_id", unique=True)
-    trigger: str
-    user_feedback: str
-    changed_json: str = "[]"
-    unchanged_json: str = "[]"
-    rationale: str = ""
-    evidence_references_json: str = "[]"
-    calculation_trace_ids_json: str = "[]"
-    approval_status: str = Field(default="pending", index=True)
-    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ProgramTrace(SQLModel, table=True):

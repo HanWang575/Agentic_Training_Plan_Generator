@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     memory_context_max_tokens: int = 34000
     memory_non_plan_max_tokens: int = 24000
     memory_plan_summary_max_tokens: int = 1000
-    memory_plan_full_max_tokens: int = 10000
+    memory_plan_full_max_tokens: int = 5000
 
     program_max_rag_queries: int = 5
     program_max_user_questions: int = 5
@@ -108,7 +108,6 @@ class Settings(BaseSettings):
     program_bodyweight_load_rounding_kg: float = 0.5
     program_rest_rounding_seconds: int = 5
     program_duration_rounding_seconds: int = 60
-    program_pace_rounding_seconds_per_km: int = 1
     program_require_approval_before_activation: bool = True
     program_require_approval_before_xunji_write: bool = True
     program_xunji_write_enabled: bool = False

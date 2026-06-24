@@ -1,45 +1,173 @@
-"""Prompts for structured program design and adaptation."""
+"""Prompts for structured program generation."""
 
 import json
 from typing import Any
 
 
-def build_program_plan_prompt(
+def build_program_task_router_prompt(
+    user_turn: str,
+    pending_action: str | None,
+    active_task_type: str | None,
+    active_sop: str | None,
+    current_sop_step: str | None,
+    latest_version_id: str | None,
+    approval_status: str | None,
+) -> str:
+    """Build the JSON-only prompt for Program Generator task routing."""
+
+    return f"""You are the TaskAndSOPRouter for a strength-program generator.
+Classify the user's current turn into exactly one route.
+
+Allowed routes:
+- new_program: design a separate new program rather than changing an existing one.
+- explain_plan_rationale: explain the current generated plan or its calculations without changing it.
+- clarification_answer: answer requested information for the currently pending planning task.
+
+Rules:
+- Use meaning, not keyword matching.
+- Use clarification_answer only when the turn actually supplies or answers requested information for the pending task.
+- Questions asking why/how without requesting a new program are rationale.
+- Treat planning requests as new_program unless they are a clarification answer or a why/how rationale question.
+- If no plan version exists, do not claim an existing plan can be explained; choose new_program unless this is a clarification answer.
+- Return JSON only.
+
+Current user turn:
+{user_turn}
+
+Workflow state:
+{json.dumps({
+    "pending_action": pending_action,
+    "active_task_type": active_task_type,
+    "active_sop": active_sop,
+    "current_sop_step": current_sop_step,
+    "latest_version_id": latest_version_id,
+    "approval_status": approval_status,
+}, ensure_ascii=False)}
+
+Return exactly:
+{{
+  "route": "new_program | explain_plan_rationale | clarification_answer",
+  "rationale": "short classification reason",
+  "confidence": 0.0
+}}"""
+
+
+def build_program_rationale_prompt(
+    question: str,
+    sop_context: dict[str, Any],
+    recorded_rationale: str,
+    numeric_facts: dict[str, Any] | None,
+) -> str:
+    """Build the grounded prompt for a question-specific plan rationale."""
+
+    return f"""You are the RationaleAnswerBuilder for a strength-program generator.
+Answer the user's exact question about the current generated plan.
+
+Rules:
+- Ground the answer only in the supplied SOP/context record, recorded rationale, and numeric facts.
+- Tailor the explanation to what the user actually asked; do not merely repeat the broad rationale.
+- If numeric facts are supplied, reconstruct the calculation step by step from those facts.
+- If `matched_prescriptions` are supplied, answer from those matched prescriptions first; do not switch to an unrelated loaded exercise merely because it has a fuller calculation chain.
+- For bodyweight prescriptions with `load_kg=null`, explain the saved reps, RPE, rest, notes, and recorded rationale; do not claim they belong to another weighted exercise.
+- Inspect the complete calculation chain and named progression/percentage/rounding facts before claiming that arithmetic is missing.
+- Clearly distinguish the value used by the saved plan from a newer value reported by the user.
+- Do not invent calculations, evidence, user facts, or design decisions.
+- Do not modify the plan or promise that a plan change has occurred.
+- If the recorded context cannot answer part of the question, say what is missing.
+- Return JSON only.
+
+User question:
+{question}
+
+SOP progress and context:
+{json.dumps(sop_context, ensure_ascii=False, default=str)}
+
+Recorded plan rationale:
+{recorded_rationale}
+
+Deterministically selected numeric facts:
+{json.dumps(numeric_facts or {}, ensure_ascii=False, default=str)}
+
+Return exactly:
+{{"answer": "question-specific rationale"}}"""
+
+
+def build_program_lift_max_extraction_prompt(user_message: str) -> str:
+    """Build the JSON-only prompt for current lift-max extraction."""
+
+    return f"""You are the LiftMaxExtractor node for a strength-program generator.
+Extract only current, user-reported maximum strength values from the current user message.
+
+Rules:
+- Extract current 1RM / PR / max values only.
+- Treat "SBD 110kg, 115kg, 150kg" as squat=110 kg, bench_press=115 kg, deadlift=150 kg.
+- Do not extract future goals or targets such as "bench 120 kg by the end of the year".
+- Do not extract bodyweight, height, age, volume, reps, working sets, or recent performance sets.
+- Do not convert a recent set like "Overhead Press: 45 kg x 8 reps" into a 1RM.
+- Do not extract weighted pull-up values into bench, squat, deadlift, or overhead press.
+- Use only this user message. Do not infer from memory or previous turns.
+- Return JSON only.
+
+Current user message:
+{user_message}
+
+Allowed keys:
+- squat_1rm_kg
+- bench_press_1rm_kg
+- deadlift_1rm_kg
+- overhead_press_1rm_kg
+
+Return exactly:
+{{
+  "lift_maxes": [
+    {{
+      "key": "bench_press_1rm_kg",
+      "value_kg": 115,
+      "source_text": "My bench PR is 115 kg",
+      "confidence": 0.95
+    }}
+  ],
+  "ignored": [
+    {{"source_text": "bench 120kg by the end of the year", "reason": "future target, not current max"}}
+  ]
+}}"""
+
+
+def build_program_sop_step_prompt(
     task_type: str,
+    sop_step: str,
     user_message: str,
     collected_inputs: dict[str, Any],
     memory_context: str,
     weekly_summaries: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
-    active_plan: dict[str, Any] | None,
+    previous_decisions: dict[str, Any],
+    raw_plan: dict[str, Any],
 ) -> str:
-    """Build a JSON-only prompt; deterministic code validates all numbers later."""
+    """Build the JSON-only prompt for one SOP decision in stepwise plan generation."""
 
-    active_plan_payload = active_plan or {}
-    return f"""You are the program-design reasoning component of an evidence-based personal trainer.
-Task: {task_type}
-
-Follow the applicable SOP in order. For a new program cover screening, needs analysis, periodization,
-planning model, programming decisions, exercise selection, frequency, exercise order, load/reps,
-volume, rest periods, and final review. For adaptation protect the goal, classify the trigger,
-change the smallest coherent portion of the future plan, and avoid stacking missed work.
-
-For a missed or impossible session, first separate a schedule conflict from recovery, illness, pain,
-or fatigue. Protect the training goal rather than the exact date. Reschedule conflicts within the
-current or nearby microcycle; for recovery limitations reduce fatigue and leave recovery before the
-next hard session. Redistribute key work coherently, adjust frequency then volume then intensity then
-exercise selection/order then rest, avoid failure-based work when fatigue is high, and state what
-future monitoring should trigger another revision.
+    return f"""You are the SOPStepExecutor for an evidence-based strength-program generator.
+Make only the decision for the current SOP step. Do not write the whole plan here.
 
 Rules:
-- Do not diagnose or provide medical clearance.
-- Use only supplied user facts and evidence. State conservative assumptions.
-- Produce a four-week plan unless the user explicitly requires another duration.
-- Return session templates for one week; deterministic code expands dates and weeks.
-- Numeric suggestions are proposals and will be recalculated and traced by tools.
-- Return JSON only, with no markdown.
+- Use the supplied MemoryContext, current-step evidence, previous SOP decisions, and existing raw_plan.
+- Preserve safety: do not diagnose or provide medical clearance.
+- State conservative assumptions when user facts are missing.
+- Do not calculate load_kg or weekly/session volume in this step; calculator steps do that later.
+- Put the current step's structured decision inside the `decision` object.
+- For consultation_and_screening, use `decision.screening`.
+- For needs_analysis, use `decision.needs_analysis`.
+- For periodization, use `decision.periodization` with fields such as weeks, macrocycle, mesocycles, microcycles, phases, target_timeline, and rationale.
+- For planning_model, use `decision.planning_model` with fields such as model and rationale.
+- Return JSON only.
 
-User message:
+Task type:
+{task_type}
+
+Current SOP step:
+{sop_step}
+
+User request:
 {user_message}
 
 Collected inputs:
@@ -51,35 +179,62 @@ Memory context:
 Latest completed weekly summaries:
 {json.dumps(weekly_summaries, ensure_ascii=False)}
 
-Approved evidence:
+Current-step approved evidence:
 {json.dumps(evidence, ensure_ascii=False)}
 
-Current active plan for adaptation:
-{json.dumps(active_plan_payload, ensure_ascii=False)}
+Previous SOP decisions:
+{json.dumps(previous_decisions, ensure_ascii=False, default=str)}
 
-Return this shape:
+Existing raw_plan:
+{json.dumps(raw_plan, ensure_ascii=False, default=str)}
+
+Return exactly:
 {{
-  "title": "short plan title",
-  "goal": "primary goal",
-  "sport": "sport or general_fitness",
-  "rationale": "concise rationale linked to supplied facts and evidence",
-  "screening": {{"status": "clear|limited|medical_clearance_required", "notes": []}},
-  "needs_analysis": {{"goal": "", "experience": "", "equipment": "", "constraints": []}},
-  "periodization": {{"weeks": 4, "model": "parallel|sequential|emphasis", "phases": []}},
+  "step": "{sop_step}",
+  "decision": {{"structured_fields_for_current_step": "values"}},
+  "rationale": "short reason grounded in the supplied context",
   "assumptions": [],
-  "warnings": [],
-  "sessions": [
-    {{
-      "name": "session name",
-      "goal": "session goal",
-      "duration_minutes": 60,
-      "exercises": [
-        {{"name": "exercise", "mode": "resistance|aerobic", "sets": 3, "reps": 8,
-          "intensity_percent": 70, "rpe": 7, "rest_seconds": 120,
-          "duration_seconds": null, "distance_meters": null, "pace_seconds_per_km": null, "notes": ""}}
-      ]
-    }}
-  ],
-  "changed_elements": [],
-  "unchanged_elements": []
+  "warnings": []
 }}"""
+
+
+def build_program_plan_update_prompt(
+    sop_step: str,
+    decision: dict[str, Any],
+    raw_plan: dict[str, Any],
+    collected_inputs: dict[str, Any],
+    previous_decisions: dict[str, Any],
+) -> str:
+    """Build the JSON-only prompt for updating the structured raw_plan."""
+
+    return f"""You are the PlanUpdater for a strength-program generator.
+Update the supplied raw_plan according to the current SOP decision.
+
+Rules:
+- Return the complete updated raw_plan JSON object, not a patch.
+- Preserve the raw_plan schema and keep templates.session, templates.exercise, and templates.set.
+- Fill, expand, compact, or update sessions/exercises/sets only as needed by the current SOP decision.
+- Keep one week of session templates in raw_plan.sessions; deterministic code expands them across weeks.
+- Every exercise must include load_type: "weighted" or "bodyweight".
+- Weighted exercises should include intensity_percent, sets, reps, rpe, and rest_seconds proposals, but do not invent load_kg.
+- Bodyweight exercises may keep load_kg null.
+- Do not add calculated session dates, generated IDs, calculation_trace_ids, or database fields.
+- Do not include screening, needs_analysis, periodization, planning_model, changed_elements, or unchanged_elements in raw_plan; those belong in sop_progress.decisions.
+- Return JSON only, with no markdown.
+
+Current SOP step:
+{sop_step}
+
+Current SOP decision:
+{json.dumps(decision, ensure_ascii=False, default=str)}
+
+Collected inputs:
+{json.dumps(collected_inputs, ensure_ascii=False)}
+
+Previous SOP decisions:
+{json.dumps(previous_decisions, ensure_ascii=False, default=str)}
+
+Current raw_plan:
+{json.dumps(raw_plan, ensure_ascii=False, default=str)}
+
+Return the complete updated raw_plan object."""

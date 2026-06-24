@@ -2,7 +2,7 @@
 
 This repository implements the Program Generator block of the Personal Coach AI Agent alongside the Evidence-Based Q&A Assistant and User Profile And Memory blocks.
 
-The Program Generator creates new training programs, revises active programs, explains recorded design rationale, calculates every visible prescription deterministically, and sends approved versions to Memory for activation and progress tracking. Work is maintained in a checkpointed `ProgramContext` for each open Program Generator conversation.
+The Program Generator creates new training programs, explains recorded design rationale, calculates every visible prescription deterministically, and sends approved versions to Memory for activation and progress tracking. Work is maintained in a checkpointed `ProgramContext` for each open Program Generator conversation.
 
 ## Folder Guide
 
@@ -14,7 +14,7 @@ The Program Generator creates new training programs, revises active programs, ex
     - `nodes.py`: task routing, SOP-step readiness, next-action routing, and patch validation.
     - `calculators.py`: safe deterministic calculation functions shared by plans, FastAPI, and MCP.
     - `schemas.py`: request, response, graph-state, patch, plan, and trace contracts.
-    - `prompts.py`: structured new-program and adaptation prompt.
+    - `prompts.py`: structured new-program, plan-update, rationale, and routing prompts.
 - `app/api/routes_program.py`
   - FastAPI routes for conversation turns, contexts, versions, review, traces, weekly summaries, calculators, and optional Xunji write-back.
 - `app/memory/`
@@ -22,7 +22,7 @@ The Program Generator creates new training programs, revises active programs, ex
 - `app/knowledge/` and `app/qa/`
   - Supply approved evidence through the same services exposed by the Q&A MCP tools.
 - `app/storage/models.py`
-  - Contains ProgramContext, program artifact, adaptation, summary, trace, citation, calculation, and safety tables.
+  - Contains ProgramContext, program artifact, summary, trace, citation, calculation, and safety tables.
 - `app/mcp_server/server.py`
   - Exposes Program Generator, calculator, Q&A, and Memory tools through FastMCP.
 - `app/ui/streamlit_app.py`
@@ -32,9 +32,11 @@ The Program Generator creates new training programs, revises active programs, ex
 - `scripts/start_local.ps1`
   - Starts the API and Streamlit UI in hidden local processes.
 - `tests/test_program_service.py`
-  - Focused tests for routing, SOP order, clarification, calculations, review, activation, adaptation, safety, summaries, context inheritance, and closure references.
-- `docs/functions/program_generator.md`
-  - Authoritative Program Generator design outline.
+  - Focused tests for routing, SOP order, clarification, calculations, review, activation, safety, summaries, and closure references.
+- `docs/functions/program_generation_stepwise_outline.md`
+  - Authoritative generation-only Program Generator design outline.
+- `docs/functions/program_generator_old.md`
+  - Archived pre-simplification design outline.
 - `docs/implementation_notes/program_generator_notes.md`
   - Implementation decisions, assumptions, instruction gaps, and verification evidence.
 
@@ -44,18 +46,20 @@ The outline files are planning documents and are not modified by the implementat
 
 - A dedicated Streamlit `Program Generator` tab.
 - A conversation-scoped, revision-checked `ProgramContext`.
-- New-program, revision/adaptation, clarification, and rationale routes.
-- Ordered new-program and adaptation SOP execution.
+- New-program, clarification, and rationale routes.
+- Ordered new-program SOP execution.
 - A bounded reasoning/action loop with at most five RAG queries and five user questions per SOP step.
+- Token-budget pauses preserve the original task turn; replying `continue` resumes that turn instead of routing the word `continue` as a new request.
 - Approved-evidence retrieval and citations.
-- Full Memory context, including the active plan, session IDs, progress, profile, and recent status.
+- Full Memory context, including a compact exact-prescription active-plan read model, session IDs, progress, profile, and recent status.
 - Stable summaries for the latest four completed Monday-Sunday training weeks.
-- Deterministic tools for expressions, repetition maximum, percentage load, load rounding, volume, duration, rest, pace/distance/time, weekly frequency, and progression.
+- Deterministic tools for expressions, repetition maximum, percentage load, load rounding, volume, session duration, rest, weekly frequency, and progression.
+- Weighted exercises cannot reach a draft with an empty `load_kg`. The workflow reuses available Memory 1RMs, asks for a 1RM or recent weighted set when needed, estimates the exercise 1RM through calculator traces, and permits an empty load only for explicit bodyweight exercises.
 - Immutable draft program versions with dated sessions, exercises, sets, rationale, warnings, provenance, and calculation traces.
-- Approve/reject/request-change review behavior.
+- Approve/reject review behavior; requested changes use the normal conversation input.
 - Automatic Memory activation after approval, including deactivation of older active plans.
-- Progress preservation for unchanged week/day slots when an adaptation replaces an active version.
 - Program, tool-call, calculation, citation, and safety traces.
+- LLM-tailored rationale responses grounded in SOP progress and context. Numeric questions retain deterministic set selection and stored progression/percentage/rounding facts, which the LLM reconstructs into the final explanation.
 - FastAPI and MCP interfaces that call the same service layer.
 
 ## How The Workflow Fits Together
@@ -64,14 +68,14 @@ The outline files are planning documents and are not modified by the implementat
 2. Memory stores the user message.
 3. The Program Generator creates or resumes the conversation's `ProgramContext`.
 4. The context is hydrated with Memory data and the latest four stored weekly summaries.
-5. `TaskAndSOPRouter` chooses new program, adaptation, clarification resume, or rationale explanation.
+5. The LLM-backed `TaskAndSOPRouter` returns a validated new-program, clarification-resume, or rationale route once per user turn; that route is locked during the SOP loop.
 6. For each SOP step, the graph decides whether to retrieve evidence, ask the user, write the step output, run calculations, or finalize.
 7. Every accepted context update is validated, checkpointed, and traced.
 8. The finalizer stores an immutable draft version and returns it for review.
 9. Approval sends the complete version to Memory, which deactivates older plans and activates the approved version atomically.
 10. Memory remains the canonical owner of active-plan status and progress.
 
-A request for changes is sent as a normal conversation turn. It creates a new draft version and never mutates the Memory-owned active plan before approval.
+Approval creates or replaces the Memory-owned active plan. Active-plan changes are outside the current Program Generator workflow.
 
 ## Local Setup
 
@@ -136,7 +140,6 @@ PROGRAM_MACHINE_LOAD_ROUNDING_KG=2.5
 PROGRAM_BODYWEIGHT_LOAD_ROUNDING_KG=0.5
 PROGRAM_REST_ROUNDING_SECONDS=5
 PROGRAM_DURATION_ROUNDING_SECONDS=60
-PROGRAM_PACE_ROUNDING_SECONDS_PER_KM=1
 
 PROGRAM_REQUIRE_APPROVAL_BEFORE_ACTIVATION=true
 PROGRAM_REQUIRE_APPROVAL_BEFORE_XUNJI_WRITE=true
@@ -157,7 +160,7 @@ Keep approval requirements enabled unless you intentionally change the product's
 Current expected result:
 
 ```text
-100 passed
+101 passed
 ```
 
 The tests do not require a live LLM because Program Generator tests use deterministic fake providers.
@@ -205,6 +208,16 @@ You can also start the services manually:
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 .\.venv\Scripts\python.exe -m streamlit run app\ui\streamlit_app.py --server.port 8501
+```
+
+```
+# Stop anything currently listening on the usual backend/frontend ports
+Get-NetTCPConnection -LocalPort 8000,8501 -State Listen |
+  Select-Object -ExpandProperty OwningProcess -Unique |
+  ForEach-Object { Stop-Process -Id $_ -Force }
+
+# Start backend + frontend
+.\scripts\start_local.ps1
 ```
 
 ### 4. Add Useful Profile Data
@@ -294,26 +307,7 @@ Invoke-RestMethod `
 
 The version contains dated sessions, ordered exercises, set prescriptions, assumptions, warnings, source references, and calculation trace IDs. The context contains SOP progress, evidence, working state, draft references, and safety/budget warnings.
 
-### 8. Request A Change Or Adaptation
-
-Send requested changes through the conversation endpoint rather than the review endpoint:
-
-```powershell
-$change = @{
-  user_id = "usr_demo"
-  message = "Revise the draft so Wednesday is a shorter 40-minute session while preserving the weekly strength goal."
-} | ConvertTo-Json
-
-$revision = Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8000/api/programs/conversations/conv_demo_program/turns" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body $change
-```
-
-For a missed session, state why it was missed. The adaptation SOP distinguishes schedule conflicts from recovery, illness, pain, or fatigue and adjusts frequency, volume, intensity, exercise selection/order, and rest in that priority order.
-
-### 9. Approve And Activate A Draft
+### 8. Approve And Activate A Draft
 
 ```powershell
 $review = @{
@@ -339,20 +333,20 @@ To reject instead:
 $review = @{
   user_id = "usr_demo"
   decision = "reject"
-  reason = "Needs another revision"
+  reason = "Needs a different new plan"
 } | ConvertTo-Json
 ```
 
-### 10. Inspect The Memory-Owned Active Plan
+### 9. Inspect The Memory-Owned Active Plan
 
 ```powershell
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/api/memory/plans/active?user_id=usr_demo"
 ```
 
-Memory owns active-plan status and session progress. The Program Generator owns immutable generated versions and adaptation records.
+Memory owns active-plan status and session progress. The Program Generator owns immutable generated versions and generation audit records.
 
-### 11. Ask For The Plan Rationale
+### 10. Ask For The Plan Rationale
 
 ```powershell
 $why = @{
@@ -367,7 +361,7 @@ Invoke-RestMethod `
   -Body $why
 ```
 
-Rationale responses read the recorded SOP decisions and linked support. They do not create a new SOP or program version.
+The LLM `RationaleAnswerBuilder` tailors the answer to the exact question using recorded SOP decisions and linked support. Numeric facts are selected deterministically from persisted calculation traces before the LLM reconstructs the explanation. Rationale responses do not create a new SOP or program version.
 
 ### 12. Refresh And Read Weekly Summaries
 
@@ -421,12 +415,13 @@ Open `http://127.0.0.1:8501` and select `Program Generator`.
 
 The tab provides:
 
-- New-plan, revision, clarification, and rationale conversation turns.
+- New-plan, clarification, and rationale conversation turns.
 - The Memory-owned active plan and progress.
 - Current SOP progress and waiting state.
 - Draft/version inspection.
-- Approve, reject, and request-change controls.
+- Approve and reject controls; requested changes use the main conversation input.
 - Evidence, calculation, safety, warning, and trace details.
+- A ProgramContext debug viewer that loads any `context_id` and displays lifecycle metadata plus every stored section.
 - Weekly-summary refresh.
 - Separately confirmed Xunji write-back when enabled.
 
@@ -456,7 +451,6 @@ Calculator tools:
 - `calculate_volume_load`
 - `calculate_session_duration`
 - `calculate_rest_interval`
-- `calculate_distance_pace_time`
 - `calculate_weekly_frequency`
 - `calculate_progression_increment`
 
@@ -469,6 +463,7 @@ The Program Generator also consumes `search_knowledge`, `ask_qa_assistant`, and 
 - Missing inputs after the question limit become conservative, disclosed assumptions.
 - Missing approved evidence after the retrieval limit produces an explicit warning.
 - Every visible numeric prescription is calculated or validated deterministically and linked to calculation traces.
+- A lift maximum stated directly in the current task takes precedence over an older approved profile value for that task's calculations; the source is recorded in the calculation trace.
 - Drafts do not become active until approval.
 - Active-plan progress is never owned or edited directly by the Program Generator.
 - Conversation messages are stored through Memory, and a closing Episode references the ProgramContext rather than copying it.

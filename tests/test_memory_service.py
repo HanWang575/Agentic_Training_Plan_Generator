@@ -151,6 +151,86 @@ def test_manual_profile_and_recent_status_appear_in_context(tmp_path: Path):
     session.close()
 
 
+def test_recent_best_lifts_profile_updates_append_or_replace_entries(tmp_path: Path):
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+
+    service.update_profile(
+        "usr_test",
+        {
+            "recent_best_lifts_json": [
+                {"exercise": "Bench Press", "weight_kg": 100, "reps": 1, "date": "2026-06-01"}
+            ]
+        },
+    )
+    service.update_profile(
+        "usr_test",
+        {
+            "recent_best_lifts_json": {
+                "exercise": "Deadlift",
+                "weight_kg": 180,
+                "reps": 1,
+                "date": "2026-06-02",
+            }
+        },
+    )
+    service.update_profile(
+        "usr_test",
+        {
+            "recent_best_lifts_json": {
+                "exercise": "Bench Press",
+                "weight_kg": 105,
+                "reps": 1,
+                "date": "2026-06-10",
+            }
+        },
+    )
+
+    field = next(
+        item
+        for item in service.list_profile("usr_test").fields
+        if item.field_key == "recent_best_lifts_json"
+    )
+    assert field.value == [
+        {"exercise": "Bench Press", "weight_kg": 105, "reps": 1, "date": "2026-06-10"},
+        {"exercise": "Deadlift", "weight_kg": 180, "reps": 1, "date": "2026-06-02"},
+    ]
+    session.close()
+
+
+def test_recent_best_lifts_memory_approval_merges_with_profile(tmp_path: Path):
+    session, service = _make_service(tmp_path)
+    service.create_user("usr_test")
+    service.update_profile(
+        "usr_test",
+        {
+            "recent_best_lifts_json": [
+                {"exercise_name": "Back Squat", "weight_kg": 140, "reps": 1}
+            ]
+        },
+    )
+    item = MemoryItem(
+        memory_id="mem_best_lift",
+        user_id="usr_test",
+        category="profile",
+        target_type="ProfileField",
+        memory_key="recent_best_lifts_json",
+        text="Back squat recent best is now 145 kg for 1 rep.",
+        value_json=json.dumps({"exercise_name": "Back Squat", "weight_kg": 145, "reps": 1}),
+        confidence=0.9,
+        status="candidate",
+    )
+    session.add(item)
+    session.commit()
+
+    approved = service.approve_memory_item("mem_best_lift", MemoryItemApproveRequest())
+
+    assert approved.profile_field.value == [
+        {"exercise_name": "Back Squat", "weight_kg": 145, "reps": 1}
+    ]
+    session.close()
+
+
 def test_list_users_returns_existing_user_ids(tmp_path: Path):
     """The frontend can list local user IDs for selection/debugging."""
 

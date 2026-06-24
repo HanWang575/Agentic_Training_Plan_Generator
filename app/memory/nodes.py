@@ -42,7 +42,7 @@ MEMORY_SECTION_TOKEN_BUDGETS = {
     "episodic_memories": 6000,
     "profile": 3000,
     "recent_status": 3000,
-    "active_plan_progress": 10000,
+    "active_plan_progress": 5000,
     "training_log_summary": 4000,
 }
 

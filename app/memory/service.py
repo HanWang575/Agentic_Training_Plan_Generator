@@ -1827,21 +1827,28 @@ class MemoryService:
             row.review_status = "replaced"
             self.session.add(row)
         now = utc_now()
+        stored_value = (
+            _merge_recent_best_lifts(_json_loads(existing.value_json), value)
+            if field_key == "recent_best_lifts_json" and existing is not None
+            else _normalize_recent_best_lifts_value(value)
+            if field_key == "recent_best_lifts_json"
+            else value
+        )
         if existing is None:
             existing = ProfileField(
                 profile_field_id=f"pf_{uuid4().hex[:12]}",
                 user_id=user_id,
                 field_key=field_key,
-                value_text=_stringify_value(value),
-                value_json=_json_dumps(value),
+                value_text=_stringify_value(stored_value),
+                value_json=_json_dumps(stored_value),
                 source=source,
                 source_memory_id=source_memory_id,
                 created_at=now,
                 updated_at=now,
             )
         else:
-            existing.value_text = _stringify_value(value)
-            existing.value_json = _json_dumps(value)
+            existing.value_text = _stringify_value(stored_value)
+            existing.value_json = _json_dumps(stored_value)
             existing.source = source
             existing.source_memory_id = source_memory_id or existing.source_memory_id
             existing.review_status = "approved"
@@ -2570,6 +2577,12 @@ def _key_proposal_out(item: MemoryKeyProposal) -> KeyProposalOut:
 
 
 def _plan_progress_out(item: TrainingPlanProgress) -> PlanProgressOut:
+    plan_snapshot = _json_loads(item.plan_snapshot_json, default={})
+    source_references = plan_snapshot.get("source_references") if isinstance(plan_snapshot, dict) else None
+    if isinstance(source_references, dict) and "calculation_trace_ids" in source_references:
+        plan_snapshot = dict(plan_snapshot)
+        plan_snapshot["source_references"] = dict(source_references)
+        plan_snapshot["source_references"].pop("calculation_trace_ids", None)
     return PlanProgressOut(
         plan_id=item.plan_id,
         user_id=item.user_id,
@@ -2578,7 +2591,7 @@ def _plan_progress_out(item: TrainingPlanProgress) -> PlanProgressOut:
         status=item.status,
         current_week=item.current_week,
         planned_sessions=_json_loads(item.planned_sessions_json, default=[]),
-        plan_snapshot=_json_loads(item.plan_snapshot_json, default={}),
+        plan_snapshot=plan_snapshot,
         plan_progress=_json_loads(item.plan_progress_json, default={}),
         progress_events=_json_loads(item.progress_events_json, default=[]),
         feedback=_json_loads(item.feedback_json, default=[]),
@@ -2620,6 +2633,46 @@ def _json_loads(value: str | None, default: Any = None) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return {} if default is None else default
+
+
+def _normalize_recent_best_lifts_value(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            value = parsed
+        except json.JSONDecodeError:
+            return [value]
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _merge_recent_best_lifts(existing_value: Any, new_value: Any) -> list[Any]:
+    merged = list(_normalize_recent_best_lifts_value(existing_value))
+    index_by_identity = {
+        _recent_best_lift_identity(entry): index
+        for index, entry in enumerate(merged)
+    }
+    for entry in _normalize_recent_best_lifts_value(new_value):
+        identity = _recent_best_lift_identity(entry)
+        existing_index = index_by_identity.get(identity)
+        if existing_index is None:
+            index_by_identity[identity] = len(merged)
+            merged.append(entry)
+        else:
+            merged[existing_index] = entry
+    return merged
+
+
+def _recent_best_lift_identity(entry: Any) -> str:
+    if isinstance(entry, dict):
+        for key in ("exercise", "exercise_name", "lift", "movement", "name"):
+            value = entry.get(key)
+            if value not in (None, ""):
+                return f"{key}:{normalize_key(str(value))}"
+    return _json_dumps(entry)
 
 
 def _strip_xunji_set_time(value: Any) -> Any:
@@ -2861,19 +2914,110 @@ def _render_plan_summary(plan: PlanProgressOut) -> str:
 
 
 def _render_plan_full(plan: PlanProgressOut) -> str:
-    payload = {
-        "plan_id": plan.plan_id,
-        "version_id": plan.version_id,
-        "version": plan.version,
-        "status": plan.status,
-        "current_week": plan.current_week,
-        "planned_sessions": plan.planned_sessions,
-        "plan_snapshot": plan.plan_snapshot,
-        "plan_progress": plan.plan_progress,
-        "progress_events": plan.progress_events,
-        "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,
+    payload = compact_active_plan_payload(
+        {
+            "plan_id": plan.plan_id,
+            "version_id": plan.version_id,
+            "version": plan.version,
+            "status": plan.status,
+            "current_week": plan.current_week,
+            "planned_sessions": plan.planned_sessions,
+            "plan_snapshot": plan.plan_snapshot,
+            "plan_progress": plan.plan_progress,
+            "completed_at": plan.completed_at.isoformat() if plan.completed_at else None,
+        }
+    )
+    return f"[{plan.plan_id}]\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str)}"
+
+
+def compact_active_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    """Build the bounded active-plan read model used only inside MemoryContext."""
+
+    exercise_schema = ["name", "mode", "volume", "volume_unit", "notes", "set_groups"]
+    set_group_schema = [
+        "count",
+        "reps",
+        "load_kg",
+        "intensity_percent",
+        "rpe",
+        "rest_seconds",
+    ]
+    plan_snapshot = {
+        key: value
+        for key, value in plan.get("plan_snapshot", {}).items()
+        if key
+        not in {
+            "source_references",
+            "program_id",
+            "version_id",
+            "version_number",
+            "user_id",
+            "created_at",
+        }
+        and value not in (None, "", [], {})
     }
-    return f"[{plan.plan_id}]\n{_json_dumps(payload)}"
+    return {
+        "format": "compact_active_plan_v1",
+        "schemas": {
+            "exercise": exercise_schema,
+            "set_group": set_group_schema,
+        },
+        "plan_id": plan.get("plan_id"),
+        "version_id": plan.get("version_id"),
+        "version": plan.get("version"),
+        "status": plan.get("status"),
+        "current_week": plan.get("current_week"),
+        "planned_sessions": [_compact_planned_session(item) for item in plan.get("planned_sessions", [])],
+        "plan_snapshot": plan_snapshot,
+        "plan_progress": plan.get("plan_progress", {}),
+        "completed_at": plan.get("completed_at"),
+    }
+
+
+def _compact_planned_session(session: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: session.get(key)
+        for key in (
+            "session_id",
+            "planned_date",
+            "week_number",
+            "day_number",
+            "session_type",
+            "title",
+            "goal",
+            "duration_minutes",
+        )
+        if session.get(key) not in (None, "", [], {})
+    }
+    exercises = session.get("exercises", [])
+    if exercises:
+        compact["exercises"] = [_compact_prescribed_exercise(item) for item in exercises]
+    return compact
+
+
+def _compact_prescribed_exercise(exercise: dict[str, Any]) -> list[Any]:
+    set_fields = (
+        "reps",
+        "load_kg",
+        "intensity_percent",
+        "rpe",
+        "rest_seconds",
+    )
+    groups: list[list[Any]] = []
+    for prescribed_set in exercise.get("sets", []):
+        values = [prescribed_set.get(key) for key in set_fields]
+        if groups and groups[-1][1:] == values:
+            groups[-1][0] += 1
+        else:
+            groups.append([1, *values])
+    return [
+        exercise.get("name", ""),
+        exercise.get("mode", "resistance"),
+        exercise.get("volume"),
+        exercise.get("volume_unit"),
+        exercise.get("notes", ""),
+        groups,
+    ]
 
 
 def _render_training_log_summary(summary: TrainingLogSummaryResponse) -> str:

@@ -227,18 +227,6 @@ def init_db(active_engine=None) -> None:
             "duration_calculation_trace_id",
             "TEXT",
         )
-        _ensure_column(
-            connection,
-            "program_adaptations",
-            "evidence_references_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )
-        _ensure_column(
-            connection,
-            "program_adaptations",
-            "calculation_trace_ids_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )
         connection.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts

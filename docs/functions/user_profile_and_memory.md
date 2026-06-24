@@ -335,7 +335,7 @@ Default memory-context budget:
 | Episodic memories               | 6000                                                                                            |
 | Long-term profile facts         | 3000                                                                                            |
 | Recent status                   | 3000                                                                                            |
-| Active plan progress            | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `10000` add-on for `full` |
+| Active plan progress            | Conditional: `0` for `none`, up to `1000` add-on for `summary`, up to `5000` add-on for compact full-plan context |
 | Historical training log summary | 4000                                                                                            |
 
 
@@ -356,7 +356,7 @@ Global rule:
 - `MEMORY_CONTEXT_MAX_TOKENS` default: `34000`.
 - Default non-plan memory budget: `24000` tokens.
 - Active plan summary add-on budget: up to `1000` tokens when `plan_context_level=summary`, for a total summary-mode ceiling of `25000` tokens.
-- Conditional active-plan full-detail add-on budget: up to `10000` tokens when `plan_context_level=full`, for a total full-mode ceiling of `34000` tokens.
+- Conditional active-plan full-detail add-on budget: up to `5000` tokens when `plan_context_level=full`. The prompt read model groups identical sets and omits audit-only trace/source IDs; canonical storage remains complete.
 - If any section exceeds its section cap, return a user-visible `budget_warnings` entry instead of trimming the section.
 - If the whole `MemoryContext` exceeds the active global budget, return a global `budget_warnings` entry.
 - Do not overwrite canonical database rows or mutate the temporary prompt payload during final memory-context assembly.
@@ -383,7 +383,7 @@ Routing rules:
 - When uncertain, use `summary` rather than `full`; the downstream block can request `full` if needed.
 - Deterministic keyword rules should be kept only as fallback or guardrails when the LLM router is unavailable or returns invalid output.
 - The active-plan summary add-on has its own `1000` token budget and raises the summary-mode ceiling to `25000` tokens.
-- The active-plan full-detail add-on has its own `10000` token budget and raises the full-mode ceiling to `34000` tokens.
+- The compact active-plan full-detail add-on has its own `5000` token budget. It retains exact actionable prescriptions and progress while linking audit details through the plan version.
 
 ## 8. LangGraph Nodes
 

@@ -323,18 +323,6 @@ def create_mcp_server():
         return calculator("calculate_rest_interval", {"goal": goal, "compound": compound})
 
     @mcp.tool()
-    def calculate_distance_pace_time(
-        distance_meters: float | None = None,
-        pace_seconds_per_km: float | None = None,
-        duration_seconds: float | None = None,
-    ) -> dict:
-        return calculator(
-            "calculate_distance_pace_time",
-            {"distance_meters": distance_meters, "pace_seconds_per_km": pace_seconds_per_km,
-             "duration_seconds": duration_seconds},
-        )
-
-    @mcp.tool()
     def calculate_weekly_frequency(sessions: int, weeks: int = 1) -> dict:
         return calculator("calculate_weekly_frequency", {"sessions": sessions, "weeks": weeks})
 

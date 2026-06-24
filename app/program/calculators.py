@@ -101,24 +101,6 @@ def calculate_rest_interval(goal: str, compound: bool = True) -> tuple[float, st
     return float(value), "goal-based deterministic rest table"
 
 
-def calculate_distance_pace_time(
-    distance_meters: float | None = None,
-    pace_seconds_per_km: float | None = None,
-    duration_seconds: float | None = None,
-) -> tuple[float, str, str]:
-    supplied = sum(item is not None for item in (distance_meters, pace_seconds_per_km, duration_seconds))
-    if supplied != 2:
-        raise ValueError("Provide exactly two of distance_meters, pace_seconds_per_km, and duration_seconds.")
-    if distance_meters is None:
-        value = duration_seconds / pace_seconds_per_km * 1000
-        return value, "duration_seconds / pace_seconds_per_km * 1000", "m"
-    if pace_seconds_per_km is None:
-        value = duration_seconds / (distance_meters / 1000)
-        return value, "duration_seconds / (distance_meters / 1000)", "s/km"
-    value = pace_seconds_per_km * (distance_meters / 1000)
-    return value, "pace_seconds_per_km * (distance_meters / 1000)", "s"
-
-
 def calculate_weekly_frequency(sessions: int, weeks: int = 1) -> tuple[float, str]:
     if sessions < 0 or weeks <= 0:
         raise ValueError("sessions cannot be negative and weeks must be positive.")
@@ -188,11 +170,6 @@ class CalculatorService:
             value, formula = calculate_rest_interval(str(inputs["goal"]), bool(inputs.get("compound", True)))
             increment = self.settings.program_rest_rounding_seconds
             return round(value / increment) * increment, "s", formula, f"nearest {increment} seconds"
-        if tool_name == "calculate_distance_pace_time":
-            value, formula, unit = calculate_distance_pace_time(
-                inputs.get("distance_meters"), inputs.get("pace_seconds_per_km"), inputs.get("duration_seconds")
-            )
-            return round(value, 2), unit, formula, "2 decimals"
         if tool_name == "calculate_weekly_frequency":
             value, formula = calculate_weekly_frequency(int(inputs["sessions"]), int(inputs.get("weeks", 1)))
             return value, "sessions/week", formula, "none"

@@ -14,9 +14,6 @@ class SetPrescriptionOut(BaseModel):
     intensity_percent: float | None = None
     rpe: float | None = None
     rest_seconds: int
-    duration_seconds: int | None = None
-    distance_meters: float | None = None
-    pace_seconds_per_km: int | None = None
     calculation_trace_ids: list[str] = Field(default_factory=list)
 
 
@@ -212,6 +209,12 @@ class ProgramGraphState(TypedDict, total=False):
     route_locked: bool
     route: str
     task_type: str
+    route_rationale: str
+    route_confidence: float
+    rationale_question: str
+    rationale_context: dict[str, Any]
+    numeric_rationale_facts: dict[str, Any]
+    rationale_answer: str
     current_step: str
     missing_inputs: list[str]
     evidence_sufficient: bool

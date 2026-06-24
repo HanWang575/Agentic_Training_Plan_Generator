@@ -38,6 +38,7 @@ This file records implementation assumptions and instruction gaps without changi
 - Added explicit delete APIs for user-owned memory rows, conversations, profile fields, and recent-status rows.
 - Added profile-key, recent-status-key, current-recent-status, recent-status audit, recent-status expiry reminder, and recent-status expire/renew endpoints for frontend inspection and review.
 - Added MCP tools for memory context, episodes, memory items, key proposals, recent status, expiring status, active plan progress, and training-log summary.
+- Full active-plan MemoryContext rendering now uses `compact_active_plan_v1`: repeated set prescriptions are grouped under shared tuple schemas, audit-only IDs are omitted from the prompt payload, and the section is capped at 5,000 tokens without changing canonical plan storage.
 - Added a basic Streamlit Memory tab and memory-enabled Q&A controls in the Chat tab. The Memory tab keeps full context retrieval separate from episode search, can inspect saved conversation content, and includes filtered review queues for memory items and key proposals.
 - Streamlit ID input fields accept IDs pasted either raw or with surrounding JSON/string quotes, such as `"pf_123"`.
 - Added focused memory tests and a Q&A integration test.

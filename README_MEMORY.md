@@ -2,7 +2,7 @@
 
 This repository now includes the second function block: the User Profile And Memory system.
 
-The block stores local, inspectable personalization data for the personal trainer AI. It keeps working conversation memory, episodic summaries, reviewable candidate memories, approved profile fields, short-lived recent status, active plan progress, and imported training logs. The Q&A block can optionally request memory context without reading memory tables directly.
+The block stores local, inspectable personalization data for the personal trainer AI. It keeps working conversation memory, episodic summaries, reviewable candidate memories, approved profile fields, short-lived recent status, active plan progress, and imported training logs. Full-plan MemoryContext retrieval uses a deterministic `compact_active_plan_v1` read model capped at 5,000 tokens; canonical plan storage and active-plan APIs remain complete. The Q&A block can optionally request memory context without reading memory tables directly.
 
 ## Folder Guide
 

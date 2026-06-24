@@ -2,7 +2,7 @@
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
-from app.core.llm_provider import AnswerRequest, OpenAIProvider
+from app.core.llm_provider import AnswerRequest, OpenAIProvider, ProgramPlanUpdateRequest
 
 
 class FakeEmbeddingResponseItem:
@@ -53,6 +53,36 @@ class FakeChatCompletionsClient:
 class FakeChatClient:
     def __init__(self):
         self.chat = type("ChatNamespace", (), {"completions": FakeChatCompletionsClient()})()
+
+
+class FakeSequenceChatMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class FakeSequenceChatChoice:
+    def __init__(self, content):
+        self.message = FakeSequenceChatMessage(content)
+
+
+class FakeSequenceChatResponse:
+    def __init__(self, content):
+        self.choices = [FakeSequenceChatChoice(content)]
+
+
+class FakeSequenceChatCompletionsClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(request)
+        return FakeSequenceChatResponse(self.responses.pop(0))
+
+
+class FakeSequenceChatClient:
+    def __init__(self, responses):
+        self.chat = type("ChatNamespace", (), {"completions": FakeSequenceChatCompletionsClient(responses)})()
 
 
 def test_dashscope_embedding_settings_strip_quotes_and_use_dashscope_model():
@@ -190,3 +220,36 @@ def test_aihubmix_answer_generation_uses_chat_completions():
     assert fake_client.chat.completions.last_request["model"] == "aihubmix-model"
     assert fake_client.chat.completions.last_request["max_tokens"] == 123
     assert "Approved evidence" in fake_client.chat.completions.last_request["messages"][0]["content"]
+
+
+def test_program_plan_update_repairs_malformed_json_once():
+    """Large program JSON occasionally misses a comma; the provider should ask for repair once."""
+
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    fake_client = FakeSequenceChatClient(
+        [
+            '{"title":"Broken Plan" "sessions":[]}',
+            '{"title":"Fixed Plan","sessions":[]}',
+        ]
+    )
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    plan = provider.update_program_plan(
+        ProgramPlanUpdateRequest(
+            sop_step="programming_intensity_and_volume",
+            decision={"summary": "Use conservative loading."},
+            raw_plan={"title": "Draft Plan", "sessions": []},
+            collected_inputs={},
+            previous_decisions={},
+        )
+    )
+
+    assert plan == {"title": "Fixed Plan", "sessions": []}
+    assert len(fake_client.chat.completions.requests) == 2
+    assert "Repair the following malformed JSON" in fake_client.chat.completions.requests[1]["messages"][0]["content"]
