@@ -19,6 +19,7 @@ from app.memory.prompts import (
     build_training_sport_type_prompt,
 )
 from app.program.prompts import (
+    build_program_input_extraction_prompt,
     build_program_lift_max_extraction_prompt,
     build_program_plan_update_prompt,
     build_program_rationale_prompt,
@@ -30,6 +31,17 @@ from app.qa.prompts import build_answer_prompt, build_query_planner_prompt
 
 class StructuredOutputError(ValueError):
     """Raised when an LLM structured-output response cannot be parsed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_excerpt: str | None = None,
+        repair_excerpt: str | None = None,
+    ):
+        super().__init__(message)
+        self.raw_excerpt = raw_excerpt
+        self.repair_excerpt = repair_excerpt
 
 
 @dataclass(slots=True)
@@ -201,6 +213,15 @@ class ProgramLiftMaxExtractionRequest:
     """Current user-message input for LLM lift-max extraction."""
 
     user_message: str
+
+
+@dataclass(slots=True)
+class ProgramInputExtractionRequest:
+    """Current turn, recent status, and profile text for Program Generator input extraction."""
+
+    user_message: str
+    recent_status_text: str = ""
+    profile_text: str = ""
 
 
 @dataclass(slots=True)
@@ -522,7 +543,7 @@ class OpenAIProvider:
             previous_decisions=request.previous_decisions,
             raw_plan=request.raw_plan,
         )
-        return self._generate_json_object(prompt, max_tokens=1800, label="SOPStepExecutor")
+        return self._generate_json_object(prompt, max_tokens=3500, label="SOPStepExecutor")
 
     def update_program_plan(self, request: ProgramPlanUpdateRequest) -> dict[str, Any]:
         """Update the structured raw_plan from one SOP decision."""
@@ -542,6 +563,17 @@ class OpenAIProvider:
         prompt = build_program_lift_max_extraction_prompt(request.user_message)
         payload = self._generate_json_object(prompt, max_tokens=700, label="LiftMaxExtractor")
         return _program_lift_maxes_from_payload(payload)
+
+    def extract_program_inputs(self, request: ProgramInputExtractionRequest) -> dict[str, Any]:
+        """Extract Program Generator collected inputs through the LLM extractor node."""
+
+        prompt = build_program_input_extraction_prompt(
+            user_message=request.user_message,
+            recent_status_text=request.recent_status_text,
+            profile_text=request.profile_text,
+        )
+        payload = self._generate_json_object(prompt, max_tokens=800, label="ProgramInputExtractor")
+        return _program_inputs_from_payload(payload)
 
     def generate_program_task_route(self, request: ProgramTaskRouteRequest) -> ProgramTaskRouteResult:
         """Classify one Program Generator turn with structured LLM output."""
@@ -597,7 +629,9 @@ class OpenAIProvider:
             except StructuredOutputError as repair_error:
                 raise StructuredOutputError(
                     f"{label} returned malformed JSON after one repair attempt. "
-                    f"First error: {first_error}; repair error: {repair_error}"
+                    f"First error: {first_error}; repair error: {repair_error}",
+                    raw_excerpt=getattr(first_error, "raw_excerpt", None),
+                    repair_excerpt=getattr(repair_error, "raw_excerpt", None),
                 ) from repair_error
 
     def _generate_chat_text(self, prompt: str, max_tokens: int) -> str:
@@ -634,20 +668,27 @@ def _parse_json_object(text: str, label: str = "LLM") -> dict:
         if cleaned.startswith("{") and cleaned.endswith("}"):
             return json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise _structured_json_error(label, exc) from exc
+        raise _structured_json_error(label, exc, cleaned) from exc
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if not match:
         raise StructuredOutputError(f"{label} did not return a JSON object.")
     try:
         return json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        raise _structured_json_error(label, exc) from exc
+        raise _structured_json_error(label, exc, match.group(0)) from exc
 
 
-def _structured_json_error(label: str, exc: json.JSONDecodeError) -> StructuredOutputError:
+def _structured_json_error(label: str, exc: json.JSONDecodeError, text: str) -> StructuredOutputError:
     return StructuredOutputError(
-        f"{label} returned malformed JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}."
+        f"{label} returned malformed JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}.",
+        raw_excerpt=_json_error_excerpt(text, exc),
     )
+
+
+def _json_error_excerpt(text: str, exc: json.JSONDecodeError, radius: int = 1200) -> str:
+    start = max(0, exc.pos - radius)
+    end = min(len(text), exc.pos + radius)
+    return text[start:end]
 
 
 def _build_json_repair_prompt(raw_text: str) -> str:
@@ -689,6 +730,48 @@ def _program_lift_maxes_from_payload(payload: dict[str, Any]) -> dict[str, float
         if confidence < 0.5:
             continue
         values[key] = value
+    return values
+
+
+def _program_inputs_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_inputs = payload.get("inputs", payload)
+    if not isinstance(raw_inputs, dict):
+        return {}
+    values: dict[str, Any] = {}
+    goal_aliases = {
+        "strength": "strength",
+        "powerlifting": "strength",
+        "hypertrophy": "hypertrophy",
+        "bodybuilding": "hypertrophy",
+        "muscle": "hypertrophy",
+        "endurance": "endurance",
+        "general fitness": "general fitness",
+        "fitness": "general fitness",
+    }
+    raw_goal = str(raw_inputs.get("goal", "")).strip().lower()
+    if raw_goal in goal_aliases:
+        values["goal"] = goal_aliases[raw_goal]
+    raw_experience = str(raw_inputs.get("experience", "")).strip().lower()
+    if raw_experience in {"beginner", "intermediate", "advanced"}:
+        values["experience"] = raw_experience
+    raw_screening = str(raw_inputs.get("screening", "")).strip().lower()
+    if raw_screening in {"clear", "limited"}:
+        values["screening"] = raw_screening
+    raw_equipment = str(raw_inputs.get("equipment", "")).strip()
+    if raw_equipment:
+        values["equipment"] = raw_equipment[:300]
+    try:
+        days = int(raw_inputs.get("days_per_week"))
+    except (TypeError, ValueError):
+        days = None
+    if days is not None and 1 <= days <= 7:
+        values["days_per_week"] = days
+    try:
+        duration = int(raw_inputs.get("session_duration_minutes"))
+    except (TypeError, ValueError):
+        duration = None
+    if duration is not None:
+        values["session_duration_minutes"] = min(180, max(20, duration))
     return values
 
 

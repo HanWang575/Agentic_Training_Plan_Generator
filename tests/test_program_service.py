@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -37,10 +38,68 @@ class FakeProgramProvider:
 
     def __init__(self):
         self.lift_max_requests = []
+        self.input_requests = []
+        self.sop_requests = []
 
     def extract_program_lift_maxes(self, request):
         self.lift_max_requests.append(request.user_message)
         return _extract_lift_maxes(request.user_message)
+
+    def extract_program_inputs(self, request):
+        self.input_requests.append(request.user_message)
+        result = {}
+        result.update(self._extract_inputs_from_text(request.profile_text))
+        result.update(self._extract_inputs_from_text(request.recent_status_text))
+        result.update(self._extract_inputs_from_text(request.user_message))
+        return result
+
+    def _extract_inputs_from_text(self, text):
+        text = text.lower()
+        result = {}
+        if "strength" in text or "powerlifting" in text:
+            result["goal"] = "strength"
+        elif "hypertrophy" in text or "muscle" in text:
+            result["goal"] = "hypertrophy"
+        elif "endurance" in text:
+            result["goal"] = "endurance"
+        for level in ("beginner", "intermediate", "advanced"):
+            if level in text:
+                result["experience"] = level
+                break
+        if "commercial gym" in text:
+            result["equipment"] = "commercial gym"
+        elif "full gym" in text or "barbell" in text:
+            result["equipment"] = "full gym, barbell"
+        elif "bodyweight" in text:
+            result["equipment"] = "bodyweight"
+        if "injury-free" in text or "no injuries" in text or "nothing hurts" in text:
+            result["screening"] = "clear"
+        elif "pain" in text or "injury" in text or "medical" in text:
+            result["screening"] = "limited"
+        day_match = re.search(r"\b([1-7])\s*(?:days?|times?)\s*(?:per|a)?\s*week", text)
+        if not day_match:
+            day_match = re.search(r"days(?:_per_week| per week)?\s*[:=]\s*([1-7])", text)
+        if day_match:
+            result["days_per_week"] = int(day_match.group(1))
+        else:
+            for word, value in {
+                "one": 1,
+                "two": 2,
+                "three": 3,
+                "four": 4,
+                "five": 5,
+                "six": 6,
+                "seven": 7,
+            }.items():
+                if re.search(rf"\b{word}\s+(?:days?|times?)\s+(?:per|a)\s+week", text):
+                    result["days_per_week"] = value
+                    break
+        duration_match = re.search(r"\b(\d{2,3})\s*(?:minutes?|mins?)", text)
+        if not duration_match:
+            duration_match = re.search(r"(?:duration|session_duration_minutes)\s*[:=]\s*(\d{2,3})", text)
+        if duration_match:
+            result["session_duration_minutes"] = int(duration_match.group(1))
+        return result
 
     def generate_program_task_route(self, request):
         message = request.user_turn.lower()
@@ -140,6 +199,7 @@ class FakeProgramProvider:
         return plan
 
     def generate_program_sop_step_decision(self, request):
+        self.sop_requests.append(request)
         decisions = {
             "consultation_and_screening": {"screening": {"status": "clear", "notes": []}},
             "needs_analysis": {
@@ -238,6 +298,32 @@ def _make_service(tmp_path: Path):
     return session, memory, service
 
 
+REQUIRED_INPUT_REPLY = (
+    "goal: strength; days_per_week: 3; duration: 60; experience: intermediate; "
+    "equipment: full gym and barbell; screening: no injuries"
+)
+
+
+def _start_new_program(
+    service: ProgramService,
+    conversation_id: str,
+    user_id: str = "usr_program",
+    message: str = "Create a strength plan. My bench PR is 115 kg.",
+    reply: str = REQUIRED_INPUT_REPLY,
+):
+    first = service.process_turn(
+        conversation_id,
+        ProgramTurnRequest(user_id=user_id, message=message),
+    )
+    if first.status != "waiting_for_user":
+        return first
+    assert "Before I design this safely" in first.response
+    return service.process_turn(
+        conversation_id,
+        ProgramTurnRequest(user_id=user_id, message=reply),
+    )
+
+
 def test_calculators_are_deterministic_and_safe(tmp_path: Path):
     settings = Settings(_env_file=None, sqlite_path=tmp_path / "app.sqlite")
     calculators = CalculatorService(settings)
@@ -273,25 +359,91 @@ def test_lift_max_extraction_does_not_cross_exercise_boundaries():
     assert _extract_lift_maxes(clarification) == {}
 
 
-def test_program_service_uses_llm_lift_max_extractor(tmp_path: Path):
+def test_program_service_uses_llm_input_and_lift_extractors(tmp_path: Path):
     _, _, service = _make_service(tmp_path)
 
     inputs = service._extract_inputs("My bench PR is 116 kg.", "")
+    natural_inputs = service._extract_inputs(
+        "I want strength, can train four days a week for 75 minutes, have intermediate experience, "
+        "use a commercial gym, and I'm injury-free.",
+        "",
+    )
 
     assert inputs["bench_press_1rm_kg"] == 116.0
-    assert service.llm_provider.lift_max_requests == ["My bench PR is 116 kg."]
+    assert natural_inputs["goal"] == "strength"
+    assert natural_inputs["session_duration_minutes"] == 75
+    assert natural_inputs["experience"] == "intermediate"
+    assert natural_inputs["equipment"] == "commercial gym"
+    assert natural_inputs["screening"] == "clear"
+    assert service.llm_provider.lift_max_requests == [
+        "My bench PR is 116 kg.",
+        (
+            "I want strength, can train four days a week for 75 minutes, have intermediate experience, "
+            "use a commercial gym, and I'm injury-free."
+        ),
+    ]
+    assert service.llm_provider.input_requests == [
+        "My bench PR is 116 kg.",
+        (
+            "I want strength, can train four days a week for 75 minutes, have intermediate experience, "
+            "use a commercial gym, and I'm injury-free."
+        ),
+    ]
+
+
+def test_input_extraction_priority_and_required_prompt_gate(tmp_path: Path):
+    _, _, service = _make_service(tmp_path)
+
+    from_three_sources = service._extract_inputs(
+        "I want hypertrophy, train 4 days per week for 75 minutes, have advanced experience, "
+        "use a commercial gym, and no injuries.",
+        profile_text=(
+            "primary_training_goal: strength; available_training_days: 3; "
+            "typical_session_duration_minutes: 60; experience_level: intermediate; "
+            "available_equipment: full gym, barbell; medical_constraints_user_reported: medical issue"
+        ),
+        recent_status_text=(
+            "Recently training for endurance, two days per week, 45 minutes, beginner, "
+            "bodyweight only, knee pain."
+        ),
+    )
+    recent_over_profile = service._extract_inputs(
+        "",
+        profile_text="strength, three days per week, 60 minutes, intermediate, full gym, no medical issues",
+        recent_status_text="hypertrophy, four days per week, 75 minutes, advanced, commercial gym, knee pain",
+    )
+    first = service.process_turn(
+        "conv_required_gate",
+        ProgramTurnRequest(user_id="usr_program", message="Create a new strength plan."),
+    )
+
+    assert from_three_sources["goal"] == "hypertrophy"
+    assert from_three_sources["days_per_week"] == 4
+    assert from_three_sources["session_duration_minutes"] == 75
+    assert from_three_sources["experience"] == "advanced"
+    assert from_three_sources["equipment"] == "commercial gym"
+    assert from_three_sources["screening"] == "clear"
+    assert recent_over_profile["goal"] == "hypertrophy"
+    assert recent_over_profile["days_per_week"] == 4
+    assert recent_over_profile["session_duration_minutes"] == 75
+    assert recent_over_profile["experience"] == "advanced"
+    assert recent_over_profile["equipment"] == "commercial gym"
+    assert recent_over_profile["screening"] == "limited"
+    assert first.status == "waiting_for_user"
+    assert "Before I design this safely" in first.response
+    assert "primary training goal" not in first.response
+    assert "available training days per week" in first.response
+    assert service.get_context(first.context_id).sections["new_program_working_state"]["required_inputs_prompted"] is True
 
 
 def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
     session, memory, service = _make_service(tmp_path)
-    response = service.process_turn(
+    response = _start_new_program(
+        service,
         "conv_program",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym and barbell; screening: no injuries. My bench PR is 115 kg."
-            ),
+        message=(
+            "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
+            "equipment: full gym and barbell; screening: no injuries. My bench PR is 115 kg."
         ),
     )
 
@@ -371,6 +523,8 @@ def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
     assert "step_outputs" not in working
     assert "calculation_results" not in context.sections
     assert "source_and_trace_references" not in context.sections
+    assert service.llm_provider.sop_requests
+    assert all("active_plan_progress" not in item.memory_context for item in service.llm_provider.sop_requests)
     latest_calculation_trace = max(
         (
             item
@@ -391,6 +545,124 @@ def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
         counters.get("rag_queries", 0) <= 5 and counters.get("user_questions", 0) <= 5
         for counters in context.sections["sop_progress"]["counters"].values()
     )
+    session.close()
+
+
+def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    original_decider = service.llm_provider.generate_program_sop_step_decision
+
+    def policy_decider(request):
+        if request.sop_step == "periodization":
+            return {
+                "step": request.sop_step,
+                "decision": {
+                    "periodization": {
+                        "weeks": 5,
+                        "deload_weeks_index": [3],
+                        "phases": ["build", "deload", "build"],
+                    }
+                },
+                "rationale": "test periodization",
+                "assumptions": [],
+                "warnings": [],
+            }
+        if request.sop_step == "programming_intensity_and_volume":
+            return {
+                "step": request.sop_step,
+                "decision": {
+                    "programming_intensity_and_volume": {
+                        "bench_policy": {
+                            "lift": "Bench Press",
+                            "weekly_progression_percent": 10,
+                            "deload_session_intensity_reduction_percent": 20,
+                            "deload_session_reps_reduction_percent": 50,
+                        }
+                    }
+                },
+                "rationale": "test intensity policy",
+                "assumptions": [],
+                "warnings": [],
+            }
+        return original_decider(request)
+
+    service.llm_provider.generate_program_sop_step_decision = policy_decider
+    response = _start_new_program(
+        service,
+        "conv_policy_materialization",
+        message=(
+            "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
+            "equipment: full gym and barbell; screening: no injuries. My bench PR is 115 kg."
+        ),
+    )
+    version = service.get_version(response.draft_program_id, response.draft_version_id)
+    context = service.get_context(response.context_id)
+    calculated_periodization = context.sections["new_program_working_state"]["calculation_artifacts"]["calculated_periodization"]
+
+    def bench_set(week: int):
+        planned_session = next(item for item in version.sessions if item.week_number == week and item.day_number == 1)
+        bench = next(item for item in planned_session.exercises if item.name == "Bench Press")
+        return bench.sets[0]
+
+    assert len(version.sessions) == 15
+    assert version.periodization["weeks"] == 5
+    assert calculated_periodization["deload_weeks"] == [3]
+    assert calculated_periodization["week_policies"]["3"]["deload"] is True
+    assert calculated_periodization["exercise_policy_count"] == 1
+    assert bench_set(1).intensity_percent == pytest.approx(72.0)
+    assert bench_set(1).reps == 6
+    assert bench_set(2).intensity_percent == pytest.approx(79.2)
+    assert bench_set(3).intensity_percent == pytest.approx(69.12)
+    assert bench_set(3).reps == 3
+    progression_traces = [
+        item
+        for item in session.exec(select(CalculationTrace)).all()
+        if item.tool_name == "calculate_progression_increment"
+    ]
+    assert any(json.loads(item.inputs_json).get("percentage") == 10 for item in progression_traces)
+    assert any(json.loads(item.inputs_json).get("percentage") == -20 for item in progression_traces)
+    session.close()
+
+
+def test_user_schedule_survives_clarification_and_raw_split_controls_materialization(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    first = service.process_turn(
+        "conv_four_day_sticky",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message=(
+                "Create a strength plan. I train 4 days per week for 60 minutes, have intermediate "
+                "experience, use a full gym, and have no injuries. My bench PR is 115 kg."
+            ),
+        ),
+    )
+    assert first.status == "waiting_for_review"
+    context = service.get_context(first.context_id)
+    assert context.sections["new_program_working_state"]["collected_inputs"]["days_per_week"] == 4
+
+    working = context.sections["new_program_working_state"]
+    working["raw_plan"]["sessions"].append(
+        {
+            "name": "Fourth Day",
+            "goal": "strength",
+            "duration_minutes": 60,
+            "exercises": [
+                {"name": "Bench Press", "load_type": "weighted", "sets": 2, "reps": 5, "intensity_percent": 70, "rpe": 7}
+            ],
+        }
+    )
+    working["collected_inputs"]["days_per_week"] = 3
+    trace_id = service._trace(service._get_context(first.context_id), "run_calculation", {"title": "raw split test"})
+    artifacts = service._materialize_plan(
+        working["raw_plan"],
+        working["collected_inputs"],
+        context.sections["memory_context"],
+        trace_id,
+        periodization={"weeks": 2},
+    )
+    assert len(working["raw_plan"]["sessions"]) == 4
+    assert artifacts["calculated_periodization"]["sessions_per_week"] == 4
+    assert len(artifacts["calculated_sessions"]) == 8
     session.close()
 
 
@@ -586,16 +858,7 @@ def test_context_budget_continue_resumes_the_original_turn(tmp_path: Path):
 
 def test_approval_activates_plan_and_compacts_active_plan_context(tmp_path: Path):
     session, memory, service = _make_service(tmp_path)
-    draft = service.process_turn(
-        "conv_activate",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
-        ),
-    )
+    draft = _start_new_program(service, "conv_activate")
     review = service.review_program(
         draft.draft_program_id,
         draft.draft_version_id,
@@ -631,16 +894,7 @@ def test_approval_activates_plan_and_compacts_active_plan_context(tmp_path: Path
 
 def test_review_messages_activation_failure_and_retry_are_explicit(tmp_path: Path, monkeypatch):
     session, memory, service = _make_service(tmp_path)
-    draft = service.process_turn(
-        "conv_activation_failure",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
-        ),
-    )
+    draft = _start_new_program(service, "conv_activation_failure")
     original_activate = memory.activate_plan
 
     def fail_activation(_request):
@@ -704,16 +958,7 @@ def test_patch_validation_and_episode_context_reference(tmp_path: Path):
             current_revision=2,
         )
 
-    draft = service.process_turn(
-        "conv_close_program",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
-        ),
-    )
+    draft = _start_new_program(service, "conv_close_program")
     memory.close_conversation("conv_close_program", program_context_id=draft.context_id)
     episode = session.exec(select(Episode).where(Episode.conversation_id == "conv_close_program")).one()
     assert episode.program_context_id == draft.context_id
@@ -727,13 +972,13 @@ def test_new_approval_deactivates_the_older_active_program(tmp_path: Path):
         "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
         "equipment: full gym; screening: no injuries"
     )
-    first = service.process_turn("conv_first", ProgramTurnRequest(user_id="usr_program", message=message))
+    first = _start_new_program(service, "conv_first", message=message)
     service.review_program(
         first.draft_program_id,
         first.draft_version_id,
         ProgramReviewRequest(user_id="usr_program", decision="approve"),
     )
-    second = service.process_turn("conv_second", ProgramTurnRequest(user_id="usr_program", message=message))
+    second = _start_new_program(service, "conv_second", message=message)
     review = service.review_program(
         second.draft_program_id,
         second.draft_version_id,
@@ -751,16 +996,7 @@ def test_new_approval_deactivates_the_older_active_program(tmp_path: Path):
 
 def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
     session, _, service = _make_service(tmp_path)
-    draft = service.process_turn(
-        "conv_rationale",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
-        ),
-    )
+    draft = _start_new_program(service, "conv_rationale", message="Create a strength plan.")
     before = service.get_context(draft.context_id)
     rationale = service.process_turn(
         "conv_rationale",
@@ -825,16 +1061,7 @@ def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
         return plan
 
     service.llm_provider.update_program_plan = plan_with_bodyweight_pullups
-    pullup_draft = service.process_turn(
-        "conv_pullup_rationale",
-        ProgramTurnRequest(
-            user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
-        ),
-    )
+    pullup_draft = _start_new_program(service, "conv_pullup_rationale")
     pullup_rationale = service.process_turn(
         "conv_pullup_rationale",
         ProgramTurnRequest(

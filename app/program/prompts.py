@@ -133,6 +133,63 @@ Return exactly:
 }}"""
 
 
+def build_program_input_extraction_prompt(
+    user_message: str,
+    recent_status_text: str,
+    profile_text: str,
+) -> str:
+    """Build the JSON-only prompt for Program Generator input extraction."""
+
+    return f"""You are the ProgramInputExtractor node for a strength-program generator.
+Extract only concrete planning inputs supported by the schema below.
+
+Rules:
+- Extract each field from the highest-priority source that answers it.
+- Priority order is: current user message, then recent status text, then profile text.
+- If the current user message answers a field, always use that value even when recent status or profile disagree.
+- Use recent status only when the current user message does not answer the field.
+- Use profile text only when neither the current user message nor recent status answers the field.
+- Do not invent values.
+- For screening, return "clear" only when the selected source confirms no injuries, pain, medical limitations, relevant illness, medication concern, or clearance issue.
+- For screening, return "limited" when the selected source reports pain, injury, illness, medication changes, medical limitations, or uncertainty requiring conservative handling.
+- If screening is not stated or cannot be inferred, omit it.
+- Convert days_per_week and session_duration_minutes to integers when stated.
+- Keep equipment as a short comma-separated string.
+- Return JSON only.
+
+Current user message:
+{user_message}
+
+Recent status text:
+{recent_status_text}
+
+Profile text:
+{profile_text}
+
+Allowed output keys:
+- goal: strength | hypertrophy | endurance | general fitness
+- days_per_week: integer 1-7
+- session_duration_minutes: integer 20-180
+- experience: beginner | intermediate | advanced
+- equipment: string
+- screening: clear | limited
+
+Return exactly:
+{{
+  "inputs": {{
+    "goal": "strength",
+    "days_per_week": 3,
+    "session_duration_minutes": 60,
+    "experience": "intermediate",
+    "equipment": "full gym, barbell",
+    "screening": "clear"
+  }},
+  "ignored": [
+    {{"text": "unsupported fact", "reason": "not a required planning input"}}
+  ]
+}}"""
+
+
 def build_program_sop_step_prompt(
     task_type: str,
     sop_step: str,
@@ -155,10 +212,14 @@ Rules:
 - State conservative assumptions when user facts are missing.
 - Do not calculate load_kg or weekly/session volume in this step; calculator steps do that later.
 - Put the current step's structured decision inside the `decision` object.
+- In the current step's structured decision always includes a 'rationale' field.
 - For consultation_and_screening, use `decision.screening`.
 - For needs_analysis, use `decision.needs_analysis`.
-- For periodization, use `decision.periodization` with fields such as weeks, macrocycle, mesocycles, microcycles, phases, target_timeline, and rationale.
-- For planning_model, use `decision.planning_model` with fields such as model and rationale.
+- For periodization, use `decision.periodization` with fields including but not limited to weeks, macrocycle, mesocycles, microcycles, phases, target_timeline, deload_weeks_index (a list containing the indexes of deload weeks), and rationale.
+- For planning_model, use `decision.planning_model` with fields including model and rationale.
+- For programming_exercises_and_order, use `decision.programming_exercises_and_order` with fields including but not limited to `program_exercise_list`, `session_exercise_order` and rationale.
+- For programming_intensity_and_volume, use `decision.programming_intensity_and_volume`. For each exercise in `program_exercise_list`, generate a section in this form: {{"lift": "lift_name", "weekly_primary_exposure": "intensity_description", "base_intensity_percent_1rm": "a number or a range in 0-100%",
+  "sets_per_week": "a number in 1-10", "reps_per_set": "a number in 1-15", "weekly_progression_percent": "a number in 0-10%", "deload_session_weight_reduction_percent": "a number in 0-40%", "deload_session_reps_reduction_percent": "a number in 0-50%", "target_rpe": " a number in 5-10", "rationale": "rationale"}}.
 - Return JSON only.
 
 Task type:

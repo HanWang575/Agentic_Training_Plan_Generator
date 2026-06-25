@@ -2,7 +2,15 @@
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
-from app.core.llm_provider import AnswerRequest, OpenAIProvider, ProgramPlanUpdateRequest
+import pytest
+
+from app.core.llm_provider import (
+    AnswerRequest,
+    OpenAIProvider,
+    ProgramPlanUpdateRequest,
+    ProgramSOPStepDecisionRequest,
+    StructuredOutputError,
+)
 
 
 class FakeEmbeddingResponseItem:
@@ -253,3 +261,75 @@ def test_program_plan_update_repairs_malformed_json_once():
     assert plan == {"title": "Fixed Plan", "sessions": []}
     assert len(fake_client.chat.completions.requests) == 2
     assert "Repair the following malformed JSON" in fake_client.chat.completions.requests[1]["messages"][0]["content"]
+
+
+def test_structured_output_error_keeps_malformed_json_excerpts():
+    """Failed repair should preserve compact raw and repair excerpts for trace debugging."""
+
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    fake_client = FakeSequenceChatClient(
+        [
+            '{"step":"programming_intensity_and_volume" "decision":{}}',
+            '{"step":"programming_intensity_and_volume" "decision":{}}',
+        ]
+    )
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        provider.update_program_plan(
+            ProgramPlanUpdateRequest(
+                sop_step="programming_intensity_and_volume",
+                decision={"summary": "Use conservative loading."},
+                raw_plan={"title": "Draft Plan", "sessions": []},
+                collected_inputs={},
+                previous_decisions={},
+            )
+        )
+
+    assert "after one repair attempt" in str(exc_info.value)
+    assert '"step":"programming_intensity_and_volume"' in exc_info.value.raw_excerpt
+    assert '"decision":{}' in exc_info.value.repair_excerpt
+
+
+def test_program_sop_step_executor_has_room_for_long_intensity_decision():
+    """The intensity SOP can cover many exercises, so its JSON budget should not be tiny."""
+
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    fake_client = FakeSequenceChatClient(
+        [
+            (
+                '{"step":"programming_intensity_and_volume",'
+                '"decision":{"programming_intensity_and_volume":{}},'
+                '"rationale":"ok","assumptions":[],"warnings":[]}'
+            )
+        ]
+    )
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    provider.generate_program_sop_step_decision(
+        ProgramSOPStepDecisionRequest(
+            task_type="program_generation",
+            sop_step="programming_intensity_and_volume",
+            user_message="Create a program",
+            collected_inputs={},
+            memory_context="",
+            weekly_summaries=[],
+            evidence=[],
+            previous_decisions={},
+            raw_plan={"sessions": []},
+        )
+    )
+
+    assert fake_client.chat.completions.requests[0]["max_tokens"] == 3500

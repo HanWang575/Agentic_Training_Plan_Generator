@@ -17,6 +17,7 @@ from app.core.config import Settings
 from app.core.errors import ConfigurationError, NotFoundError
 from app.core.llm_provider import (
     OpenAIProvider,
+    ProgramInputExtractionRequest,
     ProgramPlanUpdateRequest,
     ProgramLiftMaxExtractionRequest,
     ProgramSOPStepDecisionRequest,
@@ -80,6 +81,8 @@ NEW_PROGRAM_SOP = [
 ]
 
 DETERMINISTIC_GENERATION_STEPS = {"load_calculation", "volume_calculation"}
+
+PROGRAM_REQUIRED_INPUTS = ("goal", "days_per_week", "session_duration_minutes", "experience", "equipment", "screening")
 
 PROGRAM_SECTION_DEFAULTS: dict[str, Any] = {
     "current_user_turn": {},
@@ -256,7 +259,14 @@ class ProgramService:
         working_key = self._working_key(task_type)
         working = dict(sections.get(working_key, {}))
         collected = dict(working.get("collected_inputs", {}))
-        collected.update(self._extract_inputs(effective_message, memory_context.sections.get("profile", "")))
+        extracted_from_user = self._extract_inputs(effective_message, profile_text="", recent_status_text="")
+        extracted_from_context = self._extract_inputs(
+            "",
+            profile_text=memory_context.sections.get("profile", ""),
+            recent_status_text=memory_context.sections.get("recent_status", ""),
+        )
+        _merge_context_defaults(collected, extracted_from_context)
+        collected.update(extracted_from_user)
         pending_load_names = list(working.get("pending_load_clarifications", []))
         if pending_load_names:
             load_references = dict(collected.get("exercise_load_references", {}))
@@ -281,6 +291,17 @@ class ProgramService:
         red_flags = self._red_flags(effective_message, memory_context.sections.get("recent_status", ""))
         if red_flags:
             return self._blocked_safety_response(context, sections, red_flags, started)
+
+        if route == "new_program" and not working.get("required_inputs_prompted"):
+            working["required_inputs_prompted"] = True
+            sections[working_key] = working
+            first_message_inputs = self._extract_inputs(effective_message, profile_text="", recent_status_text="")
+            missing_required = [
+                key for key in PROGRAM_REQUIRED_INPUTS if first_message_inputs.get(key) in (None, "", [])
+            ]
+            if missing_required:
+                self._checkpoint(context, sections)
+                return self._ask_for_missing(context, missing_required, started)
 
         self._checkpoint(context, sections)
         max_actions = self.settings.program_max_sop_steps_per_run * (
@@ -826,7 +847,34 @@ class ProgramService:
     def _working_key(self, task_type: str | None = None) -> str:
         return "new_program_working_state"
 
-    def _extract_inputs(self, message: str, profile_text: str) -> dict[str, Any]:
+    def _extract_inputs(
+        self,
+        message: str,
+        profile_text: str,
+        recent_status_text: str = "",
+    ) -> dict[str, Any]:
+        extracted: dict[str, Any] = {}
+        if self.llm_provider and hasattr(self.llm_provider, "extract_program_inputs"):
+            try:
+                llm_inputs = self.llm_provider.extract_program_inputs(
+                    ProgramInputExtractionRequest(
+                        user_message=message,
+                        recent_status_text=recent_status_text,
+                        profile_text=profile_text,
+                    )
+                )
+                if isinstance(llm_inputs, dict):
+                    extracted.update(llm_inputs)
+            except (ConfigurationError, StructuredOutputError, ValueError, TypeError):
+                extracted = {}
+        if not extracted:
+            extracted.update(self._extract_inputs_deterministic("", profile_text))
+            extracted.update(self._extract_inputs_deterministic("", recent_status_text))
+            extracted.update(self._extract_inputs_deterministic(message, ""))
+        extracted.update(self._extract_lift_maxes(message))
+        return extracted
+
+    def _extract_inputs_deterministic(self, message: str, profile_text: str) -> dict[str, Any]:
         combined = f"{profile_text}\n{message}"
         lowered = combined.lower()
         result: dict[str, Any] = {}
@@ -878,7 +926,6 @@ class ProgramService:
             match = re.search(pattern, message, flags=re.IGNORECASE)
             if match:
                 result[key] = int(match.group(1))
-        result.update(self._extract_lift_maxes(message))
         return result
 
     def _extract_lift_maxes(self, message: str) -> dict[str, float]:
@@ -953,7 +1000,15 @@ class ProgramService:
         trace_id = self._trace(
             context,
             "structured_output_error",
-            {"error": str(exc)},
+            {
+                key: value
+                for key, value in {
+                    "error": str(exc),
+                    "raw_excerpt": getattr(exc, "raw_excerpt", None),
+                    "repair_excerpt": getattr(exc, "repair_excerpt", None),
+                }.items()
+                if value
+            },
             errors=[str(exc)],
             started=started,
         )
@@ -1128,6 +1183,7 @@ class ProgramService:
                     sections.get("memory_context", {}),
                     trace_id,
                     periodization=_periodization_from_sop_progress(progress, raw_plan),
+                    intensity_volume_policy=_intensity_volume_policy_from_sop_progress(progress),
                 )
                 working.pop("calculated_plan", None)
                 output = self._load_calculation_step_output(working["calculation_artifacts"])
@@ -1141,6 +1197,7 @@ class ProgramService:
                         sections.get("memory_context", {}),
                         trace_id,
                         periodization=_periodization_from_sop_progress(progress, raw_plan),
+                        intensity_volume_policy=_intensity_volume_policy_from_sop_progress(progress),
                     )
                     working["calculation_artifacts"] = artifacts
                 output = self._volume_calculation_step_output(artifacts)
@@ -1150,7 +1207,7 @@ class ProgramService:
                 sop_step=step,
                 user_message=task_request,
                 collected_inputs=collected_inputs,
-                memory_context=_render_program_memory_context(sections.get("memory_context", {})),
+                memory_context=_render_program_memory_context_for_sop(sections.get("memory_context", {})),
                 weekly_summaries=sections.get("latest_four_week_summary_notes", []),
                 evidence=_current_evidence_items(sections),
                 previous_decisions=dict(progress.get("decisions", {})),
@@ -1188,6 +1245,7 @@ class ProgramService:
                 sections.get("memory_context", {}),
                 trace_id,
                 periodization=_periodization_from_sop_progress(progress, raw_plan),
+                intensity_volume_policy=_intensity_volume_policy_from_sop_progress(progress),
             )
             working.pop("calculated_plan", None)
         if step == "rest_periods":
@@ -1420,6 +1478,7 @@ class ProgramService:
             sections.get("memory_context", {}),
             trace_id,
             periodization=_periodization_from_sop_progress(sections.get("sop_progress", {}), raw),
+            intensity_volume_policy=_intensity_volume_policy_from_sop_progress(sections.get("sop_progress", {})),
         )
         working["calculation_artifacts"] = artifacts
         working.pop("calculated_plan", None)
@@ -1433,17 +1492,25 @@ class ProgramService:
         memory_context: dict[str, Any],
         trace_id: str,
         periodization: dict[str, Any] | None = None,
+        intensity_volume_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         periodization = periodization if isinstance(periodization, dict) else raw.get("periodization", {})
-        weeks = int(max(1, min(12, periodization.get("weeks", 4))))
-        days = int(max(1, min(7, inputs.get("days_per_week", len(raw.get("sessions", [])) or 3))))
-        templates = list(raw.get("sessions", []))[:days]
+        weeks = int(max(1, min(52, _coerce_float(periodization.get("weeks"), 4))))
+        raw_sessions = list(raw.get("sessions", []))
+        days_source = len(raw_sessions) if raw_sessions else inputs.get("days_per_week", 3)
+        days = int(max(1, min(7, days_source)))
+        templates = raw_sessions[:days]
         if not templates:
             raise ValueError("At least one session template is required.")
         while len(templates) < days:
             templates.append(templates[len(templates) % len(raw["sessions"])])
         start_date = _next_monday(datetime.now(timezone.utc))
         profile = str(memory_context.get("sections", {}).get("profile", ""))
+        intensity_volume_policy = intensity_volume_policy if isinstance(intensity_volume_policy, dict) else {}
+        deload_weeks = _deload_weeks_from_periodization(periodization, weeks)
+        exercise_policies = intensity_volume_policy.get("exercise_policies", {})
+        if not isinstance(exercise_policies, dict):
+            exercise_policies = {}
         frequency_trace = self._calculation(
             trace_id,
             "calculate_weekly_frequency",
@@ -1466,6 +1533,9 @@ class ProgramService:
                 for exercise_index, exercise in enumerate(template.get("exercises", []), start=1):
                     exercise_id = f"pex_{uuid4().hex[:12]}"
                     mode = "resistance"
+                    exercise_name = str(exercise.get("name", f"Exercise {exercise_index}"))
+                    exercise_policy = _policy_for_exercise(exercise_name, exercise_policies)
+                    is_deload_week = week in deload_weeks
                     sets_count = int(max(1, min(10, exercise.get("sets", 3))))
                     set_count_trace = self._calculation(
                         trace_id, "calculate_expression", {"expression": str(sets_count), "unit": "sets"}, ["programming_decision"]
@@ -1475,7 +1545,7 @@ class ProgramService:
                     exercise_reps = int(max(1, min(100, exercise.get("reps", 8))))
                     is_bodyweight = _is_bodyweight_exercise(exercise)
                     one_rm, one_rm_source = self._training_max_for_exercise(
-                        str(exercise.get("name", "")),
+                        exercise_name,
                         profile,
                         inputs,
                         trace_id,
@@ -1486,11 +1556,37 @@ class ProgramService:
                             f"Weighted exercise '{exercise.get('name', '')}' has no 1RM or recent performance record."
                         )
                     reps = exercise_reps
-                    rep_trace = self._calculation(
-                        trace_id, "calculate_expression", {"expression": str(reps), "unit": "reps"}, ["programming_decision"]
-                    )
                     raw_intensity = exercise.get("intensity_percent")
-                    base_intensity = float(max(1, min(100, raw_intensity if raw_intensity is not None else 70)))
+                    raw_intensity_value = _coerce_float(raw_intensity, None)
+                    policy_base_intensity = _coerce_float(
+                        _first_present(
+                            exercise_policy,
+                            "base_intensity_percent_1rm",
+                            "base_intensity_range_percent_1rm",
+                            "intensity_percent",
+                            "base_intensity",
+                        ),
+                        None,
+                    )
+                    base_intensity = float(max(1, min(100, policy_base_intensity if policy_base_intensity is not None else raw_intensity_value if raw_intensity_value is not None else 70)))
+                    weekly_progression_percent = _coerce_float(exercise_policy.get("weekly_progression_percent"), 1.5)
+                    deload_intensity_reduction = _coerce_float(
+                        exercise_policy.get("deload_session_intensity_reduction_percent"),
+                        0,
+                    )
+                    deload_reps_reduction = _coerce_float(
+                        exercise_policy.get("deload_session_reps_reduction_percent"),
+                        0,
+                    )
+                    if is_deload_week and deload_reps_reduction:
+                        adjusted_reps = max(1, round(exercise_reps * (1 - max(0, min(100, deload_reps_reduction)) / 100)))
+                        reps = int(adjusted_reps)
+                    rep_source_refs = ["programming_decision"]
+                    if is_deload_week and deload_reps_reduction:
+                        rep_source_refs.extend(["periodization_deload_week", "sop_intensity_volume_policy"])
+                    rep_trace = self._calculation(
+                        trace_id, "calculate_expression", {"expression": str(reps), "unit": "reps"}, rep_source_refs
+                    )
                     intensity_trace = self._calculation(
                         trace_id,
                         "calculate_expression",
@@ -1511,18 +1607,35 @@ class ProgramService:
                     intensity = base_intensity
                     trace_ids = [set_count_trace, rep_trace, intensity_trace, rest_trace, rpe_trace]
                     if not is_bodyweight and one_rm:
+                        progression_percent = (week - 1) * weekly_progression_percent
                         progressed = self._calculation(
                             trace_id,
                             "calculate_progression_increment",
-                            {"current_value": base_intensity, "percentage": (week - 1) * 1.5, "unit": "%1RM"},
-                            ["periodization_week"],
+                            {"current_value": base_intensity, "percentage": progression_percent, "unit": "%1RM"},
+                            ["periodization_week", "sop_intensity_volume_policy"],
                         )
                         progressed_value = self.session.get(CalculationTrace, progressed)
                         progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", base_intensity))
+                        trace_ids.append(progressed)
+                        if is_deload_week and deload_intensity_reduction:
+                            deload_progressed = self._calculation(
+                                trace_id,
+                                "calculate_progression_increment",
+                                {
+                                    "current_value": progressed_percent,
+                                    "percentage": -max(0, min(100, deload_intensity_reduction)),
+                                    "unit": "%1RM",
+                                },
+                                ["periodization_deload_week", "sop_intensity_volume_policy"],
+                            )
+                            deload_row = self.session.get(CalculationTrace, deload_progressed)
+                            progressed_percent = float(_loads(deload_row.result_json, {}).get("value", progressed_percent))
+                            trace_ids.append(deload_progressed)
+                        load_percent = min(progressed_percent, 100)
                         percentage_trace = self._calculation(
                             trace_id,
                             "calculate_percentage_load",
-                            {"one_rm": one_rm, "percentage": min(progressed_percent, 95), "unit": "kg"},
+                            {"one_rm": one_rm, "percentage": load_percent, "unit": "kg"},
                             [one_rm_source, "program_intensity"],
                         )
                         percentage_row = self.session.get(CalculationTrace, percentage_trace)
@@ -1540,8 +1653,8 @@ class ProgramService:
                         rounded_row = self.session.get(CalculationTrace, rounded_trace)
                         load_kg = float(_loads(rounded_row.result_json, {}).get("value", 0))
                         exercise_load = load_kg
-                        intensity = min(progressed_percent, 95)
-                        trace_ids.extend([progressed, percentage_trace, rounded_trace])
+                        intensity = load_percent
+                        trace_ids.extend([percentage_trace, rounded_trace])
                     rest_seconds = int(self._calculation_value(rest_trace))
                     for set_number in range(1, sets_count + 1):
                         sets.append(
@@ -1560,7 +1673,7 @@ class ProgramService:
                         volume_trace = self._calculation(
                             trace_id,
                             "calculate_volume_load",
-                            {"sets": sets_count, "reps": int(exercise_reps), "load": exercise_load, "unit": "kg"},
+                            {"sets": sets_count, "reps": int(reps), "load": exercise_load, "unit": "kg"},
                             [set_count_trace, "set_repetition_and_load_traces"],
                         )
                         volume_unit = "kg"
@@ -1568,7 +1681,7 @@ class ProgramService:
                         volume_trace = self._calculation(
                             trace_id,
                             "calculate_expression",
-                            {"expression": f"{sets_count} * {int(exercise_reps)}", "unit": "reps"},
+                            {"expression": f"{sets_count} * {int(reps)}", "unit": "reps"},
                             [set_count_trace, "set_repetition_traces"],
                         )
                         volume_unit = "reps"
@@ -1578,7 +1691,7 @@ class ProgramService:
                     exercises.append(
                         {
                             "exercise_id": exercise_id,
-                            "name": str(exercise.get("name", f"Exercise {exercise_index}")),
+                            "name": exercise_name,
                             "order": exercise_index,
                             "mode": mode,
                             "notes": str(exercise.get("notes", "")),
@@ -1608,6 +1721,12 @@ class ProgramService:
             "calculated_periodization": {
                 "weeks": weeks,
                 "sessions_per_week": days,
+                "deload_weeks": sorted(deload_weeks),
+                "exercise_policy_count": len(exercise_policies),
+                "week_policies": {
+                    str(week): {"deload": week in deload_weeks}
+                    for week in range(1, weeks + 1)
+                },
                 "frequency_calculation_trace_id": frequency_trace,
                 "weekly_volume_load_kg": weekly_workload,
             },
@@ -2223,6 +2342,29 @@ def _render_program_memory_context(memory_context: dict[str, Any]) -> str:
     )
 
 
+def _render_program_memory_context_for_sop(memory_context: dict[str, Any]) -> str:
+    """Render only the MemoryContext sections needed by SOPStepExecutor."""
+
+    memory_sections = memory_context.get("sections")
+    if not isinstance(memory_sections, dict):
+        return ""
+    allowed_sections = (
+        "rolling_summary",
+        "working_memory",
+        "profile",
+        "recent_status",
+        "active_plan_summary",
+        "latest_four_week_summary_notes",
+    )
+    return render_sections(
+        {
+            name: _stringify_memory_context_section(memory_sections.get(name))
+            for name in allowed_sections
+            if memory_sections.get(name) not in (None, "", [], {})
+        }
+    )
+
+
 def _stringify_memory_context_section(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -2377,6 +2519,159 @@ def _periodization_from_sop_progress(sop_progress: dict[str, Any], raw_plan: dic
     if not periodization:
         periodization = {"weeks": 4, "macrocycle": "four_week_block", "phases": []}
     return dict(periodization)
+
+
+def _merge_context_defaults(collected: dict[str, Any], defaults: dict[str, Any]) -> None:
+    for key, value in defaults.items():
+        if key not in collected or collected.get(key) in (None, "", []):
+            collected[key] = value
+
+
+def _intensity_volume_policy_from_sop_progress(sop_progress: dict[str, Any]) -> dict[str, Any]:
+    decision = _sop_decision_payload(sop_progress, "programming_intensity_and_volume")
+    payload = decision.get("programming_intensity_and_volume", decision) if isinstance(decision, dict) else {}
+    policies: dict[str, dict[str, Any]] = {}
+    for item in _iter_dicts(payload):
+        name = _first_present(item, "lift", "exercise", "exercise_name", "name")
+        if not name:
+            continue
+        policy = {
+            "name": str(name),
+            "weekly_progression_percent": _coerce_float(item.get("weekly_progression_percent"), None),
+            "deload_session_intensity_reduction_percent": _coerce_float(
+                item.get("deload_session_intensity_reduction_percent"),
+                None,
+            ),
+            "deload_session_reps_reduction_percent": _coerce_float(
+                item.get("deload_session_reps_reduction_percent"),
+                None,
+            ),
+            "base_intensity_percent_1rm": _coerce_float(
+                _first_present(
+                    item,
+                    "base_intensity_percent_1rm",
+                    "base_intensity_range_percent_1rm",
+                    "intensity_percent",
+                    "base_intensity",
+                ),
+                None,
+            ),
+            "target_rpe": _coerce_float(item.get("target_rpe"), None),
+        }
+        if any(value is not None for key, value in policy.items() if key != "name"):
+            policies[_normalize_exercise_name(str(name))] = policy
+    return {"exercise_policies": policies}
+
+
+def _deload_weeks_from_periodization(periodization: dict[str, Any], total_weeks: int) -> set[int]:
+    weeks: set[int] = set()
+    for key in (
+        "deload_weeks_index",
+        "deload_week_index",
+        "deload_weeks",
+        "deload_week",
+        "deload_week_indices",
+    ):
+        weeks.update(_parse_week_numbers(periodization.get(key), total_weeks))
+
+    cursor = 1
+    mesocycles = periodization.get("mesocycles", [])
+    if isinstance(mesocycles, list):
+        for mesocycle in mesocycles:
+            if not isinstance(mesocycle, dict):
+                continue
+            duration = int(max(1, _coerce_float(_first_present(mesocycle, "weeks", "duration_weeks"), 1)))
+            if _contains_deload_text(mesocycle):
+                weeks.update(range(cursor, min(total_weeks, cursor + duration - 1) + 1))
+            cursor += duration
+
+    phases = periodization.get("phases", [])
+    if isinstance(phases, list):
+        for phase in phases:
+            if isinstance(phase, dict) and _contains_deload_text(phase):
+                weeks.update(_parse_week_numbers(phase.get("weeks"), total_weeks))
+    return {week for week in weeks if 1 <= week <= total_weeks}
+
+
+def _policy_for_exercise(exercise_name: str, exercise_policies: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_exercise_name(exercise_name)
+    exact = exercise_policies.get(normalized)
+    if isinstance(exact, dict):
+        return exact
+    for key, value in exercise_policies.items():
+        if not isinstance(value, dict):
+            continue
+        key_text = str(key)
+        if key_text and (key_text in normalized or normalized in key_text):
+            return value
+    return {}
+
+
+def _iter_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_dicts(child)
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, ""):
+            return mapping[key]
+    return None
+
+
+def _coerce_float(value: Any, default: float | None = 0) -> float | None:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value)
+    range_match = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:-|to)\s*(-?\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    if range_match:
+        return (float(range_match.group(1)) + float(range_match.group(2))) / 2
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if match:
+        return float(match.group(0))
+    return default
+
+
+def _parse_week_numbers(value: Any, total_weeks: int) -> set[int]:
+    weeks: set[int] = set()
+    if value in (None, ""):
+        return weeks
+    if isinstance(value, (int, float)):
+        week = int(value)
+        return {week} if 1 <= week <= total_weeks else set()
+    if isinstance(value, list):
+        for item in value:
+            weeks.update(_parse_week_numbers(item, total_weeks))
+        return weeks
+    if isinstance(value, dict):
+        for item in value.values():
+            weeks.update(_parse_week_numbers(item, total_weeks))
+        return weeks
+    text = str(value)
+    for start, end in re.findall(r"(\d+)\s*(?:-|to)\s*(\d+)", text, flags=re.IGNORECASE):
+        low, high = sorted((int(start), int(end)))
+        weeks.update(range(low, high + 1))
+    for item in re.findall(r"\d+", text):
+        weeks.add(int(item))
+    return {week for week in weeks if 1 <= week <= total_weeks}
+
+
+def _contains_deload_text(value: Any) -> bool:
+    if isinstance(value, dict):
+        text = " ".join(str(child) for child in value.values())
+    elif isinstance(value, list):
+        text = " ".join(str(child) for child in value)
+    else:
+        text = str(value)
+    lowered = text.lower()
+    return any(term in lowered for term in ("deload", "resensitization", "resensitisation", "fatigue reduction"))
 
 
 def _sop_decision_payload(sop_progress: dict[str, Any], step: str) -> dict[str, Any]:
