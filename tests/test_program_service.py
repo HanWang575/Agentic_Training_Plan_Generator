@@ -18,7 +18,13 @@ from app.memory.schemas import PlanProgressPatchRequest
 from app.program.calculators import CalculatorService
 from app.program.nodes import ProgramContextPatchValidator, ReasoningActionRouter, TaskAndSOPRouter
 from app.program.schemas import ProgramContextPatch, ProgramReviewRequest, ProgramTurnRequest
-from app.program.service import NEW_PROGRAM_SOP, ProgramService, _extract_lift_maxes
+from app.program.service import (
+    NEW_PROGRAM_SOP,
+    ProgramService,
+    _extract_exercise_load_references,
+    _extract_lift_maxes,
+    _intensity_volume_policy_from_sop_progress,
+)
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import (
     CalculationTrace,
@@ -559,7 +565,7 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
                 "decision": {
                     "periodization": {
                         "weeks": 5,
-                        "deload_weeks_index": [3],
+                        "deload_week_numbers": [3],
                         "phases": ["build", "deload", "build"],
                     }
                 },
@@ -574,9 +580,9 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
                     "programming_intensity_and_volume": {
                         "bench_policy": {
                             "lift": "Bench Press",
-                            "weekly_progression_percent": 10,
-                            "deload_session_intensity_reduction_percent": 20,
-                            "deload_session_reps_reduction_percent": 50,
+                            "weekly_progression_percent": [0, 10, 0, 10, 10],
+                            "deload_session_intensity_reduction_percent": [0, 0, 20, 0, 0],
+                            "deload_session_reps_reduction_percent": [0, 0, 50, 0, 0],
                         }
                     }
                 },
@@ -612,8 +618,9 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
     assert bench_set(1).intensity_percent == pytest.approx(72.0)
     assert bench_set(1).reps == 6
     assert bench_set(2).intensity_percent == pytest.approx(79.2)
-    assert bench_set(3).intensity_percent == pytest.approx(69.12)
+    assert bench_set(3).intensity_percent == pytest.approx(63.36)
     assert bench_set(3).reps == 3
+    assert bench_set(4).intensity_percent == pytest.approx(87.12)
     progression_traces = [
         item
         for item in session.exec(select(CalculationTrace)).all()
@@ -621,6 +628,163 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
     ]
     assert any(json.loads(item.inputs_json).get("percentage") == 10 for item in progression_traces)
     assert any(json.loads(item.inputs_json).get("percentage") == -20 for item in progression_traces)
+    session.close()
+
+
+def test_session_specific_intensity_policy_distinguishes_repeated_lift_slots(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    first = _start_new_program(
+        service,
+        "conv_repeated_lift_slots",
+        message=(
+            "Create a strength plan. days_per_week: 2; duration: 60; experience: intermediate; "
+            "equipment: full gym and barbell; screening: no injuries. My bench PR is 115 kg."
+        ),
+    )
+    context = service.get_context(first.context_id)
+    record = service._get_context(first.context_id)
+    raw_plan = dict(context.sections["new_program_working_state"]["raw_plan"])
+    raw_plan["sessions"] = [
+        {
+            "name": "Upper Volume",
+            "goal": "strength",
+            "duration_minutes": 60,
+            "exercises": [
+                {"name": "Bench Press", "load_type": "weighted", "sets": 3, "reps": 6, "intensity_percent": 70, "rpe": 7}
+            ],
+        },
+        {
+            "name": "Upper Intensity",
+            "goal": "strength",
+            "duration_minutes": 60,
+            "exercises": [
+                {"name": "Bench Press", "load_type": "weighted", "sets": 1, "reps": 3, "intensity_percent": 85, "rpe": 8}
+            ],
+        },
+    ]
+    sop_progress = {
+        "decisions": {
+            "programming_intensity_and_volume": {
+                "decision": {
+                    "programming_intensity_and_volume": {
+                        "slots": [
+                            {
+                                "session_index": 1,
+                                "exercise_order": 1,
+                                "lift": "Bench Press",
+                                "week1_intensity_percent_1rm": 70,
+                                "sets_per_week": [4, 4],
+                                "reps_per_set": [6, 6],
+                                "weekly_progression_percent": [0, 2],
+                                "target_rpe": [7, 7.5],
+                            },
+                            {
+                                "session_index": 2,
+                                "exercise_order": 1,
+                                "lift": "Bench Press",
+                                "week1_intensity_percent_1rm": 85,
+                                "sets_per_week": [1, 1],
+                                "reps_per_set": [3, 2],
+                                "weekly_progression_percent": [0, 1],
+                                "target_rpe": [8, 8.5],
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    trace_id = service._trace(record, "run_calculation", {"title": "repeated lift slots"})
+    artifacts = service._materialize_plan(
+        raw_plan,
+        context.sections["new_program_working_state"]["collected_inputs"],
+        context.sections["memory_context"],
+        trace_id,
+        periodization={"weeks": 2},
+        intensity_volume_policy=_intensity_volume_policy_from_sop_progress(sop_progress),
+    )
+
+    def bench_slot(week: int, day: int):
+        planned_session = next(
+            item for item in artifacts["calculated_sessions"] if item["week_number"] == week and item["day_number"] == day
+        )
+        return planned_session["exercises"][0]["sets"][0]
+
+    assert artifacts["calculated_periodization"]["session_exercise_policy_count"] == 2
+    assert bench_slot(1, 1)["intensity_percent"] == pytest.approx(70)
+    assert bench_slot(1, 1)["reps"] == 6
+    assert bench_slot(1, 1)["rpe"] == pytest.approx(7)
+    assert bench_slot(1, 2)["intensity_percent"] == pytest.approx(85)
+    assert bench_slot(1, 2)["reps"] == 3
+    assert bench_slot(1, 2)["rpe"] == pytest.approx(8)
+    assert bench_slot(2, 1)["intensity_percent"] == pytest.approx(71.4)
+    assert bench_slot(2, 2)["intensity_percent"] == pytest.approx(85.85)
+    assert bench_slot(2, 2)["reps"] == 2
+    session.close()
+
+
+def test_deload_reps_reduction_applies_to_week_indexed_reps_without_zero_sets(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    first = _start_new_program(
+        service,
+        "conv_deload_reps_policy",
+        message=(
+            "Create a strength plan. days_per_week: 1; duration: 60; experience: intermediate; "
+            "equipment: full gym and barbell; screening: no injuries. My bench PR is 115 kg."
+        ),
+    )
+    context = service.get_context(first.context_id)
+    record = service._get_context(first.context_id)
+    raw_plan = dict(context.sections["new_program_working_state"]["raw_plan"])
+    raw_plan["sessions"] = [
+        {
+            "name": "Bench",
+            "goal": "strength",
+            "duration_minutes": 60,
+            "exercises": [
+                {"name": "Bench Press", "load_type": "weighted", "sets": 3, "reps": 6, "intensity_percent": 70, "rpe": 7}
+            ],
+        }
+    ]
+    sop_progress = {
+        "decisions": {
+            "programming_intensity_and_volume": {
+                "decision": {
+                    "programming_intensity_and_volume": [
+                        {
+                            "session_index": 1,
+                            "exercise_order": 1,
+                            "lift": "Bench Press",
+                            "week1_intensity_percent_1rm": 70,
+                            "sets_per_week": [3, 3, 0, 3],
+                            "reps_per_set": [6, 6, 6, 6],
+                            "weekly_progression_percent": [0, 2, 0, 2],
+                            "deload_session_intensity_reduction_percent": [0, 0, 20, 0],
+                            "deload_session_reps_reduction_percent": [0, 0, 50, 0],
+                            "target_rpe": [7, 7.5, 5, 8],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    trace_id = service._trace(record, "run_calculation", {"title": "deload reps policy"})
+    artifacts = service._materialize_plan(
+        raw_plan,
+        context.sections["new_program_working_state"]["collected_inputs"],
+        context.sections["memory_context"],
+        trace_id,
+        periodization={"weeks": 4, "deload_week_numbers": [3]},
+        intensity_volume_policy=_intensity_volume_policy_from_sop_progress(sop_progress),
+    )
+
+    week_3 = next(item for item in artifacts["calculated_sessions"] if item["week_number"] == 3)
+    bench = week_3["exercises"][0]
+    assert len(bench["sets"]) == 3
+    assert bench["sets"][0]["reps"] == 3
+    assert bench["sets"][0]["intensity_percent"] == pytest.approx(57.12)
+    week_4 = next(item for item in artifacts["calculated_sessions"] if item["week_number"] == 4)
+    assert week_4["exercises"][0]["sets"][0]["intensity_percent"] == pytest.approx(72.83)
     session.close()
 
 
@@ -712,10 +876,22 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
     )
     assert waiting.status == "waiting_for_user"
     assert "Weighted Pull-Up" in waiting.response
+    assert "load_references" in waiting.response
 
     draft = service.process_turn(
         "conv_weighted_clarification",
-        ProgramTurnRequest(user_id="usr_program", message="Weighted Pull-Up: 40 kg x 5 reps"),
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured load references.",
+            load_references=[
+                {
+                    "exercise_name": "Weighted Pull-Up",
+                    "type": "recent_set",
+                    "weight_kg": 40,
+                    "reps": 5,
+                }
+            ],
+        ),
     )
     assert draft.status == "waiting_for_review"
     version = service.get_version(draft.draft_program_id, draft.draft_version_id)
@@ -742,6 +918,46 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
     ]
     assert any(json.loads(item.inputs_json) == {"weight": 40.0, "reps": 5, "method": "epley", "unit": "kg"} for item in estimate_traces)
     session.close()
+
+
+def test_load_reference_parser_handles_press_and_structured_json():
+    message = (
+        "Weighted Plank 1RM: 20kg, Weighted Pull-up 1RM: 55kg, "
+        "Chest-Supported Row: 40kg x 12 reps, Overhead Press: 45kg x 7 reps, "
+        "Weighted Pull-up Iso Hold 1RM: 55kg, Lat Pulldown: 40kg x 10 reps, "
+        "Face Pull: 40kg x 12 reps"
+    )
+    names = [
+        "Weighted Plank",
+        "Weighted Pull-up",
+        "Chest-Supported Row",
+        "Overhead Press",
+        "Weighted Pull-up Iso Hold",
+        "Lat Pulldown",
+        "Face Pull",
+    ]
+    parsed = _extract_exercise_load_references(message, names)
+    assert parsed["overhead_press"] == {
+        "exercise_name": "Overhead Press",
+        "weight_kg": 45.0,
+        "reps": 7,
+        "source": "current_user_turn_recent_performance",
+    }
+    assert parsed["chest_supported_row"]["reps"] == 12
+
+    structured = _extract_exercise_load_references(
+        json.dumps(
+            {
+                "load_references": [
+                    {"exercise_name": "Overhead Press", "type": "recent_set", "weight_kg": 45, "reps": 7},
+                    {"exercise_name": "Weighted Pull-up", "type": "1rm", "weight_kg": 55, "reps": 1},
+                ]
+            }
+        ),
+        ["Overhead Press", "Weighted Pull-up"],
+    )
+    assert structured["overhead_press"]["reps"] == 7
+    assert structured["weighted_pull_up"]["source"] == "current_user_turn_1rm"
 
 
 def test_malformed_program_json_returns_clean_error_response(tmp_path: Path):
@@ -1026,8 +1242,8 @@ def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
         "conv_rationale",
         ProgramTurnRequest(user_id="usr_program", message="I want the exact calculation behind 75.24%"),
     )
-    assert "Selected Bench Press at 75.24%" in intensity_followup.response
-    assert "72 * (1 + 4.5 / 100) = 75.24%" in intensity_followup.response
+    assert "Selected Bench Press at 75.29%" in intensity_followup.response
+    assert "74.18 * (1 + 1.5 / 100) = 75.29%" in intensity_followup.response
 
     original_updater = service.llm_provider.update_program_plan
 

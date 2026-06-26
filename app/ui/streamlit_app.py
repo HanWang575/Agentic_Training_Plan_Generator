@@ -57,6 +57,100 @@ def _rerun_app() -> None:
         st.experimental_rerun()
 
 
+def _program_widget_key(prefix: str, context_id: str, exercise_name: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in exercise_name.lower()).strip("_")
+    return f"{prefix}_{context_id}_{slug}"
+
+
+def _pending_program_load_reference_names(context_payload: dict) -> list[str]:
+    sections = context_payload.get("sections", {})
+    working = sections.get("new_program_working_state", {})
+    names = working.get("pending_load_clarifications", [])
+    if isinstance(names, list) and names:
+        return [str(item) for item in names if str(item).strip()]
+    pending = sections.get("sop_progress", {}).get("pending_missing_inputs", [])
+    if not isinstance(pending, list):
+        return []
+    return [
+        str(item).split(":", 1)[1]
+        for item in pending
+        if isinstance(item, str) and item.startswith("load_reference:") and item.split(":", 1)[1].strip()
+    ]
+
+
+def _render_program_load_reference_form(context_payload: dict, user_id: str, conversation_id: str) -> None:
+    exercise_names = _pending_program_load_reference_names(context_payload)
+    if not exercise_names:
+        return
+    context_id = str(context_payload.get("context_id", "program_context"))
+    st.markdown("#### Load References")
+    st.caption("Choose one reference type for each weighted exercise, then submit the form.")
+    with st.form(f"program_load_reference_form_{context_id}"):
+        entries = []
+        for exercise_name in exercise_names:
+            cols = st.columns([3, 2, 2, 2])
+            cols[0].markdown(f"**{exercise_name}**")
+            ref_type = cols[1].selectbox(
+                "Type",
+                ["recent_set", "1rm"],
+                key=_program_widget_key("program_load_type", context_id, exercise_name),
+            )
+            weight_kg = cols[2].number_input(
+                "Weight kg",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+                key=_program_widget_key("program_load_weight", context_id, exercise_name),
+            )
+            reps = 1
+            if ref_type == "recent_set":
+                reps = cols[3].number_input(
+                    "Reps",
+                    min_value=1,
+                    value=5,
+                    step=1,
+                    key=_program_widget_key("program_load_reps", context_id, exercise_name),
+                )
+            else:
+                cols[3].number_input(
+                    "Reps",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    disabled=True,
+                    key=_program_widget_key("program_load_reps", context_id, exercise_name),
+                )
+            entries.append(
+                {
+                    "exercise_name": exercise_name,
+                    "type": ref_type,
+                    "weight_kg": float(weight_kg),
+                    "reps": int(reps),
+                }
+            )
+        submitted = st.form_submit_button("Submit load references", disabled=not bool(user_id and conversation_id))
+    if not submitted:
+        return
+    missing = [item["exercise_name"] for item in entries if item["weight_kg"] <= 0]
+    if missing:
+        st.error("Enter a weight for: " + ", ".join(missing))
+        return
+    message = "Submitted structured load references."
+    st.session_state["program_messages"].append({"role": "user", "content": message})
+    response = httpx.post(
+        f"{API_BASE_URL}/api/programs/conversations/{conversation_id}/turns",
+        json={"user_id": user_id, "message": message, "load_references": entries},
+        timeout=300,
+    )
+    if response.is_success:
+        payload = response.json()
+        st.session_state["program_last_response"] = payload
+        st.session_state["program_messages"].append({"role": "assistant", "content": payload["response"]})
+        _rerun_app()
+    else:
+        st.error(response.json().get("detail", response.text))
+
+
 def _render_program_version_response(payload: dict) -> None:
     """Render one ProgramVersionResponse section at a time to keep the UI responsive."""
 
@@ -1604,6 +1698,11 @@ with tabs[7]:
             )
             if context_response.is_success:
                 context_payload = context_response.json()
+                _render_program_load_reference_form(
+                    context_payload,
+                    program_user_id,
+                    program_conversation_id,
+                )
                 with st.expander("SOP progress and context"):
                     st.json(
                         {

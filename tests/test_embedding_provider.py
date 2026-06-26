@@ -332,4 +332,4 @@ def test_program_sop_step_executor_has_room_for_long_intensity_decision():
         )
     )
 
-    assert fake_client.chat.completions.requests[0]["max_tokens"] == 3500
+    assert fake_client.chat.completions.requests[0]["max_tokens"] == 8000

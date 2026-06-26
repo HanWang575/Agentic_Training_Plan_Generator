@@ -63,9 +63,17 @@ class ProgramVersionResponse(BaseModel):
     created_at: datetime
 
 
+class ProgramLoadReferenceInput(BaseModel):
+    exercise_name: str = Field(min_length=1)
+    type: Literal["1rm", "recent_set"]
+    weight_kg: float = Field(gt=0)
+    reps: int | None = Field(default=None, ge=1)
+
+
 class ProgramTurnRequest(BaseModel):
     user_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    load_references: list[ProgramLoadReferenceInput] = Field(default_factory=list)
     expected_context_revision: int | None = None
 
 

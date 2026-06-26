@@ -215,11 +215,27 @@ Rules:
 - In the current step's structured decision always includes a 'rationale' field.
 - For consultation_and_screening, use `decision.screening`.
 - For needs_analysis, use `decision.needs_analysis`.
-- For periodization, use `decision.periodization` with fields including but not limited to weeks, macrocycle, mesocycles, microcycles, phases, target_timeline, deload_weeks_index (a list containing the indexes of deload weeks), and rationale.
+- For periodization, use `decision.periodization` with fields including but not limited to weeks, macrocycle, mesocycles, microcycles, phases, target_timeline, deload_week_numbers (1-based program week numbers indicating deload weeks), and rationale.
 - For planning_model, use `decision.planning_model` with fields including model and rationale.
-- For programming_exercises_and_order, use `decision.programming_exercises_and_order` with fields including but not limited to `program_exercise_list`, `session_exercise_order` and rationale.
-- For programming_intensity_and_volume, use `decision.programming_intensity_and_volume`. For each exercise in `program_exercise_list`, generate a section in this form: {{"lift": "lift_name", "weekly_primary_exposure": "intensity_description", "base_intensity_percent_1rm": "a number or a range in 0-100%",
-  "sets_per_week": "a number in 1-10", "reps_per_set": "a number in 1-15", "weekly_progression_percent": "a number in 0-10%", "deload_session_weight_reduction_percent": "a number in 0-40%", "deload_session_reps_reduction_percent": "a number in 0-50%", "target_rpe": " a number in 5-10", "rationale": "rationale"}}.
+- For programming_exercises_and_order, use `decision.programming_exercises_and_order` with fields including but not limited to `program_exercise_list`, `session_exercise_order` and rationale. `program_exercise_list` is the unique exercise catalog, so each exercise appears once there. `session_exercise_order` is the arranged session plan, so the same exercise may appear in multiple sessions when the role differs.
+- For programming_intensity_and_volume, use `decision.programming_intensity_and_volume`. Use `previous_decisions.periodization` to make week-by-week intensity and volume choices.
+  Generate one compact section for each arranged exercise slot in `session_exercise_order`, not for each unique exercise in `program_exercise_list`. If the same lift appears in two sessions, create two separate sections.
+  {{"session_index": "1-based training-day index",
+  "exercise_order": "1-based order within that session",
+  "lift": "lift_name",
+  "slot_role": "short role such as volume, intensity, technique, accessory, or deload",
+  "weekly_primary_exposure": "short description",
+  "week1_intensity_percent_1rm": "number in 50-100 for every weighted exercise slot; never output 0/null/N/A for weighted exercises",
+  "sets_per_week": ["one integer per program week, range [1,20], deload behaviour should not be considered when setting this integer"],
+  "reps_per_set": ["one integer per program week, range [1,15], deload behaviour should not be considered when setting this integer"],
+  "weekly_progression_percent": ["one number per program week; percentage increase from the previous effective load, not from 1RM; week 1 must be 0; deload weeks must be 0, range [0,5]"],
+  "deload_session_intensity_reduction_percent": ["one number per program week; 0 for non-deload weeks, range [0, 100]"],
+  "deload_session_reps_reduction_percent": ["one number per program week; 0 for non-deload weeks, range [0, 100]"],
+  "target_rpe": ["one number per program week, range [1, 10]"],
+  "rationale": "explain the rationale behind briefly."}}.
+  Each list length must equal `decision.periodization.weeks`. Do not express deload/taper by setting `sets_per_week` to 0 or by pre-reducing `reps_per_set`; deload/taper is handled only by `deload_session_intensity_reduction_percent`, `deload_session_reps_reduction_percent`, lower `target_rpe`, and `weekly_progression_percent: 0`.
+  Use `sets_per_week: 0` only when the exercise slot is intentionally absent for a non-deload reason.
+  For a repeated lift, `sets_per_week` is the weekly set count assigned to that specific session slot; the lift's total weekly set count is the sum of its slots.
 - Return JSON only.
 
 Task type:
@@ -277,7 +293,7 @@ Rules:
 - Fill, expand, compact, or update sessions/exercises/sets only as needed by the current SOP decision.
 - Keep one week of session templates in raw_plan.sessions; deterministic code expands them across weeks.
 - Every exercise must include load_type: "weighted" or "bodyweight".
-- Weighted exercises should include intensity_percent, sets, reps, rpe, and rest_seconds proposals, but do not invent load_kg.
+- All weighted exercises must include none-zero intensity_percent, sets, reps, rpe, and rest_seconds proposals, but do not invent load_kg.
 - Bodyweight exercises may keep load_kg null.
 - Do not add calculated session dates, generated IDs, calculation_trace_ids, or database fields.
 - Do not include screening, needs_analysis, periodization, planning_model, changed_elements, or unchanged_elements in raw_plan; those belong in sop_progress.decisions.

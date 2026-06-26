@@ -271,6 +271,12 @@ class ProgramService:
         if pending_load_names:
             load_references = dict(collected.get("exercise_load_references", {}))
             load_references.update(_extract_exercise_load_references(effective_message, pending_load_names))
+            load_references.update(
+                _normalize_structured_load_references(
+                    [item.model_dump(mode="json") for item in request.load_references],
+                    pending_load_names,
+                )
+            )
             if load_references:
                 collected["exercise_load_references"] = load_references
         if route == "new_program":
@@ -1044,11 +1050,17 @@ class ProgramService:
         requested_details = [labels[item] for item in standard_missing]
         if load_missing:
             requested_details.append(
-                "a 1RM or recent weighted set for each weighted exercise: "
-                + ", ".join(load_missing)
-                + '. Reply in the form "Exercise: 80 kg x 8 reps" or "Exercise 1RM: 100 kg"'
+                "load references for each weighted exercise listed in the template below"
             )
         question = "Before I design this safely, please provide: " + "; ".join(requested_details) + "."
+        if load_missing:
+            question += (
+                "\n\nChoose `1rm` when you know a current one-rep max, or `recent_set` when you know a recent "
+                "weighted set. Keep one object for each exercise and fill `weight_kg` plus `reps`; for `1rm`, "
+                "use `reps: 1`.\n\n```json\n"
+                + json.dumps(_load_reference_template(load_missing), indent=2)
+                + "\n```"
+            )
         trace_id = self._trace(context, "ask_user", {"missing_inputs": missing}, started=started)
         self._assistant_message(context, question)
         return self._turn_response(context, question, trace_id)
@@ -1511,6 +1523,9 @@ class ProgramService:
         exercise_policies = intensity_volume_policy.get("exercise_policies", {})
         if not isinstance(exercise_policies, dict):
             exercise_policies = {}
+        session_exercise_policies = intensity_volume_policy.get("session_exercise_policies", {})
+        if not isinstance(session_exercise_policies, dict):
+            session_exercise_policies = {}
         frequency_trace = self._calculation(
             trace_id,
             "calculate_weekly_frequency",
@@ -1520,6 +1535,8 @@ class ProgramService:
         weekly_workload: dict[str, float] = {str(week): 0.0 for week in range(1, weeks + 1)}
         sessions: list[dict[str, Any]] = []
         training_max_cache: dict[str, tuple[float | None, str]] = {}
+        slot_intensity_percent_cache: dict[str, float] = {}
+        slot_set_count_cache: dict[str, int] = {}
         for week in range(1, weeks + 1):
             for day_index, template in enumerate(templates, start=1):
                 session_id = f"psess_{uuid4().hex[:12]}"
@@ -1534,15 +1551,33 @@ class ProgramService:
                     exercise_id = f"pex_{uuid4().hex[:12]}"
                     mode = "resistance"
                     exercise_name = str(exercise.get("name", f"Exercise {exercise_index}"))
-                    exercise_policy = _policy_for_exercise(exercise_name, exercise_policies)
+                    exercise_policy = _policy_for_exercise_slot(
+                        day_index,
+                        exercise_index,
+                        exercise_name,
+                        session_exercise_policies,
+                        exercise_policies,
+                    )
+                    slot_policy_key = _exercise_slot_policy_key(day_index, exercise_index, exercise_name)
                     is_deload_week = week in deload_weeks
-                    sets_count = int(max(1, min(10, exercise.get("sets", 3))))
+                    policy_sets = _policy_week_int(exercise_policy, "sets_per_week", week, None)
+                    sets_count = int(max(0, min(20, policy_sets if policy_sets is not None else exercise.get("sets", 3))))
+                    set_source_refs = ["programming_decision"]
+                    if is_deload_week and policy_sets == 0:
+                        previous_sets = slot_set_count_cache.get(slot_policy_key)
+                        if previous_sets:
+                            sets_count = previous_sets
+                            set_source_refs.append("deload_zero_sets_replaced_with_previous_nonzero")
+                    if sets_count == 0:
+                        continue
+                    slot_set_count_cache[slot_policy_key] = sets_count
                     set_count_trace = self._calculation(
-                        trace_id, "calculate_expression", {"expression": str(sets_count), "unit": "sets"}, ["programming_decision"]
+                        trace_id, "calculate_expression", {"expression": str(sets_count), "unit": "sets"}, set_source_refs
                     )
                     sets = []
                     exercise_load = None
-                    exercise_reps = int(max(1, min(100, exercise.get("reps", 8))))
+                    policy_reps = _policy_week_int(exercise_policy, "reps_per_set", week, None)
+                    exercise_reps = int(max(1, min(100, policy_reps if policy_reps is not None else exercise.get("reps", 8))))
                     is_bodyweight = _is_bodyweight_exercise(exercise)
                     one_rm, one_rm_source = self._training_max_for_exercise(
                         exercise_name,
@@ -1563,19 +1598,29 @@ class ProgramService:
                             exercise_policy,
                             "base_intensity_percent_1rm",
                             "base_intensity_range_percent_1rm",
+                            "week1_intensity_percent_1rm",
                             "intensity_percent",
                             "base_intensity",
                         ),
                         None,
                     )
                     base_intensity = float(max(1, min(100, policy_base_intensity if policy_base_intensity is not None else raw_intensity_value if raw_intensity_value is not None else 70)))
-                    weekly_progression_percent = _coerce_float(exercise_policy.get("weekly_progression_percent"), 1.5)
-                    deload_intensity_reduction = _coerce_float(
-                        exercise_policy.get("deload_session_intensity_reduction_percent"),
+                    weekly_progression_percent = _policy_week_float(
+                        exercise_policy,
+                        "weekly_progression_percent",
+                        week,
+                        0 if is_deload_week else 1.5,
+                    )
+                    deload_intensity_reduction = _policy_week_float(
+                        exercise_policy,
+                        "deload_session_intensity_reduction_percent",
+                        week,
                         0,
                     )
-                    deload_reps_reduction = _coerce_float(
-                        exercise_policy.get("deload_session_reps_reduction_percent"),
+                    deload_reps_reduction = _policy_week_float(
+                        exercise_policy,
+                        "deload_session_reps_reduction_percent",
+                        week,
                         0,
                     )
                     if is_deload_week and deload_reps_reduction:
@@ -1599,7 +1644,8 @@ class ProgramService:
                         {"goal": template.get("goal", raw.get("goal", "general fitness")), "compound": exercise_index <= 2},
                         ["session_goal"],
                     )
-                    rpe = float(max(1, min(10, exercise.get("rpe", 7))))
+                    policy_rpe = _policy_week_float(exercise_policy, "target_rpe", week, None)
+                    rpe = float(max(1, min(10, policy_rpe if policy_rpe is not None else exercise.get("rpe", 7))))
                     rpe_trace = self._calculation(
                         trace_id, "calculate_expression", {"expression": str(rpe), "unit": "RPE"}, ["programming_decision"]
                     )
@@ -1607,31 +1653,39 @@ class ProgramService:
                     intensity = base_intensity
                     trace_ids = [set_count_trace, rep_trace, intensity_trace, rest_trace, rpe_trace]
                     if not is_bodyweight and one_rm:
-                        progression_percent = (week - 1) * weekly_progression_percent
+                        previous_progression_intensity = slot_intensity_percent_cache.get(slot_policy_key, base_intensity)
+                        progression_percent = 0 if week == 1 else weekly_progression_percent
                         progressed = self._calculation(
                             trace_id,
                             "calculate_progression_increment",
-                            {"current_value": base_intensity, "percentage": progression_percent, "unit": "%1RM"},
+                            {
+                                "current_value": previous_progression_intensity,
+                                "percentage": progression_percent,
+                                "unit": "%1RM",
+                            },
                             ["periodization_week", "sop_intensity_volume_policy"],
                         )
                         progressed_value = self.session.get(CalculationTrace, progressed)
-                        progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", base_intensity))
+                        progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", previous_progression_intensity))
                         trace_ids.append(progressed)
+                        baseline_percent = min(progressed_percent, 100)
+                        effective_percent = baseline_percent
                         if is_deload_week and deload_intensity_reduction:
                             deload_progressed = self._calculation(
                                 trace_id,
                                 "calculate_progression_increment",
                                 {
-                                    "current_value": progressed_percent,
+                                    "current_value": baseline_percent,
                                     "percentage": -max(0, min(100, deload_intensity_reduction)),
                                     "unit": "%1RM",
                                 },
                                 ["periodization_deload_week", "sop_intensity_volume_policy"],
                             )
                             deload_row = self.session.get(CalculationTrace, deload_progressed)
-                            progressed_percent = float(_loads(deload_row.result_json, {}).get("value", progressed_percent))
+                            effective_percent = float(_loads(deload_row.result_json, {}).get("value", baseline_percent))
                             trace_ids.append(deload_progressed)
-                        load_percent = min(progressed_percent, 100)
+                        load_percent = min(effective_percent, 100)
+                        slot_intensity_percent_cache[slot_policy_key] = baseline_percent
                         percentage_trace = self._calculation(
                             trace_id,
                             "calculate_percentage_load",
@@ -1723,6 +1777,7 @@ class ProgramService:
                 "sessions_per_week": days,
                 "deload_weeks": sorted(deload_weeks),
                 "exercise_policy_count": len(exercise_policies),
+                "session_exercise_policy_count": len(session_exercise_policies),
                 "week_policies": {
                     str(week): {"deload": week in deload_weeks}
                     for week in range(1, weeks + 1)
@@ -2531,46 +2586,109 @@ def _intensity_volume_policy_from_sop_progress(sop_progress: dict[str, Any]) -> 
     decision = _sop_decision_payload(sop_progress, "programming_intensity_and_volume")
     payload = decision.get("programming_intensity_and_volume", decision) if isinstance(decision, dict) else {}
     policies: dict[str, dict[str, Any]] = {}
+    session_policies: dict[str, dict[str, Any]] = {}
     for item in _iter_dicts(payload):
         name = _first_present(item, "lift", "exercise", "exercise_name", "name")
         if not name:
             continue
         policy = {
             "name": str(name),
-            "weekly_progression_percent": _coerce_float(item.get("weekly_progression_percent"), None),
-            "deload_session_intensity_reduction_percent": _coerce_float(
-                item.get("deload_session_intensity_reduction_percent"),
-                None,
+            "weekly_progression_percent": item.get("weekly_progression_percent"),
+            "deload_session_intensity_reduction_percent": _first_present(
+                item,
+                "deload_session_intensity_reduction_percent",
+                "deload_session_weight_reduction_percent",
             ),
-            "deload_session_reps_reduction_percent": _coerce_float(
-                item.get("deload_session_reps_reduction_percent"),
-                None,
+            "deload_session_reps_reduction_percent": item.get("deload_session_reps_reduction_percent"),
+            "base_intensity_percent_1rm": _first_present(
+                item,
+                "base_intensity_percent_1rm",
+                "base_intensity_range_percent_1rm",
+                "week1_intensity_percent_1rm",
+                "intensity_percent",
+                "base_intensity",
             ),
-            "base_intensity_percent_1rm": _coerce_float(
-                _first_present(
-                    item,
-                    "base_intensity_percent_1rm",
-                    "base_intensity_range_percent_1rm",
-                    "intensity_percent",
-                    "base_intensity",
-                ),
-                None,
-            ),
-            "target_rpe": _coerce_float(item.get("target_rpe"), None),
+            "sets_per_week": item.get("sets_per_week"),
+            "reps_per_set": item.get("reps_per_set"),
+            "target_rpe": item.get("target_rpe"),
+            "slot_role": _first_present(item, "slot_role", "role", "session_role"),
         }
-        if any(value is not None for key, value in policy.items() if key != "name"):
+        session_index = _coerce_float(
+            _first_present(item, "session_index", "session_day", "day_index", "day_number", "day"),
+            None,
+        )
+        exercise_order = _coerce_float(_first_present(item, "exercise_order", "exercise_index", "order"), None)
+        if session_index is not None and exercise_order is not None:
+            session_policies[_exercise_slot_policy_key(int(session_index), int(exercise_order), str(name))] = policy
+        if any(_policy_value_present(value) for key, value in policy.items() if key != "name"):
             policies[_normalize_exercise_name(str(name))] = policy
-    return {"exercise_policies": policies}
+    return {"exercise_policies": policies, "session_exercise_policies": session_policies}
+
+
+def _policy_value_present(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, list):
+        return any(item not in (None, "") for item in value)
+    return True
+
+
+def _policy_week_float(policy: dict[str, Any], key: str, week: int, default: float | None = 0) -> float | None:
+    return _coerce_float(_policy_week_value(policy, key, week, default), default)
+
+
+def _policy_week_int(policy: dict[str, Any], key: str, week: int, default: int | None = 0) -> int | None:
+    value = _policy_week_float(policy, key, week, None if default is None else float(default))
+    if value is None:
+        return default
+    return int(round(value))
+
+
+def _policy_week_value(policy: dict[str, Any], key: str, week: int, default: Any = None) -> Any:
+    value = policy.get(key)
+    if isinstance(value, list):
+        index = week - 1
+        if 0 <= index < len(value):
+            return value[index]
+        return default
+    if value in (None, ""):
+        return default
+    return value
+
+
+def _policy_has_weekly_values(policy: dict[str, Any], key: str) -> bool:
+    return isinstance(policy.get(key), list)
+
+
+def _exercise_slot_policy_key(day_index: int, exercise_index: int, exercise_name: str) -> str:
+    return f"{int(day_index)}:{int(exercise_index)}:{_normalize_exercise_name(exercise_name)}"
+
+
+def _policy_for_exercise_slot(
+    day_index: int,
+    exercise_index: int,
+    exercise_name: str,
+    session_exercise_policies: dict[str, Any],
+    exercise_policies: dict[str, Any],
+) -> dict[str, Any]:
+    exact_slot = session_exercise_policies.get(_exercise_slot_policy_key(day_index, exercise_index, exercise_name))
+    if isinstance(exact_slot, dict):
+        return exact_slot
+    normalized = _normalize_exercise_name(exercise_name)
+    for key, value in session_exercise_policies.items():
+        if not isinstance(value, dict):
+            continue
+        parts = str(key).split(":", 2)
+        if len(parts) == 3 and parts[0] == str(day_index) and parts[2] == normalized:
+            return value
+    return _policy_for_exercise(exercise_name, exercise_policies)
 
 
 def _deload_weeks_from_periodization(periodization: dict[str, Any], total_weeks: int) -> set[int]:
     weeks: set[int] = set()
     for key in (
-        "deload_weeks_index",
-        "deload_week_index",
-        "deload_weeks",
-        "deload_week",
-        "deload_week_indices",
+        "deload_week_numbers",
+        "deload_week_number",
     ):
         weeks.update(_parse_week_numbers(periodization.get(key), total_weeks))
 
@@ -3209,38 +3327,31 @@ def _is_bodyweight_exercise(exercise: dict[str, Any]) -> bool:
     )
 
 
+def _load_reference_template(exercise_names: list[str]) -> dict[str, Any]:
+    return {
+        "load_references": [
+            {
+                "exercise_name": exercise_name,
+                "type": "recent_set",
+                "weight_kg": None,
+                "reps": None,
+            }
+            for exercise_name in exercise_names
+        ]
+    }
+
+
 def _extract_exercise_load_references(
     message: str,
     exercise_names: list[str],
 ) -> dict[str, dict[str, Any]]:
-    references: dict[str, dict[str, Any]] = {}
+    references = _extract_structured_load_references_from_message(message, exercise_names)
     for exercise_name in exercise_names:
-        aliases = [exercise_name]
-        normalized = exercise_name.lower()
-        if "overhead press" in normalized:
-            aliases.append("OHP")
-        if "back squat" in normalized:
-            aliases.append("squat")
-        segment = ""
-        for alias in aliases:
-            match = re.search(re.escape(alias), message, re.IGNORECASE)
-            if match:
-                segment = message[match.start() : match.start() + 140]
-                break
-        if not segment:
+        key = _normalize_exercise_name(exercise_name)
+        if key in references:
             continue
-        one_rm_match = re.search(
-            r"(?:1\s*rm|pr|max)\D{0,20}(\d+(?:\.\d+)?)\s*kg",
-            segment,
-            re.IGNORECASE,
-        )
-        if one_rm_match:
-            references[_normalize_exercise_name(exercise_name)] = {
-                "exercise_name": exercise_name,
-                "weight_kg": float(one_rm_match.group(1)),
-                "reps": 1,
-                "source": "current_user_turn_1rm",
-            }
+        segment = _exercise_message_segment(message, exercise_name, exercise_names)
+        if not segment:
             continue
         performance_match = re.search(
             r"(\d+(?:\.\d+)?)\s*kg\s*(?:x|for)\s*(\d+)\s*(?:reps?)?",
@@ -3248,13 +3359,136 @@ def _extract_exercise_load_references(
             re.IGNORECASE,
         )
         if performance_match:
-            references[_normalize_exercise_name(exercise_name)] = {
+            references[key] = {
                 "exercise_name": exercise_name,
                 "weight_kg": float(performance_match.group(1)),
                 "reps": int(performance_match.group(2)),
                 "source": "current_user_turn_recent_performance",
             }
+            continue
+        one_rm_match = re.search(
+            r"(?:\b1\s*rm\b|\bone\s*rep\s*max\b|\bpr\b|\bmax\b)\D{0,20}(\d+(?:\.\d+)?)\s*kg",
+            segment,
+            re.IGNORECASE,
+        )
+        if not one_rm_match:
+            one_rm_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*kg\D{0,20}(?:\b1\s*rm\b|\bone\s*rep\s*max\b|\bpr\b|\bmax\b)",
+                segment,
+                re.IGNORECASE,
+            )
+        if one_rm_match:
+            references[key] = {
+                "exercise_name": exercise_name,
+                "weight_kg": float(one_rm_match.group(1)),
+                "reps": 1,
+                "source": "current_user_turn_1rm",
+            }
     return references
+
+
+def _extract_structured_load_references_from_message(
+    message: str,
+    exercise_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    candidates: list[Any] = []
+    for block in re.findall(r"```(?:json)?\s*(.*?)```", message, flags=re.IGNORECASE | re.DOTALL):
+        candidates.append(_loads(block.strip(), None))
+    stripped = message.strip()
+    candidates.append(_loads(stripped, None))
+    if "{" in stripped and "}" in stripped:
+        candidates.append(_loads(stripped[stripped.find("{") : stripped.rfind("}") + 1], None))
+    for candidate in candidates:
+        references = _normalize_structured_load_references(_load_reference_items(candidate), exercise_names)
+        if references:
+            return references
+    return {}
+
+
+def _load_reference_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        raw_items = payload.get("load_references", payload.get("references", payload.get("exercise_load_references")))
+        if raw_items is None and {"exercise_name", "weight_kg"}.issubset(payload):
+            raw_items = [payload]
+    elif isinstance(payload, list):
+        raw_items = payload
+    else:
+        raw_items = None
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _normalize_structured_load_references(
+    items: list[dict[str, Any]],
+    exercise_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    allowed = {_normalize_exercise_name(name): name for name in exercise_names}
+    references: dict[str, dict[str, Any]] = {}
+    for item in items:
+        key = _normalize_exercise_name(str(item.get("exercise_name") or item.get("exercise") or item.get("name") or ""))
+        if key not in allowed:
+            continue
+        try:
+            weight = float(item.get("weight_kg"))
+        except (TypeError, ValueError):
+            continue
+        if weight <= 0:
+            continue
+        raw_type = str(item.get("type") or item.get("reference_type") or "").strip().lower().replace("-", "_").replace(" ", "_")
+        try:
+            reps = int(item.get("reps")) if item.get("reps") not in (None, "") else None
+        except (TypeError, ValueError):
+            reps = None
+        if raw_type in {"1rm", "1_rm", "one_rm", "one_rep_max", "max", "pr"}:
+            reps = 1
+            source = "current_user_turn_1rm"
+        elif raw_type in {"recent_set", "recent", "working_set", "set"}:
+            if reps is None or reps < 1:
+                continue
+            source = "current_user_turn_recent_performance"
+        else:
+            if reps is None:
+                continue
+            source = "current_user_turn_1rm" if reps == 1 else "current_user_turn_recent_performance"
+        references[key] = {
+            "exercise_name": allowed[key],
+            "weight_kg": weight,
+            "reps": reps,
+            "source": source,
+        }
+    return references
+
+
+def _exercise_aliases(exercise_name: str) -> list[str]:
+    aliases = [exercise_name]
+    normalized = exercise_name.lower()
+    if "overhead press" in normalized:
+        aliases.append("OHP")
+    if "back squat" in normalized:
+        aliases.append("squat")
+    return sorted(dict.fromkeys(aliases), key=len, reverse=True)
+
+
+def _exercise_message_segment(message: str, exercise_name: str, exercise_names: list[str]) -> str:
+    start = None
+    end_of_name = None
+    for alias in _exercise_aliases(exercise_name):
+        match = re.search(re.escape(alias), message, re.IGNORECASE)
+        if match and (start is None or match.start() < start):
+            start = match.start()
+            end_of_name = match.end()
+    if start is None or end_of_name is None:
+        return ""
+    end = min(len(message), start + 180)
+    for other_name in exercise_names:
+        if _normalize_exercise_name(other_name) == _normalize_exercise_name(exercise_name):
+            continue
+        for alias in _exercise_aliases(other_name):
+            match = re.search(re.escape(alias), message[end_of_name:], re.IGNORECASE)
+            if match:
+                end = min(end, end_of_name + match.start())
+    return message[start:end]
 
 
 def _next_monday(now: datetime) -> datetime:

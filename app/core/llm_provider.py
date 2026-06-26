@@ -543,7 +543,7 @@ class OpenAIProvider:
             previous_decisions=request.previous_decisions,
             raw_plan=request.raw_plan,
         )
-        return self._generate_json_object(prompt, max_tokens=3500, label="SOPStepExecutor")
+        return self._generate_json_object(prompt, max_tokens=8000, label="SOPStepExecutor")
 
     def update_program_plan(self, request: ProgramPlanUpdateRequest) -> dict[str, Any]:
         """Update the structured raw_plan from one SOP decision."""
@@ -555,7 +555,7 @@ class OpenAIProvider:
             collected_inputs=request.collected_inputs,
             previous_decisions=request.previous_decisions,
         )
-        return self._generate_json_object(prompt, max_tokens=6000, label="PlanUpdater")
+        return self._generate_json_object(prompt, max_tokens=8000, label="PlanUpdater")
 
     def extract_program_lift_maxes(self, request: ProgramLiftMaxExtractionRequest) -> dict[str, float]:
         """Extract current user-reported lift maxes through the LLM extractor node."""
