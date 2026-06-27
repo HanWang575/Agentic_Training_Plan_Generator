@@ -1535,7 +1535,7 @@ class ProgramService:
         weekly_workload: dict[str, float] = {str(week): 0.0 for week in range(1, weeks + 1)}
         sessions: list[dict[str, Any]] = []
         training_max_cache: dict[str, tuple[float | None, str]] = {}
-        slot_intensity_percent_cache: dict[str, float] = {}
+        slot_progression_kg_cache: dict[str, float] = {}
         slot_set_count_cache: dict[str, int] = {}
         for week in range(1, weeks + 1):
             for day_index, template in enumerate(templates, start=1):
@@ -1591,25 +1591,12 @@ class ProgramService:
                             f"Weighted exercise '{exercise.get('name', '')}' has no 1RM or recent performance record."
                         )
                     reps = exercise_reps
-                    raw_intensity = exercise.get("intensity_percent")
-                    raw_intensity_value = _coerce_float(raw_intensity, None)
-                    policy_base_intensity = _coerce_float(
-                        _first_present(
-                            exercise_policy,
-                            "base_intensity_percent_1rm",
-                            "base_intensity_range_percent_1rm",
-                            "week1_intensity_percent_1rm",
-                            "intensity_percent",
-                            "base_intensity",
-                        ),
-                        None,
-                    )
-                    base_intensity = float(max(1, min(100, policy_base_intensity if policy_base_intensity is not None else raw_intensity_value if raw_intensity_value is not None else 70)))
-                    weekly_progression_percent = _policy_week_float(
+                    raw_intensity_value = _coerce_float(exercise.get("intensity_percent"), None)
+                    weekly_estimated_progression_kg = _policy_week_float(
                         exercise_policy,
-                        "weekly_progression_percent",
+                        "weekly_estimated_progression_kg",
                         week,
-                        0 if is_deload_week else 1.5,
+                        0,
                     )
                     deload_intensity_reduction = _policy_week_float(
                         exercise_policy,
@@ -1632,12 +1619,6 @@ class ProgramService:
                     rep_trace = self._calculation(
                         trace_id, "calculate_expression", {"expression": str(reps), "unit": "reps"}, rep_source_refs
                     )
-                    intensity_trace = self._calculation(
-                        trace_id,
-                        "calculate_expression",
-                        {"expression": str(base_intensity), "unit": "%1RM"},
-                        ["programming_decision"],
-                    )
                     rest_trace = self._calculation(
                         trace_id,
                         "calculate_rest_interval",
@@ -1650,47 +1631,51 @@ class ProgramService:
                         trace_id, "calculate_expression", {"expression": str(rpe), "unit": "RPE"}, ["programming_decision"]
                     )
                     load_kg = None
-                    intensity = base_intensity
-                    trace_ids = [set_count_trace, rep_trace, intensity_trace, rest_trace, rpe_trace]
+                    intensity = raw_intensity_value
+                    trace_ids = [set_count_trace, rep_trace, rest_trace, rpe_trace]
                     if not is_bodyweight and one_rm:
-                        previous_progression_intensity = slot_intensity_percent_cache.get(slot_policy_key, base_intensity)
-                        progression_percent = 0 if week == 1 else weekly_progression_percent
-                        progressed = self._calculation(
-                            trace_id,
-                            "calculate_progression_increment",
-                            {
-                                "current_value": previous_progression_intensity,
-                                "percentage": progression_percent,
-                                "unit": "%1RM",
-                            },
-                            ["periodization_week", "sop_intensity_volume_policy"],
+                        cumulative_progression_kg = slot_progression_kg_cache.get(slot_policy_key, 0.0) + float(
+                            weekly_estimated_progression_kg or 0
                         )
-                        progressed_value = self.session.get(CalculationTrace, progressed)
-                        progressed_percent = float(_loads(progressed_value.result_json, {}).get("value", previous_progression_intensity))
-                        trace_ids.append(progressed)
-                        baseline_percent = min(progressed_percent, 100)
-                        effective_percent = baseline_percent
+                        slot_progression_kg_cache[slot_policy_key] = cumulative_progression_kg
+                        effective_one_rm_trace = self._calculation(
+                            trace_id,
+                            "calculate_expression",
+                            {
+                                "expression": f"{one_rm} + {cumulative_progression_kg}",
+                                "unit": "kg",
+                            },
+                            [one_rm_source, "sop_weekly_estimated_progression_kg"],
+                        )
+                        effective_one_rm = self._calculation_value(effective_one_rm_trace)
+                        intensity_from_reps_trace = self._calculation(
+                            trace_id,
+                            "calculate_reps_rpe_intensity",
+                            {"reps": int(reps), "target_rpe": rpe},
+                            ["set_reps", "target_rpe"],
+                        )
+                        load_percent = self._calculation_value(intensity_from_reps_trace)
+                        trace_ids.extend([effective_one_rm_trace, intensity_from_reps_trace])
                         if is_deload_week and deload_intensity_reduction:
                             deload_progressed = self._calculation(
                                 trace_id,
                                 "calculate_progression_increment",
                                 {
-                                    "current_value": baseline_percent,
+                                    "current_value": load_percent,
                                     "percentage": -max(0, min(100, deload_intensity_reduction)),
                                     "unit": "%1RM",
                                 },
                                 ["periodization_deload_week", "sop_intensity_volume_policy"],
                             )
                             deload_row = self.session.get(CalculationTrace, deload_progressed)
-                            effective_percent = float(_loads(deload_row.result_json, {}).get("value", baseline_percent))
+                            load_percent = float(_loads(deload_row.result_json, {}).get("value", load_percent))
                             trace_ids.append(deload_progressed)
-                        load_percent = min(effective_percent, 100)
-                        slot_intensity_percent_cache[slot_policy_key] = baseline_percent
+                        load_percent = min(load_percent, 100)
                         percentage_trace = self._calculation(
                             trace_id,
                             "calculate_percentage_load",
-                            {"one_rm": one_rm, "percentage": load_percent, "unit": "kg"},
-                            [one_rm_source, "program_intensity"],
+                            {"one_rm": effective_one_rm, "percentage": load_percent, "unit": "kg"},
+                            [effective_one_rm_trace, intensity_from_reps_trace],
                         )
                         percentage_row = self.session.get(CalculationTrace, percentage_trace)
                         unrounded = float(_loads(percentage_row.result_json, {}).get("value", 0))
@@ -2593,21 +2578,17 @@ def _intensity_volume_policy_from_sop_progress(sop_progress: dict[str, Any]) -> 
             continue
         policy = {
             "name": str(name),
-            "weekly_progression_percent": item.get("weekly_progression_percent"),
+            "weekly_estimated_progression_kg": _first_present(
+                item,
+                "weekly_estimated_progression_kg",
+                "weekly_progression_kg",
+            ),
             "deload_session_intensity_reduction_percent": _first_present(
                 item,
                 "deload_session_intensity_reduction_percent",
                 "deload_session_weight_reduction_percent",
             ),
             "deload_session_reps_reduction_percent": item.get("deload_session_reps_reduction_percent"),
-            "base_intensity_percent_1rm": _first_present(
-                item,
-                "base_intensity_percent_1rm",
-                "base_intensity_range_percent_1rm",
-                "week1_intensity_percent_1rm",
-                "intensity_percent",
-                "base_intensity",
-            ),
             "sets_per_week": item.get("sets_per_week"),
             "reps_per_set": item.get("reps_per_set"),
             "target_rpe": item.get("target_rpe"),

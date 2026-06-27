@@ -337,8 +337,10 @@ def test_calculators_are_deterministic_and_safe(tmp_path: Path):
     one_rm = calculators.run("estimate_repetition_max", {"weight": 100, "reps": 5})
     load = calculators.run("calculate_percentage_load", {"one_rm": one_rm.value, "percentage": 75})
     rounded = calculators.run("round_training_load", {"load": load.value, "increment": 2.5})
+    reps_rpe_intensity = calculators.run("calculate_reps_rpe_intensity", {"reps": 5, "target_rpe": 8})
 
     assert one_rm.value == pytest.approx(116.67, abs=0.01)
+    assert reps_rpe_intensity.value == pytest.approx(81.08, abs=0.01)
     assert rounded.value % 2.5 == 0
     with pytest.raises(ValueError):
         calculators.run("calculate_expression", {"expression": "__import__('os').system('echo no')"})
@@ -484,7 +486,14 @@ def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
         if item.tool_name == "calculate_percentage_load"
     ]
     assert any(json.loads(item.inputs_json).get("one_rm") == 115 for item in percentage_traces)
-    assert any("current_user_turn_1rm" in json.loads(item.source_references_json) for item in percentage_traces)
+    effective_one_rm_traces = [
+        item
+        for item in session.exec(select(CalculationTrace)).all()
+        if item.tool_name == "calculate_expression"
+        and json.loads(item.inputs_json).get("unit") == "kg"
+        and json.loads(item.result_json).get("value") == 115
+    ]
+    assert any("current_user_turn_1rm" in json.loads(item.source_references_json) for item in effective_one_rm_traces)
     step_traces = [item for item in session.exec(select(ProgramTrace)).all() if item.action == "write_step_output"]
     assert len(step_traces) == len(NEW_PROGRAM_SOP)
     context = service.get_context(response.context_id)
@@ -580,7 +589,9 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
                     "programming_intensity_and_volume": {
                         "bench_policy": {
                             "lift": "Bench Press",
-                            "weekly_progression_percent": [0, 10, 0, 10, 10],
+                            "reps_per_set": [6, 6, 6, 6, 6],
+                            "target_rpe": [7, 7, 5, 7, 7],
+                            "weekly_estimated_progression_kg": [0, 2, 0, 2, 2],
                             "deload_session_intensity_reduction_percent": [0, 0, 20, 0, 0],
                             "deload_session_reps_reduction_percent": [0, 0, 50, 0, 0],
                         }
@@ -615,19 +626,22 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
     assert calculated_periodization["deload_weeks"] == [3]
     assert calculated_periodization["week_policies"]["3"]["deload"] is True
     assert calculated_periodization["exercise_policy_count"] == 1
-    assert bench_set(1).intensity_percent == pytest.approx(72.0)
+    assert bench_set(1).intensity_percent == pytest.approx(76.92)
     assert bench_set(1).reps == 6
-    assert bench_set(2).intensity_percent == pytest.approx(79.2)
-    assert bench_set(3).intensity_percent == pytest.approx(63.36)
+    assert bench_set(1).load_kg == pytest.approx(88.5)
+    assert bench_set(2).intensity_percent == pytest.approx(76.92)
+    assert bench_set(2).load_kg == pytest.approx(90.0)
+    assert bench_set(3).intensity_percent == pytest.approx(63.16)
     assert bench_set(3).reps == 3
-    assert bench_set(4).intensity_percent == pytest.approx(87.12)
+    assert bench_set(4).intensity_percent == pytest.approx(76.92)
+    assert bench_set(4).load_kg == pytest.approx(91.5)
     progression_traces = [
         item
         for item in session.exec(select(CalculationTrace)).all()
         if item.tool_name == "calculate_progression_increment"
     ]
-    assert any(json.loads(item.inputs_json).get("percentage") == 10 for item in progression_traces)
     assert any(json.loads(item.inputs_json).get("percentage") == -20 for item in progression_traces)
+    assert any(item.tool_name == "calculate_reps_rpe_intensity" for item in session.exec(select(CalculationTrace)).all())
     session.close()
 
 
@@ -672,20 +686,18 @@ def test_session_specific_intensity_policy_distinguishes_repeated_lift_slots(tmp
                                 "session_index": 1,
                                 "exercise_order": 1,
                                 "lift": "Bench Press",
-                                "week1_intensity_percent_1rm": 70,
                                 "sets_per_week": [4, 4],
                                 "reps_per_set": [6, 6],
-                                "weekly_progression_percent": [0, 2],
+                                "weekly_estimated_progression_kg": [0, 2],
                                 "target_rpe": [7, 7.5],
                             },
                             {
                                 "session_index": 2,
                                 "exercise_order": 1,
                                 "lift": "Bench Press",
-                                "week1_intensity_percent_1rm": 85,
                                 "sets_per_week": [1, 1],
                                 "reps_per_set": [3, 2],
-                                "weekly_progression_percent": [0, 1],
+                                "weekly_estimated_progression_kg": [0, 1],
                                 "target_rpe": [8, 8.5],
                             },
                         ]
@@ -711,14 +723,14 @@ def test_session_specific_intensity_policy_distinguishes_repeated_lift_slots(tmp
         return planned_session["exercises"][0]["sets"][0]
 
     assert artifacts["calculated_periodization"]["session_exercise_policy_count"] == 2
-    assert bench_slot(1, 1)["intensity_percent"] == pytest.approx(70)
+    assert bench_slot(1, 1)["intensity_percent"] == pytest.approx(76.92)
     assert bench_slot(1, 1)["reps"] == 6
     assert bench_slot(1, 1)["rpe"] == pytest.approx(7)
-    assert bench_slot(1, 2)["intensity_percent"] == pytest.approx(85)
+    assert bench_slot(1, 2)["intensity_percent"] == pytest.approx(85.71)
     assert bench_slot(1, 2)["reps"] == 3
     assert bench_slot(1, 2)["rpe"] == pytest.approx(8)
-    assert bench_slot(2, 1)["intensity_percent"] == pytest.approx(71.4)
-    assert bench_slot(2, 2)["intensity_percent"] == pytest.approx(85.85)
+    assert bench_slot(2, 1)["intensity_percent"] == pytest.approx(77.92)
+    assert bench_slot(2, 2)["intensity_percent"] == pytest.approx(89.55)
     assert bench_slot(2, 2)["reps"] == 2
     session.close()
 
@@ -755,10 +767,9 @@ def test_deload_reps_reduction_applies_to_week_indexed_reps_without_zero_sets(tm
                             "session_index": 1,
                             "exercise_order": 1,
                             "lift": "Bench Press",
-                            "week1_intensity_percent_1rm": 70,
                             "sets_per_week": [3, 3, 0, 3],
                             "reps_per_set": [6, 6, 6, 6],
-                            "weekly_progression_percent": [0, 2, 0, 2],
+                            "weekly_estimated_progression_kg": [0, 2, 0, 2],
                             "deload_session_intensity_reduction_percent": [0, 0, 20, 0],
                             "deload_session_reps_reduction_percent": [0, 0, 50, 0],
                             "target_rpe": [7, 7.5, 5, 8],
@@ -782,9 +793,10 @@ def test_deload_reps_reduction_applies_to_week_indexed_reps_without_zero_sets(tm
     bench = week_3["exercises"][0]
     assert len(bench["sets"]) == 3
     assert bench["sets"][0]["reps"] == 3
-    assert bench["sets"][0]["intensity_percent"] == pytest.approx(57.12)
+    assert bench["sets"][0]["intensity_percent"] == pytest.approx(63.16)
     week_4 = next(item for item in artifacts["calculated_sessions"] if item["week_number"] == 4)
-    assert week_4["exercises"][0]["sets"][0]["intensity_percent"] == pytest.approx(72.83)
+    assert week_4["exercises"][0]["sets"][0]["intensity_percent"] == pytest.approx(78.95)
+    assert week_4["exercises"][0]["sets"][0]["load_kg"] == pytest.approx(94.0)
     session.close()
 
 
@@ -1242,8 +1254,8 @@ def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
         "conv_rationale",
         ProgramTurnRequest(user_id="usr_program", message="I want the exact calculation behind 75.24%"),
     )
-    assert "Selected Bench Press at 75.29%" in intensity_followup.response
-    assert "74.18 * (1 + 1.5 / 100) = 75.29%" in intensity_followup.response
+    assert "Selected Bench Press at 76.92%" in intensity_followup.response
+    assert "Bench Press 6 reps RPE 7.0" in intensity_followup.response
 
     original_updater = service.llm_provider.update_program_plan
 

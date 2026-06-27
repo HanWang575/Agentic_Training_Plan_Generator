@@ -225,15 +225,15 @@ Rules:
   "lift": "lift_name",
   "slot_role": "short role such as volume, intensity, technique, accessory, or deload",
   "weekly_primary_exposure": "short description",
-  "week1_intensity_percent_1rm": "number in 50-100 for every weighted exercise slot; never output 0/null/N/A for weighted exercises",
-  "sets_per_week": ["one integer per program week, range [1,20], deload behaviour should not be considered when setting this integer"],
-  "reps_per_set": ["one integer per program week, range [1,15], deload behaviour should not be considered when setting this integer"],
-  "weekly_progression_percent": ["one number per program week; percentage increase from the previous effective load, not from 1RM; week 1 must be 0; deload weeks must be 0, range [0,5]"],
-  "deload_session_intensity_reduction_percent": ["one number per program week; 0 for non-deload weeks, range [0, 100]"],
-  "deload_session_reps_reduction_percent": ["one number per program week; 0 for non-deload weeks, range [0, 100]"],
+  "sets_per_week": ["one integer per program week, range [1,20], deload behaviour should not be considered when setting this integer, for deload weeks the value should be the same as previous week"],
+  "reps_per_set": ["one integer per program week, range [1,15], deload behaviour should not be considered when setting this integer, for deload weeks the value should be the same as previous week"],
+  "weekly_estimated_progression_kg": ["one number per program week; expected increase in this exercise slot's estimated 1RM for that week, not cumulative; week 1 should usually be 0; deload weeks should usually be 0, choose in [0, 0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]"],
+  "deload_session_intensity_reduction_percent": ["one number per program week; must be 0 only for non-deload weeks, non-zero only for weeks in `deload_week_numbers`, range [0, 100]"],
+  "deload_session_reps_reduction_percent": ["one number per program week; must be 0 for non-deload weeks, non-zero only for weeks in `deload_week_numbers`, range [0, 100]"],
   "target_rpe": ["one number per program week, range [1, 10]"],
   "rationale": "explain the rationale behind briefly."}}.
-  Each list length must equal `decision.periodization.weeks`. Do not express deload/taper by setting `sets_per_week` to 0 or by pre-reducing `reps_per_set`; deload/taper is handled only by `deload_session_intensity_reduction_percent`, `deload_session_reps_reduction_percent`, lower `target_rpe`, and `weekly_progression_percent: 0`.
+  The deterministic calculator derives intensity_percent and load_kg from `reps_per_set`, `target_rpe`, and cumulative `weekly_estimated_progression_kg`; do not output `week1_intensity_percent_1rm`, `base_intensity_percent_1rm`, or `weekly_progression_percent`.
+  Each list length must equal `decision.periodization.weeks`. Do not express deload/taper by setting `sets_per_week` to 0 or by pre-reducing `reps_per_set`; deload/taper is handled only by `deload_session_intensity_reduction_percent`, `deload_session_reps_reduction_percent`, lower `target_rpe`, and `weekly_estimated_progression_kg: 0`.
   Use `sets_per_week: 0` only when the exercise slot is intentionally absent for a non-deload reason.
   For a repeated lift, `sets_per_week` is the weekly set count assigned to that specific session slot; the lift's total weekly set count is the sum of its slots.
 - Return JSON only.

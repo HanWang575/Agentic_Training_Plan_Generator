@@ -68,6 +68,21 @@ def calculate_percentage_load(one_rm: float, percentage: float) -> tuple[float, 
     return one_rm * percentage / 100, "one_rm * percentage / 100"
 
 
+def calculate_reps_rpe_intensity(reps: int, target_rpe: float) -> tuple[float, str]:
+    if reps < 1:
+        raise ValueError("reps must be at least 1.")
+    if not 1 <= target_rpe <= 10:
+        raise ValueError("target_rpe must be in [1, 10].")
+    rir = 10 - target_rpe
+    estimated_reps_to_failure = reps + rir
+    if estimated_reps_to_failure <= 1:
+        return 100.0, "estimated_reps_to_failure <= 1 ? 100 : 100 / (1 + estimated_reps_to_failure / 30)"
+    return (
+        100 / (1 + estimated_reps_to_failure / 30),
+        "100 / (1 + (reps + (10 - target_rpe)) / 30)",
+    )
+
+
 def round_training_load(load: float, increment: float) -> tuple[float, str]:
     if load < 0 or increment <= 0:
         raise ValueError("load cannot be negative and increment must be positive.")
@@ -151,6 +166,9 @@ class CalculatorService:
         if tool_name == "calculate_percentage_load":
             value, formula = calculate_percentage_load(float(inputs["one_rm"]), float(inputs["percentage"]))
             return round(value, 2), str(inputs.get("unit", "kg")), formula, "2 decimals"
+        if tool_name == "calculate_reps_rpe_intensity":
+            value, formula = calculate_reps_rpe_intensity(int(inputs["reps"]), float(inputs["target_rpe"]))
+            return round(value, 2), "%1RM", formula, "2 decimals"
         if tool_name == "round_training_load":
             increment = float(inputs.get("increment", self.settings.program_barbell_load_rounding_kg))
             value, formula = round_training_load(float(inputs["load"]), increment)
