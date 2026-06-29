@@ -289,12 +289,14 @@ Update the supplied raw_plan according to the current SOP decision.
 
 Rules:
 - Return the complete updated raw_plan JSON object, not a patch.
-- Preserve the raw_plan schema and keep templates.session, templates.exercise, and templates.set.
+- Preserve the raw_plan schema and keep templates.session and templates.exercise.
 - Fill, expand, compact, or update sessions/exercises/sets only as needed by the current SOP decision.
 - Keep one week of session templates in raw_plan.sessions; deterministic code expands them across weeks.
 - Every exercise must include load_type: "weighted" or "bodyweight".
+- All pull-up, chin-up, dip, and grip/tempo/paused/weighted/unweighted variations of those movements must use load_type: "weighted"; bodyweight-only versions use external load 0 kg during load-reference collection.
 - All weighted exercises must include none-zero intensity_percent, sets, reps, rpe, and rest_seconds proposals, but do not invent load_kg.
 - Bodyweight exercises may keep load_kg null.
+- Do not output sets_template; represent repeated identical sets with compact exercise-level sets, reps, rpe, and rest_seconds fields.
 - Do not add calculated session dates, generated IDs, calculation_trace_ids, or database fields.
 - Do not include screening, needs_analysis, periodization, planning_model, changed_elements, or unchanged_elements in raw_plan; those belong in sop_progress.decisions.
 - Return JSON only, with no markdown.

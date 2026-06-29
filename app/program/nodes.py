@@ -87,6 +87,8 @@ class SOPStepReadinessAssessor:
         completed_steps = progress.get("completed_steps", [])
         missing = [key for key in self.REQUIRED_INPUTS if inputs.get(key) in (None, "", [])]
         if step == "load_calculation":
+            if working.get("pending_bodyweight_clarification"):
+                missing.append("bodyweight_kg")
             missing.extend(
                 f"load_reference:{exercise_name}"
                 for exercise_name in working.get("pending_load_clarifications", [])

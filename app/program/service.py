@@ -288,6 +288,11 @@ class ProgramService:
                 collected,
                 memory_context.sections.get("profile", ""),
             )
+            working["pending_bodyweight_clarification"] = _missing_bodyweight_dependent_bodyweight(
+                working["raw_plan"],
+                collected,
+                memory_context.sections.get("profile", ""),
+            )
         sections[working_key] = working
         request_row.goal = str(collected.get("goal", "")) or None
         request_row.constraints_json = _dumps(
@@ -877,6 +882,13 @@ class ProgramService:
             extracted.update(self._extract_inputs_deterministic("", profile_text))
             extracted.update(self._extract_inputs_deterministic("", recent_status_text))
             extracted.update(self._extract_inputs_deterministic(message, ""))
+        bodyweight = (
+            _extract_bodyweight_kg(message)
+            or _extract_bodyweight_kg(recent_status_text)
+            or _extract_bodyweight_kg(profile_text)
+        )
+        if bodyweight is not None:
+            extracted["bodyweight_kg"] = bodyweight
         extracted.update(self._extract_lift_maxes(message))
         return extracted
 
@@ -904,6 +916,9 @@ class ProgramService:
             duration = re.search(r"typical_session_duration_minutes\D{0,4}(\d{2,3})", lowered)
         if duration:
             result["session_duration_minutes"] = min(180, max(20, int(duration.group(1))))
+        bodyweight = _extract_bodyweight_kg(combined)
+        if bodyweight is not None:
+            result["bodyweight_kg"] = bodyweight
         for level in ("beginner", "intermediate", "advanced"):
             if level in lowered:
                 result["experience"] = level
@@ -1044,10 +1059,11 @@ class ProgramService:
             "experience": "experience level (beginner, intermediate, or advanced)",
             "equipment": "available equipment",
             "screening": "current injuries, pain, medical limitations, or confirmation that none apply",
+            "bodyweight_kg": "current bodyweight in kg for pull-up/chin-up/dip loading",
         }
         standard_missing = [item for item in missing if not item.startswith("load_reference:")]
         load_missing = [item.split(":", 1)[1] for item in missing if item.startswith("load_reference:")]
-        requested_details = [labels[item] for item in standard_missing]
+        requested_details = [labels.get(item, item) for item in standard_missing]
         if load_missing:
             requested_details.append(
                 "load references for each weighted exercise listed in the template below"
@@ -1057,7 +1073,8 @@ class ProgramService:
             question += (
                 "\n\nChoose `1rm` when you know a current one-rep max, or `recent_set` when you know a recent "
                 "weighted set. Keep one object for each exercise and fill `weight_kg` plus `reps`; for `1rm`, "
-                "use `reps: 1`.\n\n```json\n"
+                "use `reps: 1`. For pull-up/chin-up/dip variations, `weight_kg` means external added load only; "
+                "use `0` for bodyweight sets.\n\n```json\n"
                 + json.dumps(_load_reference_template(load_missing), indent=2)
                 + "\n```"
             )
@@ -1183,7 +1200,12 @@ class ProgramService:
                     collected_inputs,
                     sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
                 )
-                if working["pending_load_clarifications"]:
+                working["pending_bodyweight_clarification"] = _missing_bodyweight_dependent_bodyweight(
+                    raw_plan,
+                    collected_inputs,
+                    sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
+                )
+                if working["pending_load_clarifications"] or working["pending_bodyweight_clarification"]:
                     sections[working_key] = working
                     sections["sop_progress"] = progress
                     self._checkpoint(context, sections)
@@ -1243,6 +1265,11 @@ class ProgramService:
             raw_plan = _strip_raw_plan_sop_metadata(updated_plan)
             working["raw_plan"] = raw_plan
             working["pending_load_clarifications"] = self._missing_weighted_load_references(
+                raw_plan,
+                collected_inputs,
+                sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
+            )
+            working["pending_bodyweight_clarification"] = _missing_bodyweight_dependent_bodyweight(
                 raw_plan,
                 collected_inputs,
                 sections.get("memory_context", {}).get("sections", {}).get("profile", ""),
@@ -1311,15 +1338,6 @@ class ProgramService:
                     "rpe": None,
                     "rest_seconds": None,
                     "notes": "",
-                    "sets_template": [],
-                },
-                "set": {
-                    "set_number": 1,
-                    "reps": 0,
-                    "load_kg": None,
-                    "intensity_percent": None,
-                    "rpe": None,
-                    "rest_seconds": None,
                 },
             },
             "sessions": [],
@@ -1333,7 +1351,7 @@ class ProgramService:
         templates = raw_plan.get("templates")
         if not isinstance(templates, dict):
             raise ValueError("PlanUpdater removed raw_plan.templates.")
-        for name in ("session", "exercise", "set"):
+        for name in ("session", "exercise"):
             if not isinstance(templates.get(name), dict):
                 raise ValueError(f"PlanUpdater removed raw_plan.templates.{name}.")
         sessions = raw_plan.get("sessions", [])
@@ -1362,7 +1380,7 @@ class ProgramService:
         bodyweight: set[str] = set()
         for session in artifacts.get("calculated_sessions", []):
             for exercise in session.get("exercises", []):
-                first_set = next(iter(exercise.get("sets", [])), {})
+                first_set = next(iter(_calculated_sets_for_exercise(exercise)), {})
                 name = str(exercise.get("name", ""))
                 if first_set.get("load_kg") is None:
                     bodyweight.add(name)
@@ -1400,7 +1418,7 @@ class ProgramService:
         rests: dict[str, dict[str, Any]] = {}
         for session in artifacts.get("calculated_sessions", []):
             for exercise in session.get("exercises", []):
-                first_set = next(iter(exercise.get("sets", [])), {})
+                first_set = next(iter(_calculated_sets_for_exercise(exercise)), {})
                 name = str(exercise.get("name", ""))
                 rests[name] = {"exercise": name, "rest_seconds": first_set.get("rest_seconds")}
         return list(rests.values())
@@ -1454,24 +1472,45 @@ class ProgramService:
         key = _normalize_exercise_name(exercise_name)
         if key in cache:
             return cache[key]
+        bodyweight = _bodyweight_kg(profile, inputs)
+        is_bodyweight_dependent = _is_bodyweight_dependent_weighted_exercise_name(exercise_name)
         one_rm, source = _one_rm_for_exercise(exercise_name, profile, inputs)
         if one_rm is not None:
+            if is_bodyweight_dependent:
+                if bodyweight is None:
+                    cache[key] = (None, "missing_bodyweight_for_total_load")
+                    return cache[key]
+                cache[key] = (one_rm + bodyweight, f"{source}_external_load_plus_bodyweight")
+                return cache[key]
             cache[key] = (one_rm, source)
             return cache[key]
         reference = inputs.get("exercise_load_references", {}).get(key)
         if not reference:
             cache[key] = (None, "missing_load_reference")
             return cache[key]
-        weight = float(reference["weight_kg"])
+        external_weight = float(reference["weight_kg"])
         reps = int(reference.get("reps", 1))
+        if is_bodyweight_dependent:
+            if bodyweight is None:
+                cache[key] = (None, "missing_bodyweight_for_total_load")
+                return cache[key]
+            weight = bodyweight + external_weight
+        else:
+            weight = external_weight
         if reps == 1:
-            cache[key] = (weight, f"user_reported_1rm:{key}")
+            source_label = "user_reported_1rm_total_load" if is_bodyweight_dependent else "user_reported_1rm"
+            cache[key] = (weight, f"{source_label}:{key}")
             return cache[key]
         estimate_trace = self._calculation(
             trace_id,
             "estimate_repetition_max",
             {"weight": weight, "reps": reps, "method": "epley", "unit": "kg"},
-            [f"user_reported_recent_performance:{key}"],
+            [
+                f"user_reported_recent_performance:{key}",
+                "bodyweight_dependent_total_load_uses_bodyweight_plus_external_load"
+                if is_bodyweight_dependent
+                else "external_load_reference",
+            ],
         )
         estimated = self._calculation_value(estimate_trace)
         cache[key] = (estimated, estimate_trace)
@@ -1574,11 +1613,12 @@ class ProgramService:
                     set_count_trace = self._calculation(
                         trace_id, "calculate_expression", {"expression": str(sets_count), "unit": "sets"}, set_source_refs
                     )
-                    sets = []
                     exercise_load = None
                     policy_reps = _policy_week_int(exercise_policy, "reps_per_set", week, None)
                     exercise_reps = int(max(1, min(100, policy_reps if policy_reps is not None else exercise.get("reps", 8))))
                     is_bodyweight = _is_bodyweight_exercise(exercise)
+                    is_bodyweight_dependent = _is_bodyweight_dependent_weighted_exercise_name(exercise_name)
+                    bodyweight = _bodyweight_kg(profile, inputs)
                     one_rm, one_rm_source = self._training_max_for_exercise(
                         exercise_name,
                         profile,
@@ -1679,35 +1719,53 @@ class ProgramService:
                         )
                         percentage_row = self.session.get(CalculationTrace, percentage_trace)
                         unrounded = float(_loads(percentage_row.result_json, {}).get("value", 0))
+                        rounding_input_load = unrounded
+                        rounding_source_refs: list[Any] = [percentage_trace]
+                        if is_bodyweight_dependent and bodyweight is not None:
+                            external_trace = self._calculation(
+                                trace_id,
+                                "calculate_expression",
+                                {
+                                    "expression": f"{unrounded} - {bodyweight}",
+                                    "unit": "kg",
+                                },
+                                [percentage_trace, "bodyweight_dependent_display_load_subtracts_bodyweight"],
+                            )
+                            external_unrounded = self._calculation_value(external_trace)
+                            rounding_input_load = max(0.0, external_unrounded)
+                            rounding_source_refs.append(external_trace)
                         rounded_trace = self._calculation(
                             trace_id,
                             "round_training_load",
                             {
-                                "load": unrounded,
+                                "load": rounding_input_load,
                                 "increment": self._load_rounding_increment(str(exercise.get("name", "")), inputs),
                                 "unit": "kg",
                             },
-                            [percentage_trace],
+                            rounding_source_refs,
                         )
                         rounded_row = self.session.get(CalculationTrace, rounded_trace)
                         load_kg = float(_loads(rounded_row.result_json, {}).get("value", 0))
-                        exercise_load = load_kg
-                        intensity = load_percent
-                        trace_ids.extend([percentage_trace, rounded_trace])
-                    rest_seconds = int(self._calculation_value(rest_trace))
-                    for set_number in range(1, sets_count + 1):
-                        sets.append(
-                            {
-                                "set_id": f"pset_{uuid4().hex[:12]}",
-                                "set_number": set_number,
-                                "reps": reps,
-                                "load_kg": load_kg,
-                                "intensity_percent": intensity,
-                                "rpe": rpe,
-                                "rest_seconds": rest_seconds,
-                                "calculation_trace_ids": list(trace_ids),
-                            }
+                        exercise_load = (
+                            bodyweight + load_kg
+                            if is_bodyweight_dependent and bodyweight is not None
+                            else load_kg
                         )
+                        intensity = load_percent
+                        trace_ids.extend([item for item in rounding_source_refs if item != percentage_trace] + [percentage_trace, rounded_trace])
+                    rest_seconds = int(self._calculation_value(rest_trace))
+                    set_groups = [
+                        {
+                            "count": sets_count,
+                            "start_set_number": 1,
+                            "reps": reps,
+                            "load_kg": load_kg,
+                            "intensity_percent": intensity,
+                            "rpe": rpe,
+                            "rest_seconds": rest_seconds,
+                            "calculation_trace_ids": list(trace_ids),
+                        }
+                    ]
                     if exercise_load is not None:
                         volume_trace = self._calculation(
                             trace_id,
@@ -1737,7 +1795,7 @@ class ProgramService:
                             "volume": volume_value,
                             "volume_unit": volume_unit,
                             "calculation_trace_ids": [set_count_trace, volume_trace],
-                            "sets": sets,
+                            "set_groups": set_groups,
                         }
                     )
                 sessions.append(
@@ -1926,7 +1984,7 @@ class ProgramService:
                 calculation_trace_ids_json=_dumps(exercise_data.get("calculation_trace_ids", [])),
             )
             self.session.add(exercise)
-            for set_data in exercise_data["sets"]:
+            for set_data in _calculated_sets_for_exercise(exercise_data):
                 self.session.add(
                     SetPrescription(
                         set_prescription_id=set_data["set_id"],
@@ -2416,6 +2474,12 @@ def _stringify_memory_context_section(value: Any) -> str:
 def _compact_calculated_plan_working_state(working: dict[str, Any]) -> dict[str, Any]:
     compacted = dict(working)
     compacted.pop("step_outputs", None)
+    if isinstance(compacted.get("raw_plan"), dict):
+        compacted["raw_plan"] = _strip_raw_plan_set_details(compacted["raw_plan"])
+    if isinstance(compacted.get("calculation_artifacts"), dict):
+        compacted["calculation_artifacts"] = _compact_calculation_artifacts_set_groups(
+            compacted["calculation_artifacts"]
+        )
     if "calculated_plan" not in compacted or compacted.get("calculation_artifacts"):
         return compacted
     calculated_plan = compacted.get("calculated_plan")
@@ -2437,7 +2501,7 @@ def _calculation_artifacts_from_calculated_plan(
     calculated_periodization = calculated_plan.get("periodization", {})
     return {
         "schema": "calculated_plan_delta_v1",
-        "calculated_sessions": calculated_plan.get("sessions", []),
+        "calculated_sessions": _compact_calculated_sessions_set_groups(calculated_plan.get("sessions", [])),
         "calculated_periodization": {
             key: value
             for key, value in calculated_periodization.items()
@@ -2460,7 +2524,167 @@ def _strip_raw_plan_sop_metadata(raw_plan: dict[str, Any]) -> dict[str, Any]:
     cleaned = dict(raw_plan or {})
     for key in RAW_PLAN_SOP_METADATA_KEYS:
         cleaned.pop(key, None)
+    return _strip_raw_plan_set_details(cleaned)
+
+
+def _strip_raw_plan_set_details(raw_plan: dict[str, Any]) -> dict[str, Any]:
+    """Drop pre-calculation set templates from raw_plan; materialization expands sets deterministically."""
+
+    cleaned = dict(raw_plan or {})
+    templates = cleaned.get("templates")
+    if isinstance(templates, dict):
+        templates = dict(templates)
+        templates.pop("set", None)
+        exercise_template = templates.get("exercise")
+        if isinstance(exercise_template, dict):
+            exercise_template = dict(exercise_template)
+            exercise_template.pop("sets_template", None)
+            templates["exercise"] = exercise_template
+        cleaned["templates"] = templates
+
+    sessions = cleaned.get("sessions")
+    if isinstance(sessions, list):
+        cleaned_sessions = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                cleaned_sessions.append(session)
+                continue
+            session_copy = dict(session)
+            exercises = session_copy.get("exercises")
+            if isinstance(exercises, list):
+                cleaned_exercises = []
+                for exercise in exercises:
+                    if isinstance(exercise, dict):
+                        exercise_copy = dict(exercise)
+                        exercise_copy.pop("sets_template", None)
+                        cleaned_exercises.append(exercise_copy)
+                    else:
+                        cleaned_exercises.append(exercise)
+                session_copy["exercises"] = cleaned_exercises
+            cleaned_sessions.append(session_copy)
+        cleaned["sessions"] = cleaned_sessions
     return cleaned
+
+
+def _calculated_sets_for_exercise(exercise: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return expanded calculated set rows from either legacy sets or compact set_groups."""
+
+    sets = exercise.get("sets")
+    if isinstance(sets, list):
+        return [dict(item) for item in sets if isinstance(item, dict)]
+
+    expanded: list[dict[str, Any]] = []
+    groups = exercise.get("set_groups")
+    if not isinstance(groups, list):
+        return expanded
+    next_set_number = 1
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        count = int(max(0, _coerce_float(group.get("count") or group.get("sets"), 0)))
+        start = int(max(1, _coerce_float(group.get("start_set_number"), next_set_number)))
+        for offset in range(count):
+            set_data = {
+                "set_id": f"pset_{uuid4().hex[:12]}",
+                "set_number": start + offset,
+                "reps": group.get("reps"),
+                "load_kg": group.get("load_kg"),
+                "intensity_percent": group.get("intensity_percent"),
+                "rpe": group.get("rpe"),
+                "rest_seconds": group.get("rest_seconds"),
+                "calculation_trace_ids": list(group.get("calculation_trace_ids", [])),
+            }
+            expanded.append(set_data)
+        next_set_number = start + count
+    return expanded
+
+
+def _compact_calculation_artifacts_set_groups(artifacts: dict[str, Any]) -> dict[str, Any]:
+    compacted = dict(artifacts)
+    compacted["calculated_sessions"] = _compact_calculated_sessions_set_groups(
+        compacted.get("calculated_sessions", [])
+    )
+    return compacted
+
+
+def _compact_calculated_sessions_set_groups(sessions: Any) -> list[dict[str, Any]]:
+    if not isinstance(sessions, list):
+        return []
+    compacted_sessions: list[dict[str, Any]] = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_copy = dict(session)
+        exercises = session_copy.get("exercises")
+        if isinstance(exercises, list):
+            session_copy["exercises"] = [_compact_calculated_exercise_set_groups(item) for item in exercises]
+        compacted_sessions.append(session_copy)
+    return compacted_sessions
+
+
+def _compact_calculated_exercise_set_groups(exercise: Any) -> Any:
+    if not isinstance(exercise, dict):
+        return exercise
+    exercise_copy = dict(exercise)
+    sets = exercise_copy.pop("sets", None)
+    if isinstance(sets, list):
+        exercise_copy["set_groups"] = _group_calculated_sets(sets)
+    return exercise_copy
+
+
+def _group_calculated_sets(sets: list[Any]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    current_key: tuple[Any, ...] | None = None
+    current_group: dict[str, Any] | None = None
+    for set_data in sets:
+        if not isinstance(set_data, dict):
+            continue
+        trace_ids = tuple(set_data.get("calculation_trace_ids") or [])
+        key = (
+            set_data.get("reps"),
+            set_data.get("load_kg"),
+            set_data.get("intensity_percent"),
+            set_data.get("rpe"),
+            set_data.get("rest_seconds"),
+            trace_ids,
+        )
+        set_number = int(set_data.get("set_number") or ((current_group or {}).get("count", 0) + 1))
+        if current_group is None or key != current_key:
+            current_group = {
+                "count": 1,
+                "start_set_number": set_number,
+                "reps": set_data.get("reps"),
+                "load_kg": set_data.get("load_kg"),
+                "intensity_percent": set_data.get("intensity_percent"),
+                "rpe": set_data.get("rpe"),
+                "rest_seconds": set_data.get("rest_seconds"),
+                "calculation_trace_ids": list(trace_ids),
+            }
+            groups.append(current_group)
+            current_key = key
+        else:
+            current_group["count"] = int(current_group.get("count", 0)) + 1
+    return groups
+
+
+def _expand_calculated_sessions_set_groups(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expanded_sessions: list[dict[str, Any]] = []
+    for session in sessions:
+        session_copy = dict(session)
+        exercises = session_copy.get("exercises")
+        if isinstance(exercises, list):
+            expanded_exercises = []
+            for exercise in exercises:
+                if not isinstance(exercise, dict):
+                    expanded_exercises.append(exercise)
+                    continue
+                exercise_copy = dict(exercise)
+                exercise_copy["sets"] = _calculated_sets_for_exercise(exercise_copy)
+                exercise_copy.pop("set_groups", None)
+                expanded_exercises.append(exercise_copy)
+            session_copy["exercises"] = expanded_exercises
+        expanded_sessions.append(session_copy)
+    return expanded_sessions
 
 
 def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict[str, Any]) -> dict[str, Any]:
@@ -2491,7 +2715,7 @@ def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict
         "rationale": metadata["rationale"],
         "assumptions": metadata["assumptions"],
         "warnings": metadata["warnings"],
-        "sessions": calculated_sessions,
+        "sessions": _expand_calculated_sessions_set_groups(calculated_sessions),
     }
 
 
@@ -3266,6 +3490,14 @@ def _one_rm_for_exercise(
         "deadlift": "deadlift_1rm_kg",
         "overhead": "overhead_press_1rm_kg",
     }
+    if _is_bodyweight_dependent_weighted_exercise_name(exercise_name):
+        keys = {
+            "weighted pull": "weighted_pull_up_1rm_kg",
+            "pull": "pull_up_1rm_kg",
+            "chin": "chin_up_1rm_kg",
+            "weighted dip": "weighted_dip_1rm_kg",
+            "dip": "dip_1rm_kg",
+        }
     for term, key in keys.items():
         if term not in normalized:
             continue
@@ -3281,8 +3513,74 @@ def _normalize_exercise_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
+def _is_bodyweight_dependent_weighted_exercise_name(name: str) -> bool:
+    text = re.sub(r"[^a-z0-9]+", " ", name.lower())
+    tokens = set(text.split())
+    compact = text.replace(" ", "")
+    if "pullover" in compact or "latpulldown" in compact or "pulldown" in compact:
+        return False
+    has_pull_up = ("pull" in tokens and "up" in tokens) or "pullup" in compact
+    has_chin_up = ("chin" in tokens and "up" in tokens) or "chinup" in compact
+    has_dip = (
+        "dip" in tokens
+        or "dips" in tokens
+        or compact in {"dip", "dips"}
+        or compact.endswith("dip")
+        or compact.endswith("dips")
+        or any(pattern in compact for pattern in ("weighteddip", "ringdip", "bardip", "chestdip", "tricepsdip"))
+    )
+    return has_pull_up or has_chin_up or has_dip
+
+
+def _extract_bodyweight_kg(text: str) -> float | None:
+    if not text:
+        return None
+    patterns = (
+        r"\bcurrent_bodyweight_kg\b\D{0,8}(\d+(?:\.\d+)?)",
+        r"\bbodyweight_today_kg\b\D{0,8}(\d+(?:\.\d+)?)",
+        r"\bbody\s*weight\b\D{0,12}(\d+(?:\.\d+)?)\s*kg\b",
+        r"\bbodyweight\b\D{0,12}(\d+(?:\.\d+)?)\s*kg\b",
+        r"\bbw\b\D{0,8}(\d+(?:\.\d+)?)\s*kg\b",
+        r"\bweigh(?:s|ing)?\D{0,12}(\d+(?:\.\d+)?)\s*kg\b",
+        r"\bbody\s*mass\b\D{0,12}(\d+(?:\.\d+)?)\s*kg\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = float(match.group(1))
+        if 20 <= value <= 300:
+            return value
+    return None
+
+
+def _bodyweight_kg(profile: str, inputs: dict[str, Any] | None = None) -> float | None:
+    if inputs and inputs.get("bodyweight_kg") not in (None, ""):
+        try:
+            value = float(inputs["bodyweight_kg"])
+            if 20 <= value <= 300:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return _extract_bodyweight_kg(profile)
+
+
+def _raw_plan_has_bodyweight_dependent_weighted_exercise(raw_plan: dict[str, Any]) -> bool:
+    for session in raw_plan.get("sessions", []):
+        for exercise in session.get("exercises", []):
+            if _is_bodyweight_dependent_weighted_exercise_name(str(exercise.get("name", ""))):
+                return True
+    return False
+
+
+def _missing_bodyweight_dependent_bodyweight(raw_plan: dict[str, Any], inputs: dict[str, Any], profile: str) -> bool:
+    return _raw_plan_has_bodyweight_dependent_weighted_exercise(raw_plan) and _bodyweight_kg(profile, inputs) is None
+
+
 def _is_bodyweight_exercise(exercise: dict[str, Any]) -> bool:
     load_type = str(exercise.get("load_type", "")).strip().lower()
+    if _is_bodyweight_dependent_weighted_exercise_name(f"{exercise.get('name', '')} {exercise.get('notes', '')}"):
+        return False
     if load_type == "weighted":
         return False
     if load_type == "bodyweight":
@@ -3334,6 +3632,20 @@ def _extract_exercise_load_references(
         segment = _exercise_message_segment(message, exercise_name, exercise_names)
         if not segment:
             continue
+        if _is_bodyweight_dependent_weighted_exercise_name(exercise_name):
+            bodyweight_match = re.search(
+                r"(?:body\s*weight|bodyweight|self[-\s]*weight|\bbw\b|0\s*kg)\s*(?:x|for)?\s*(\d+)\s*(?:reps?)?",
+                segment,
+                re.IGNORECASE,
+            )
+            if bodyweight_match:
+                references[key] = {
+                    "exercise_name": exercise_name,
+                    "weight_kg": 0.0,
+                    "reps": int(bodyweight_match.group(1)),
+                    "source": "current_user_turn_recent_performance",
+                }
+                continue
         performance_match = re.search(
             r"(\d+(?:\.\d+)?)\s*kg\s*(?:x|for)\s*(\d+)\s*(?:reps?)?",
             segment,
@@ -3414,7 +3726,8 @@ def _normalize_structured_load_references(
             weight = float(item.get("weight_kg"))
         except (TypeError, ValueError):
             continue
-        if weight <= 0:
+        is_bodyweight_dependent = _is_bodyweight_dependent_weighted_exercise_name(allowed[key])
+        if weight < 0 or (weight == 0 and not is_bodyweight_dependent):
             continue
         raw_type = str(item.get("type") or item.get("reference_type") or "").strip().lower().replace("-", "_").replace(" ", "_")
         try:

@@ -66,7 +66,7 @@ class ProgramVersionResponse(BaseModel):
 class ProgramLoadReferenceInput(BaseModel):
     exercise_name: str = Field(min_length=1)
     type: Literal["1rm", "recent_set"]
-    weight_kg: float = Field(gt=0)
+    weight_kg: float = Field(ge=0)
     reps: int | None = Field(default=None, ge=1)
 
 

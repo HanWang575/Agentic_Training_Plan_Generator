@@ -199,7 +199,6 @@ class FakeProgramProvider:
             {
                 "session": {"name": "", "goal": "", "duration_minutes": inputs.get("session_duration_minutes", 60), "exercises": []},
                 "exercise": {"name": "", "mode": "resistance", "load_type": "weighted", "sets": 0, "reps": 0},
-                "set": {"set_number": 1, "reps": 0, "load_kg": None},
             },
         )
         return plan
@@ -720,7 +719,7 @@ def test_session_specific_intensity_policy_distinguishes_repeated_lift_slots(tmp
         planned_session = next(
             item for item in artifacts["calculated_sessions"] if item["week_number"] == week and item["day_number"] == day
         )
-        return planned_session["exercises"][0]["sets"][0]
+        return planned_session["exercises"][0]["set_groups"][0]
 
     assert artifacts["calculated_periodization"]["session_exercise_policy_count"] == 2
     assert bench_slot(1, 1)["intensity_percent"] == pytest.approx(76.92)
@@ -791,12 +790,12 @@ def test_deload_reps_reduction_applies_to_week_indexed_reps_without_zero_sets(tm
 
     week_3 = next(item for item in artifacts["calculated_sessions"] if item["week_number"] == 3)
     bench = week_3["exercises"][0]
-    assert len(bench["sets"]) == 3
-    assert bench["sets"][0]["reps"] == 3
-    assert bench["sets"][0]["intensity_percent"] == pytest.approx(63.16)
+    assert bench["set_groups"][0]["count"] == 3
+    assert bench["set_groups"][0]["reps"] == 3
+    assert bench["set_groups"][0]["intensity_percent"] == pytest.approx(63.16)
     week_4 = next(item for item in artifacts["calculated_sessions"] if item["week_number"] == 4)
-    assert week_4["exercises"][0]["sets"][0]["intensity_percent"] == pytest.approx(78.95)
-    assert week_4["exercises"][0]["sets"][0]["load_kg"] == pytest.approx(94.0)
+    assert week_4["exercises"][0]["set_groups"][0]["intensity_percent"] == pytest.approx(78.95)
+    assert week_4["exercises"][0]["set_groups"][0]["load_kg"] == pytest.approx(94.0)
     session.close()
 
 
@@ -871,6 +870,26 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
                         "rpe": 7,
                         "rest_seconds": 120,
                     },
+                    {
+                        "name": "Weighted Dip",
+                        "mode": "resistance",
+                        "load_type": "weighted",
+                        "sets": 3,
+                        "reps": 6,
+                        "intensity_percent": 75,
+                        "rpe": 8,
+                        "rest_seconds": 150,
+                    },
+                    {
+                        "name": "Dip",
+                        "mode": "resistance",
+                        "load_type": "bodyweight",
+                        "sets": 3,
+                        "reps": 10,
+                        "intensity_percent": 70,
+                        "rpe": 7,
+                        "rest_seconds": 120,
+                    },
                 ]
             )
         return plan
@@ -888,20 +907,42 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
     )
     assert waiting.status == "waiting_for_user"
     assert "Weighted Pull-Up" in waiting.response
+    assert "Pull-Up" in waiting.response
+    assert "Weighted Dip" in waiting.response
+    assert "Dip" in waiting.response
+    assert "bodyweight" in waiting.response
     assert "load_references" in waiting.response
 
     draft = service.process_turn(
         "conv_weighted_clarification",
         ProgramTurnRequest(
             user_id="usr_program",
-            message="Submitted structured load references.",
+            message="Submitted structured load references. My bodyweight is 80 kg.",
             load_references=[
                 {
                     "exercise_name": "Weighted Pull-Up",
                     "type": "recent_set",
                     "weight_kg": 40,
                     "reps": 5,
-                }
+                },
+                {
+                    "exercise_name": "Pull-Up",
+                    "type": "recent_set",
+                    "weight_kg": 0,
+                    "reps": 12,
+                },
+                {
+                    "exercise_name": "Weighted Dip",
+                    "type": "recent_set",
+                    "weight_kg": 30,
+                    "reps": 6,
+                },
+                {
+                    "exercise_name": "Dip",
+                    "type": "recent_set",
+                    "weight_kg": 0,
+                    "reps": 15,
+                },
             ],
         ),
     )
@@ -914,21 +955,40 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
         if exercise.name == "Weighted Pull-Up"
         for prescribed_set in exercise.sets
     ]
-    bodyweight_sets = [
+    pullup_sets = [
         prescribed_set
         for planned_session in version.sessions
         for exercise in planned_session.exercises
         if exercise.name == "Pull-Up"
         for prescribed_set in exercise.sets
     ]
+    weighted_dip_sets = [
+        prescribed_set
+        for planned_session in version.sessions
+        for exercise in planned_session.exercises
+        if exercise.name == "Weighted Dip"
+        for prescribed_set in exercise.sets
+    ]
+    dip_sets = [
+        prescribed_set
+        for planned_session in version.sessions
+        for exercise in planned_session.exercises
+        if exercise.name == "Dip"
+        for prescribed_set in exercise.sets
+    ]
     assert weighted_sets and all(item.load_kg is not None for item in weighted_sets)
-    assert bodyweight_sets and all(item.load_kg is None for item in bodyweight_sets)
+    assert pullup_sets and all(item.load_kg is not None for item in pullup_sets)
+    assert weighted_dip_sets and all(item.load_kg is not None for item in weighted_dip_sets)
+    assert dip_sets and all(item.load_kg is not None for item in dip_sets)
     estimate_traces = [
         item
         for item in session.exec(select(CalculationTrace)).all()
         if item.tool_name == "estimate_repetition_max"
     ]
-    assert any(json.loads(item.inputs_json) == {"weight": 40.0, "reps": 5, "method": "epley", "unit": "kg"} for item in estimate_traces)
+    assert any(json.loads(item.inputs_json) == {"weight": 120.0, "reps": 5, "method": "epley", "unit": "kg"} for item in estimate_traces)
+    assert any(json.loads(item.inputs_json) == {"weight": 80.0, "reps": 12, "method": "epley", "unit": "kg"} for item in estimate_traces)
+    assert any(json.loads(item.inputs_json) == {"weight": 110.0, "reps": 6, "method": "epley", "unit": "kg"} for item in estimate_traces)
+    assert any(json.loads(item.inputs_json) == {"weight": 80.0, "reps": 15, "method": "epley", "unit": "kg"} for item in estimate_traces)
     session.close()
 
 
@@ -1289,7 +1349,20 @@ def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
         return plan
 
     service.llm_provider.update_program_plan = plan_with_bodyweight_pullups
-    pullup_draft = _start_new_program(service, "conv_pullup_rationale")
+    pullup_waiting = _start_new_program(service, "conv_pullup_rationale")
+    assert pullup_waiting.status == "waiting_for_user"
+    pullup_draft = service.process_turn(
+        "conv_pullup_rationale",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="My bodyweight is 80 kg; pull-up references are bodyweight sets.",
+            load_references=[
+                {"exercise_name": "Pull-Up", "type": "recent_set", "weight_kg": 0, "reps": 25},
+                {"exercise_name": "Paused Pull-Up", "type": "recent_set", "weight_kg": 0, "reps": 8},
+            ],
+        ),
+    )
+    assert pullup_draft.status == "waiting_for_review"
     pullup_rationale = service.process_turn(
         "conv_pullup_rationale",
         ProgramTurnRequest(
@@ -1306,8 +1379,8 @@ def test_rationale_is_read_only_and_red_flags_block_planning(tmp_path: Path):
         "I can do more than 25 self-weight pull ups in a row. Why 6 reps pull-ups and 4 reps paused pull-ups at rpe 7?",
     )
     matched = facts["matched_prescriptions"]
-    assert any(item["exercise"] == "Pull-Up" and item["reps"] == 6 and item["load_kg"] is None for item in matched)
-    assert any(item["exercise"] == "Paused Pull-Up" and item["reps"] == 4 and item["load_kg"] is None for item in matched)
+    assert any(item["exercise"] == "Pull-Up" and item["reps"] == 6 and item["load_kg"] is not None for item in matched)
+    assert any(item["exercise"] == "Paused Pull-Up" and item["reps"] == 4 and item["load_kg"] is not None for item in matched)
     assert facts["reported_bodyweight_performance"][0]["reps"] == 25
     assert "Overhead Press" not in pullup_rationale.response
     assert "Pull-Up 6 reps RPE 7.0" in pullup_rationale.response
