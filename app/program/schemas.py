@@ -74,6 +74,7 @@ class ProgramTurnRequest(BaseModel):
     user_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
     load_references: list[ProgramLoadReferenceInput] = Field(default_factory=list)
+    required_inputs: dict[str, Any] = Field(default_factory=dict)
     expected_context_revision: int | None = None
 
 

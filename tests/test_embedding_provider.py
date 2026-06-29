@@ -7,6 +7,8 @@ import pytest
 from app.core.llm_provider import (
     AnswerRequest,
     OpenAIProvider,
+    ProgramEvidenceQueryPlanRequest,
+    ProgramInputExtractionRequest,
     ProgramPlanUpdateRequest,
     ProgramSOPStepDecisionRequest,
     StructuredOutputError,
@@ -333,3 +335,78 @@ def test_program_sop_step_executor_has_room_for_long_intensity_decision():
     )
 
     assert fake_client.chat.completions.requests[0]["max_tokens"] == 8000
+
+
+def test_program_evidence_query_planner_returns_clean_queries():
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    fake_client = FakeSequenceChatClient(
+        [
+            (
+                '{"queries":['
+                '{"query":"strength training sets reps RPE deload","purpose":"intensity evidence"},'
+                '{"query":"strength training sets reps RPE deload","purpose":"duplicate"},'
+                '{"query":"bad","purpose":"too short"}'
+                '],"rationale":"step-specific"}'
+            )
+        ]
+    )
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    result = provider.plan_program_evidence_queries(
+        ProgramEvidenceQueryPlanRequest(
+            sop_step="programming_intensity_and_volume",
+            user_message="Create a strength plan.",
+            collected_inputs={"goal": "strength"},
+            relevant_previous_decisions={"periodization": {"weeks": 12}},
+            attempt=1,
+        )
+    )
+
+    assert result.queries == [
+        {"query": "strength training sets reps RPE deload", "purpose": "intensity evidence"}
+    ]
+    assert result.rationale == "step-specific"
+    assert fake_client.chat.completions.requests[0]["max_tokens"] == 800
+
+
+def test_program_input_extractor_accepts_expanded_required_inputs():
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    fake_client = FakeSequenceChatClient(
+        [
+            (
+                '{"inputs":{"goal":"strength","physiological_priorities":["strength","power"],'
+                '"age":29,"sex":"male","height_cm":175,"bodyweight_kg":80,'
+                '"medical_history":"none","baseline_assessments":{"bench_1rm_kg":115},'
+                '"lifestyle_work_demands":"desk job","days_per_week":3,'
+                '"training_days":["Monday","Wednesday","Friday"],"session_duration_minutes":60,'
+                '"program_duration_weeks":8,"experience":"intermediate","equipment":"full gym",'
+                '"screening":"clear"}}'
+            )
+        ]
+    )
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    result = provider.extract_program_inputs(
+        ProgramInputExtractionRequest(user_message="Create a plan")
+    )
+
+    assert result["physiological_priorities"] == ["strength", "power"]
+    assert result["age"] == 29
+    assert result["sex"] == "male"
+    assert result["height_cm"] == 175
+    assert result["bodyweight_kg"] == 80
+    assert result["baseline_assessments"] == {"bench_1rm_kg": 115}
+    assert result["training_days"] == ["monday", "wednesday", "friday"]
+    assert result["program_duration_weeks"] == 8

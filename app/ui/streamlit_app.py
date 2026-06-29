@@ -1,8 +1,10 @@
 """Minimal Streamlit UI for local review, chat, and trace inspection."""
 
 import json
+import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
@@ -28,6 +30,28 @@ TRAINING_SPORT_TYPES = [
     "other anaerobic exercise",
     "other Mixed Aerobic-Anaerobic Exercise",
 ]
+PROGRAM_SOP_STEPS = [
+    "consultation_and_screening",
+    "needs_analysis",
+    "periodization",
+    "planning_model",
+    "programming_exercises_and_order",
+    "programming_intensity_and_volume",
+    "load_calculation",
+    "volume_calculation",
+    "rest_periods",
+]
+PROGRAM_SOP_LABELS = {
+    "consultation_and_screening": "Consultation and screening",
+    "needs_analysis": "Needs analysis",
+    "periodization": "Periodization",
+    "planning_model": "Planning model",
+    "programming_exercises_and_order": "Exercises and order",
+    "programming_intensity_and_volume": "Intensity and volume",
+    "load_calculation": "Load calculation",
+    "volume_calculation": "Volume calculation",
+    "rest_periods": "Rest periods",
+}
 
 
 def _clean_id_input(value: str | None) -> str:
@@ -57,25 +81,303 @@ def _rerun_app() -> None:
         st.experimental_rerun()
 
 
+def _response_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if detail:
+            return str(detail)
+    text = response.text.strip()
+    if text:
+        return text
+    return f"Request failed with HTTP {response.status_code} and an empty response body."
+
+
+def _post_program_turn_with_progress(
+    conversation_id: str,
+    payload: dict,
+    context_id: str | None = None,
+) -> httpx.Response:
+    url = f"{API_BASE_URL}/api/programs/conversations/{conversation_id}/turns"
+    progress_slot = st.empty()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(httpx.post, url, json=payload, timeout=300)
+        while not future.done():
+            if context_id:
+                context_response = httpx.get(
+                    f"{API_BASE_URL}/api/programs/contexts/{context_id}",
+                    timeout=10,
+                )
+                if context_response.is_success:
+                    with progress_slot.container():
+                        _render_program_sop_progress(context_response.json(), title="Program Generator Working")
+                else:
+                    progress_slot.progress(0.05, text="Program Generator is working...")
+            else:
+                progress_slot.progress(0.05, text="Program Generator is working...")
+            time.sleep(1)
+        progress_slot.empty()
+        return future.result()
+
+
 def _program_widget_key(prefix: str, context_id: str, exercise_name: str) -> str:
     slug = "".join(ch if ch.isalnum() else "_" for ch in exercise_name.lower()).strip("_")
     return f"{prefix}_{context_id}_{slug}"
 
 
+def _normalize_program_exercise_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
+
+def _is_bodyweight_dependent_load_reference_name(name: str) -> bool:
+    text = re.sub(r"[^a-z0-9]+", " ", str(name).lower())
+    tokens = set(text.split())
+    compact = text.replace(" ", "")
+    if "pullover" in compact or "latpulldown" in compact or "pulldown" in compact:
+        return False
+    has_pull_up = ("pull" in tokens and "up" in tokens) or "pullup" in compact
+    has_chin_up = ("chin" in tokens and "up" in tokens) or "chinup" in compact
+    has_dip = (
+        "dip" in tokens
+        or "dips" in tokens
+        or compact in {"dip", "dips"}
+        or compact.endswith("dip")
+        or compact.endswith("dips")
+        or any(pattern in compact for pattern in ("weighteddip", "ringdip", "bardip", "chestdip", "tricepsdip"))
+    )
+    return has_pull_up or has_chin_up or has_dip
+
+
+def _program_chat_markdown(content: str) -> str:
+    text = str(content or "")
+    removed_required_inputs = False
+    removed_load_references = False
+
+    def strip_required_inputs(match: re.Match) -> str:
+        nonlocal removed_required_inputs
+        removed_required_inputs = True
+        return ""
+
+    def strip_load_references(match: re.Match) -> str:
+        nonlocal removed_load_references
+        removed_load_references = True
+        return ""
+
+    text = re.sub(
+        r"\n*```json\s*\{.*?\"format\"\s*:\s*\"program_required_inputs_v1\".*?\}\s*```\s*",
+        strip_required_inputs,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"\n*```json\s*\{.*?\"load_references\"\s*:\s*\[.*?\]\s*\}\s*```\s*",
+        strip_load_references,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+    if text:
+        return text
+    if removed_load_references:
+        return "Please complete the Load References form below."
+    if removed_required_inputs:
+        return "Please complete the Required Program Inputs form below."
+    return ""
+
+
 def _pending_program_load_reference_names(context_payload: dict) -> list[str]:
+    if context_payload.get("pending_action") == "waiting_for_context_budget_decision":
+        return []
     sections = context_payload.get("sections", {})
     working = sections.get("new_program_working_state", {})
+    collected_inputs = working.get("collected_inputs", {})
+    if not isinstance(collected_inputs, dict):
+        collected_inputs = {}
+    load_references = collected_inputs.get("exercise_load_references", {})
+    if not isinstance(load_references, dict):
+        load_references = {}
     names = working.get("pending_load_clarifications", [])
     if isinstance(names, list) and names:
-        return [str(item) for item in names if str(item).strip()]
+        return [
+            str(item)
+            for item in names
+            if str(item).strip() and _normalize_program_exercise_name(str(item)) not in load_references
+        ]
     pending = sections.get("sop_progress", {}).get("pending_missing_inputs", [])
     if not isinstance(pending, list):
         return []
     return [
         str(item).split(":", 1)[1]
         for item in pending
-        if isinstance(item, str) and item.startswith("load_reference:") and item.split(":", 1)[1].strip()
+        if (
+            isinstance(item, str)
+            and item.startswith("load_reference:")
+            and item.split(":", 1)[1].strip()
+            and _normalize_program_exercise_name(item.split(":", 1)[1]) not in load_references
+        )
     ]
+
+
+def _pending_program_required_input_fields(context_payload: dict) -> list[dict]:
+    if context_payload.get("pending_action") == "waiting_for_context_budget_decision":
+        return []
+    sections = context_payload.get("sections", {})
+    pending = sections.get("sop_progress", {}).get("pending_missing_inputs", [])
+    if not isinstance(pending, list):
+        return []
+    collected_inputs = sections.get("new_program_working_state", {}).get("collected_inputs", {})
+    if not isinstance(collected_inputs, dict):
+        collected_inputs = {}
+    keys = [
+        str(item)
+        for item in pending
+        if (
+            isinstance(item, str)
+            and not item.startswith("load_reference:")
+            and collected_inputs.get(item) in (None, "", [])
+        )
+    ]
+    field_map = {
+        "goal": {
+            "label": "Primary training goal",
+            "input_type": "text",
+            "placeholder": "Example: maximal strength, powerlifting total, hypertrophy",
+        },
+        "age": {"label": "Age", "input_type": "number", "unit": "years", "min": 10, "max": 100, "value": 29},
+        "sex": {
+            "label": "Sex",
+            "input_type": "select",
+            "options": ["male", "female", "nonbinary", "prefer_not_to_say", "self_describe"],
+        },
+        "height_cm": {"label": "Height", "input_type": "number", "unit": "cm", "min": 50, "max": 250, "value": 175},
+        "bodyweight_kg": {
+            "label": "Bodyweight",
+            "input_type": "number",
+            "unit": "kg",
+            "min": 20,
+            "max": 300,
+            "value": 80,
+        },
+        "medical_history": {
+            "label": "Injury and medical history",
+            "input_type": "textarea",
+            "placeholder": "Recent injuries, pain, medical conditions, medications, or 'none'.",
+        },
+        "baseline_assessments": {
+            "label": "Testing and baseline data",
+            "input_type": "textarea",
+            "placeholder": "Example: squat 140 kg, bench 100 kg, deadlift 180 kg, pull-ups 20 reps.",
+        },
+        "lifestyle_work_demands": {
+            "label": "Lifestyle or work demands",
+            "input_type": "textarea",
+            "placeholder": "Example: desk job, shift work, repeated lifting, prolonged standing, none.",
+        },
+        "days_per_week": {
+            "label": "Training days per week",
+            "input_type": "number",
+            "unit": "days",
+            "min": 1,
+            "max": 7,
+            "value": 3,
+        },
+        "training_days": {
+            "label": "Typical training days",
+            "input_type": "multiselect",
+            "options": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+        },
+        "session_duration_minutes": {
+            "label": "Minutes available per session",
+            "input_type": "number",
+            "unit": "minutes",
+            "min": 20,
+            "max": 240,
+            "value": 60,
+        },
+        "program_duration_weeks": {
+            "label": "Preferred program duration",
+            "input_type": "number",
+            "unit": "weeks",
+            "min": 2,
+            "max": 16,
+            "value": 4,
+        },
+        "experience": {
+            "label": "Training experience",
+            "input_type": "select",
+            "options": ["beginner", "intermediate", "advanced"],
+        },
+        "equipment": {
+            "label": "Available equipment",
+            "input_type": "textarea",
+            "placeholder": "Example: full gym, barbell, rack, dumbbells, machines.",
+        },
+    }
+    return [{"key": key, **field_map.get(key, {"label": key, "input_type": "text"})} for key in keys]
+
+
+def _render_program_required_inputs_form(context_payload: dict, user_id: str, conversation_id: str) -> None:
+    fields = _pending_program_required_input_fields(context_payload)
+    if not fields:
+        return
+    context_id = str(context_payload.get("context_id", "program_context"))
+    st.markdown("#### Required Program Inputs")
+    st.caption("Fill the missing planning inputs, then submit them as structured data.")
+    with st.form(f"program_required_inputs_form_{context_id}"):
+        values = {}
+        for field in fields:
+            key = field["key"]
+            widget_key = f"program_required_{context_id}_{key}"
+            label = field.get("label", key)
+            if field.get("unit"):
+                label = f"{label} ({field['unit']})"
+            input_type = field.get("input_type", "text")
+            if input_type == "number":
+                values[key] = st.number_input(
+                    label,
+                    min_value=float(field.get("min", 0)),
+                    max_value=float(field.get("max", 1000)),
+                    value=float(field.get("value", field.get("min", 0))),
+                    step=1.0,
+                    key=widget_key,
+                )
+            elif input_type == "select":
+                values[key] = st.selectbox(label, field.get("options", []), key=widget_key)
+            elif input_type == "multiselect":
+                values[key] = st.multiselect(
+                    label,
+                    field.get("options", []),
+                    placeholder=field.get("placeholder", "Choose one or more options"),
+                    key=widget_key,
+                )
+            elif input_type == "textarea":
+                values[key] = st.text_area(label, placeholder=field.get("placeholder"), key=widget_key)
+            else:
+                values[key] = st.text_input(label, placeholder=field.get("placeholder"), key=widget_key)
+        submitted = st.form_submit_button("Submit required inputs", disabled=not bool(user_id and conversation_id))
+    if not submitted:
+        return
+    missing = [field["label"] for field in fields if values.get(field["key"]) in (None, "", [])]
+    if missing:
+        st.error("Fill: " + ", ".join(missing))
+        return
+    message = "Submitted structured required program inputs."
+    st.session_state["program_messages"].append({"role": "user", "content": message})
+    with st.spinner("Program Generator is working..."):
+        response = _post_program_turn_with_progress(
+            conversation_id,
+            {"user_id": user_id, "message": message, "required_inputs": values},
+            context_id=context_id,
+        )
+    if response.is_success:
+        payload = response.json()
+        st.session_state["program_last_response"] = payload
+        st.session_state["program_messages"].append({"role": "assistant", "content": payload["response"]})
+        _rerun_app()
+    else:
+        st.error(_response_error_detail(response))
 
 
 def _render_program_load_reference_form(context_payload: dict, user_id: str, conversation_id: str) -> None:
@@ -131,24 +433,111 @@ def _render_program_load_reference_form(context_payload: dict, user_id: str, con
         submitted = st.form_submit_button("Submit load references", disabled=not bool(user_id and conversation_id))
     if not submitted:
         return
-    missing = [item["exercise_name"] for item in entries if item["weight_kg"] <= 0]
+    missing = [
+        item["exercise_name"]
+        for item in entries
+        if item["weight_kg"] < 0
+        or (item["weight_kg"] == 0 and not _is_bodyweight_dependent_load_reference_name(item["exercise_name"]))
+    ]
     if missing:
         st.error("Enter a weight for: " + ", ".join(missing))
         return
     message = "Submitted structured load references."
     st.session_state["program_messages"].append({"role": "user", "content": message})
-    response = httpx.post(
-        f"{API_BASE_URL}/api/programs/conversations/{conversation_id}/turns",
-        json={"user_id": user_id, "message": message, "load_references": entries},
-        timeout=300,
-    )
+    with st.spinner("Program Generator is working..."):
+        response = _post_program_turn_with_progress(
+            conversation_id,
+            {"user_id": user_id, "message": message, "load_references": entries},
+            context_id=context_id,
+        )
     if response.is_success:
         payload = response.json()
         st.session_state["program_last_response"] = payload
         st.session_state["program_messages"].append({"role": "assistant", "content": payload["response"]})
         _rerun_app()
     else:
-        st.error(response.json().get("detail", response.text))
+        st.error(_response_error_detail(response))
+
+
+def _render_program_sop_progress(context_payload: dict, title: str = "Program Generation Progress") -> None:
+    sections = context_payload.get("sections", {})
+    progress = sections.get("sop_progress", {})
+    if not isinstance(progress, dict):
+        progress = {}
+    completed = [
+        step
+        for step in progress.get("completed_steps", [])
+        if step in PROGRAM_SOP_STEPS
+    ]
+    completed_count = len(dict.fromkeys(completed))
+    total = len(PROGRAM_SOP_STEPS)
+    current_step = context_payload.get("current_sop_step") or progress.get("current_step")
+    if progress.get("sop_complete"):
+        completed_count = total
+    ratio = completed_count / total if total else 0
+    current_label = PROGRAM_SOP_LABELS.get(str(current_step), str(current_step or "not started"))
+    st.markdown(f"#### {title}")
+    st.progress(
+        min(1.0, max(0.0, ratio)),
+        text=f"{completed_count}/{total} SOP steps complete",
+    )
+    status = context_payload.get("status") or "unknown"
+    pending_action = context_payload.get("pending_action")
+    st.caption(f"Current step: {current_label}. Status: {status}" + (f"; pending: {pending_action}" if pending_action else ""))
+
+
+def _render_program_rag_query_planner_debug(context_id: str) -> None:
+    st.markdown("#### Program RAG Query Planner Debug")
+    response = httpx.get(
+        f"{API_BASE_URL}/api/programs/contexts/{context_id}/traces",
+        params={"action": "query_rag"},
+        timeout=60,
+    )
+    if not response.is_success:
+        st.error(_response_error_detail(response))
+        return
+    traces = response.json()
+    if not traces:
+        st.info("No query_rag traces for this ProgramContext yet.")
+        return
+    trace_options = [
+        f"{item.get('created_at', '')} | {item.get('sop_step') or 'unknown step'} | {item.get('trace_id')}"
+        for item in traces
+    ]
+    selected = st.selectbox(
+        "query_rag trace",
+        trace_options,
+        index=len(trace_options) - 1,
+        key=f"program_rag_trace_select_{context_id}",
+    )
+    selected_index = trace_options.index(selected)
+    trace = traces[selected_index]
+    details = trace.get("details", {})
+    planner = details.get("query_planner", {})
+    st.caption(
+        f"Step: {trace.get('sop_step') or 'unknown'} | "
+        f"Trace: {trace.get('trace_id')} | "
+        f"Planner: {planner.get('planner', 'unknown')} | "
+        f"Results: {details.get('result_count', 0)}"
+    )
+    planned_queries = planner.get("queries", [])
+    if planned_queries:
+        rows = [
+            {
+                "query": item.get("query", ""),
+                "purpose": item.get("purpose", ""),
+            }
+            for item in planned_queries
+            if isinstance(item, dict)
+        ]
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    else:
+        st.json(details.get("queries", []))
+    if planner.get("rationale"):
+        st.caption("Planner rationale")
+        st.write(planner["rationale"])
+    with st.expander("Raw query_rag trace"):
+        st.json(trace)
 
 
 def _render_program_version_response(payload: dict) -> None:
@@ -1617,12 +2006,12 @@ with tabs[7]:
         elif active_plan_response.is_success:
             st.info("No active plan.")
         else:
-            st.error(active_plan_response.json().get("detail", active_plan_response.text))
+            st.error(_response_error_detail(active_plan_response))
     if "program_messages" not in st.session_state:
         st.session_state["program_messages"] = []
     for item in st.session_state["program_messages"]:
         with st.chat_message(item["role"]):
-            st.markdown(item["content"])
+            st.markdown(_program_chat_markdown(item["content"]))
 
     program_message = st.chat_input("Ask for a new plan or rationale")
     if program_message:
@@ -1630,18 +2019,22 @@ with tabs[7]:
             st.error("Program user ID is required.")
         else:
             st.session_state["program_messages"].append({"role": "user", "content": program_message})
-            response = httpx.post(
-                f"{API_BASE_URL}/api/programs/conversations/{program_conversation_id}/turns",
-                json={"user_id": program_user_id, "message": program_message},
-                timeout=300,
-            )
+            active_context_id = None
+            if st.session_state.get("program_last_response"):
+                active_context_id = st.session_state["program_last_response"].get("context_id")
+            with st.spinner("Program Generator is working..."):
+                response = _post_program_turn_with_progress(
+                    program_conversation_id,
+                    {"user_id": program_user_id, "message": program_message},
+                    context_id=active_context_id,
+                )
             if response.is_success:
                 payload = response.json()
                 st.session_state["program_last_response"] = payload
                 st.session_state["program_messages"].append({"role": "assistant", "content": payload["response"]})
                 _rerun_app()
             else:
-                st.error(response.json().get("detail", response.text))
+                st.error(_response_error_detail(response))
 
     program_result = st.session_state.get("program_last_response")
     if program_result:
@@ -1683,7 +2076,7 @@ with tabs[7]:
                     st.session_state["program_version_cache_key"] = version_cache_key
                     st.session_state["program_version_response"] = version.json()
                 else:
-                    st.error(version.json().get("detail", version.text))
+                    st.error(_response_error_detail(version))
             version_payload = st.session_state.get("program_version_response")
             if (
                 st.session_state.get("program_version_cache_key") == version_cache_key
@@ -1698,6 +2091,12 @@ with tabs[7]:
             )
             if context_response.is_success:
                 context_payload = context_response.json()
+                _render_program_sop_progress(context_payload)
+                _render_program_required_inputs_form(
+                    context_payload,
+                    program_user_id,
+                    program_conversation_id,
+                )
                 _render_program_load_reference_form(
                     context_payload,
                     program_user_id,
@@ -1717,6 +2116,7 @@ with tabs[7]:
                             ),
                         }
                     )
+                _render_program_rag_query_planner_debug(context_id)
         trace_id = program_result.get("trace_id")
         if trace_id:
             trace_response = httpx.get(f"{API_BASE_URL}/api/programs/traces/{trace_id}", timeout=60)
@@ -1762,13 +2162,13 @@ with tabs[7]:
             st.session_state["program_debug_context"] = response.json()
         else:
             st.session_state.pop("program_debug_context", None)
-            st.error(response.json().get("detail", response.text))
+            st.error(_response_error_detail(response))
     if debug_col2.button("Show all context IDs"):
         response = httpx.get(f"{API_BASE_URL}/api/programs/contexts", timeout=60)
         if response.is_success:
             st.session_state["program_context_ids"] = response.json()
         else:
-            st.error(response.json().get("detail", response.text))
+            st.error(_response_error_detail(response))
 
     context_ids = st.session_state.get("program_context_ids")
     if context_ids is not None:

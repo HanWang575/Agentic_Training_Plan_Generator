@@ -105,6 +105,15 @@ def get_program_trace(
     return _run(lambda: service.get_trace(trace_id))
 
 
+@router.get("/programs/contexts/{context_id}/traces", response_model=list[ProgramTraceResponse])
+def list_program_context_traces(
+    context_id: str,
+    action: str | None = None,
+    service: ProgramService = Depends(program_service_dependency),
+) -> list[ProgramTraceResponse]:
+    return _run(lambda: service.list_context_traces(context_id, action=action))
+
+
 @router.get("/training/summary-notes", response_model=TrainingSummaryNotesResponse)
 def get_training_summary_notes(
     user_id: str,

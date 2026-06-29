@@ -11,7 +11,12 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.core.errors import ConfigurationError
-from app.core.llm_provider import OpenAIProvider, ProgramTaskRouteResult, StructuredOutputError
+from app.core.llm_provider import (
+    OpenAIProvider,
+    ProgramEvidenceQueryPlanResult,
+    ProgramTaskRouteResult,
+    StructuredOutputError,
+)
 from app.knowledge.schemas import RetrievedChunk
 from app.memory.service import MemoryService
 from app.memory.schemas import PlanProgressPatchRequest
@@ -24,6 +29,7 @@ from app.program.service import (
     _extract_exercise_load_references,
     _extract_lift_maxes,
     _intensity_volume_policy_from_sop_progress,
+    _rank_program_evidence_with_rrf,
 )
 from app.storage.database import create_app_engine, init_db
 from app.storage.models import (
@@ -45,6 +51,7 @@ class FakeProgramProvider:
     def __init__(self):
         self.lift_max_requests = []
         self.input_requests = []
+        self.query_plan_requests = []
         self.sop_requests = []
 
     def extract_program_lift_maxes(self, request):
@@ -64,14 +71,32 @@ class FakeProgramProvider:
         result = {}
         if "strength" in text or "powerlifting" in text:
             result["goal"] = "strength"
+            result["physiological_priorities"] = ["strength"]
         elif "hypertrophy" in text or "muscle" in text:
             result["goal"] = "hypertrophy"
+            result["physiological_priorities"] = ["hypertrophy"]
         elif "endurance" in text:
             result["goal"] = "endurance"
+            result["physiological_priorities"] = ["muscular endurance"]
+        if "power" in text or "explosive" in text:
+            result["physiological_priorities"] = list(dict.fromkeys(result.get("physiological_priorities", []) + ["power"]))
         for level in ("beginner", "intermediate", "advanced"):
             if level in text:
                 result["experience"] = level
                 break
+        age_match = re.search(r"\bage\s*[:=]?\s*(\d{1,3})\b|\b(\d{1,3})\s*(?:yo|years old)\b", text)
+        if age_match:
+            result["age"] = int(next(group for group in age_match.groups() if group))
+        if re.search(r"\bmale\b", text):
+            result["sex"] = "male"
+        elif re.search(r"\bfemale\b", text):
+            result["sex"] = "female"
+        height_match = re.search(r"\bheight\s*[:=]?\s*(\d{2,3})\s*cm\b", text)
+        if height_match:
+            result["height_cm"] = float(height_match.group(1))
+        bodyweight_match = re.search(r"\b(?:bodyweight|body weight|bw)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*kg\b", text)
+        if bodyweight_match:
+            result["bodyweight_kg"] = float(bodyweight_match.group(1))
         if "commercial gym" in text:
             result["equipment"] = "commercial gym"
         elif "full gym" in text or "barbell" in text:
@@ -80,8 +105,10 @@ class FakeProgramProvider:
             result["equipment"] = "bodyweight"
         if "injury-free" in text or "no injuries" in text or "nothing hurts" in text:
             result["screening"] = "clear"
+            result["medical_history"] = "no current injuries, medical conditions, or medication issues reported"
         elif "pain" in text or "injury" in text or "medical" in text:
             result["screening"] = "limited"
+            result["medical_history"] = "injury, pain, medical issue, or medication concern reported"
         day_match = re.search(r"\b([1-7])\s*(?:days?|times?)\s*(?:per|a)?\s*week", text)
         if not day_match:
             day_match = re.search(r"days(?:_per_week| per week)?\s*[:=]\s*([1-7])", text)
@@ -105,6 +132,20 @@ class FakeProgramProvider:
             duration_match = re.search(r"(?:duration|session_duration_minutes)\s*[:=]\s*(\d{2,3})", text)
         if duration_match:
             result["session_duration_minutes"] = int(duration_match.group(1))
+        duration_weeks_match = re.search(r"(?:program_duration_weeks|program duration|duration_weeks)\s*[:=]\s*(\d{1,2})", text)
+        if duration_weeks_match:
+            result["program_duration_weeks"] = int(duration_weeks_match.group(1))
+        days = []
+        for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+            if day in text:
+                days.append(day)
+        if days:
+            result["training_days"] = days
+            result.setdefault("days_per_week", len(days))
+        for key in ("baseline_assessments", "lifestyle_work_demands", "medical_history"):
+            match = re.search(rf"{key}\s*[:=]\s*([^;\n]+)", text)
+            if match:
+                result[key] = match.group(1).strip()
         return result
 
     def generate_program_task_route(self, request):
@@ -144,6 +185,18 @@ class FakeProgramProvider:
             if reported is not None:
                 answer += f" The current question reports {reported:g} kg."
         return answer
+
+    def plan_program_evidence_queries(self, request):
+        self.query_plan_requests.append(request)
+        return ProgramEvidenceQueryPlanResult(
+            queries=[
+                {
+                    "query": f"{request.sop_step} evidence for {request.collected_inputs.get('goal', 'strength')} programming",
+                    "purpose": f"retrieve evidence for {request.sop_step}",
+                }
+            ],
+            rationale="test query plan",
+        )
 
     def _base_plan(self, raw_plan, inputs, task_type="program_generation"):
         plan = dict(raw_plan or {})
@@ -247,7 +300,11 @@ class FakeProgramProvider:
         return plan
 
 class FakeKnowledgeService:
+    def __init__(self):
+        self.queries = []
+
     def search(self, query, topic_hint=None, keyword_top_k=None, semantic_top_k=None):
+        self.queries.append(query)
         chunk = RetrievedChunk(
             source_id="src_strength",
             chunk_id="chk_programming",
@@ -262,6 +319,112 @@ class FakeKnowledgeService:
             retrieval_method="keyword",
         )
         return [chunk], [], None
+
+
+def _program_chunk(chunk_id: str, rank: int, method: str, score: float) -> RetrievedChunk:
+    return RetrievedChunk(
+        source_id="src_test",
+        chunk_id=chunk_id,
+        title="Test source",
+        text="example",
+        page_number=None,
+        section_heading=None,
+        topic_tags=[],
+        token_count=1,
+        score=score,
+        rank=rank,
+        retrieval_method=method,
+    )
+
+
+def test_program_evidence_rrf_prefers_chunk_found_by_both_methods():
+    ranked = _rank_program_evidence_with_rrf(
+        keyword_results=[
+            _program_chunk("chk_keyword_only", rank=1, method="keyword", score=1.0),
+            _program_chunk("chk_shared", rank=2, method="keyword", score=0.5),
+        ],
+        semantic_results=[
+            _program_chunk("chk_shared", rank=1, method="semantic", score=0.1),
+        ],
+        rrf_k=60,
+    )
+
+    assert [item.chunk_id for item in ranked[:2]] == ["chk_shared", "chk_keyword_only"]
+
+
+def test_program_rag_uses_llm_query_planner_and_stores_output_in_trace(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+
+    response = service.process_turn(
+        "conv_query_planner",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Create a strength plan. " + REQUIRED_INPUT_REPLY,
+        ),
+    )
+
+    assert response.status == "waiting_for_review"
+    assert service.llm_provider.query_plan_requests
+    first_request = service.llm_provider.query_plan_requests[0]
+    assert first_request.sop_step == "consultation_and_screening"
+    assert first_request.collected_inputs["goal"] == "strength"
+    assert service.knowledge_service.queries
+    assert service.knowledge_service.queries[0].startswith("consultation_and_screening evidence")
+
+    traces = session.exec(select(ProgramTrace).where(ProgramTrace.action == "query_rag")).all()
+    assert traces
+    context_query_traces = service.list_context_traces(response.context_id, action="query_rag")
+    assert context_query_traces
+    assert all(item.action == "query_rag" for item in context_query_traces)
+    details = json.loads(traces[0].details_json)
+    assert details["query_planner"]["planner"] == "llm"
+    assert details["query_planner"]["queries"][0]["purpose"] == "retrieve evidence for consultation_and_screening"
+    assert details["queries"][0].startswith("consultation_and_screening evidence")
+    session.close()
+
+
+def test_program_route_structured_output_error_returns_trace(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+
+    def bad_route(_request):
+        raise StructuredOutputError("TaskAndSOPRouter returned malformed JSON.", raw_excerpt="{bad")
+
+    service.llm_provider.generate_program_task_route = bad_route
+    response = service.process_turn(
+        "conv_route_json_error",
+        ProgramTurnRequest(user_id="usr_program", message="Create a strength plan."),
+    )
+
+    assert response.route == "route_error"
+    assert response.status == "open"
+    assert response.trace_id
+    assert "routing this Program Generator turn" in response.response
+    trace = session.get(ProgramTrace, response.trace_id)
+    assert trace.action == "route_error"
+    assert "TaskAndSOPRouter returned malformed JSON" in trace.errors_json
+    session.close()
+
+
+def test_program_route_unexpected_error_returns_trace(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+
+    def bad_route(_request):
+        raise RuntimeError("router transport failed")
+
+    service.llm_provider.generate_program_task_route = bad_route
+    response = service.process_turn(
+        "conv_route_runtime_error",
+        ProgramTurnRequest(user_id="usr_program", message="Create a strength plan."),
+    )
+
+    assert response.route == "route_error"
+    assert response.status == "open"
+    assert response.trace_id
+    assert "failed while routing" in response.response
+    trace = session.get(ProgramTrace, response.trace_id)
+    assert trace.action == "route_error"
+    assert "RuntimeError: router transport failed" in trace.errors_json
+    session.close()
 
 
 def _make_service(tmp_path: Path):
@@ -304,8 +467,12 @@ def _make_service(tmp_path: Path):
 
 
 REQUIRED_INPUT_REPLY = (
-    "goal: strength; days_per_week: 3; duration: 60; experience: intermediate; "
-    "equipment: full gym and barbell; screening: no injuries"
+    "goal: strength; age: 29; sex: male; height: 175 cm; "
+    "bodyweight: 80 kg; medical_history: no current injuries, medical conditions, or medications; "
+    "baseline_assessments: squat 140 kg, bench 100 kg, deadlift 180 kg, overhead press 65 kg; "
+    "lifestyle_work_demands: desk job, no relevant physical demands; days_per_week: 3; "
+    "training_days: monday, wednesday, friday; duration: 60; program_duration_weeks: 4; "
+    "experience: intermediate; equipment: full gym and barbell"
 )
 
 
@@ -322,7 +489,7 @@ def _start_new_program(
     )
     if first.status != "waiting_for_user":
         return first
-    assert "Before I design this safely" in first.response
+    assert "program_required_inputs_v1" in first.response
     return service.process_turn(
         conversation_id,
         ProgramTurnRequest(user_id=user_id, message=reply),
@@ -437,10 +604,52 @@ def test_input_extraction_priority_and_required_prompt_gate(tmp_path: Path):
     assert recent_over_profile["equipment"] == "commercial gym"
     assert recent_over_profile["screening"] == "limited"
     assert first.status == "waiting_for_user"
-    assert "Before I design this safely" in first.response
+    assert "program_required_inputs_v1" in first.response
     assert "primary training goal" not in first.response
-    assert "available training days per week" in first.response
+    assert "Training days per week" in first.response
     assert service.get_context(first.context_id).sections["new_program_working_state"]["required_inputs_prompted"] is True
+
+
+def test_structured_required_inputs_resume_program_generation(tmp_path: Path):
+    _, _, service = _make_service(tmp_path)
+
+    first = service.process_turn(
+        "conv_structured_required_inputs",
+        ProgramTurnRequest(user_id="usr_program", message="Create a new strength plan."),
+    )
+    assert first.status == "waiting_for_user"
+    assert "program_required_inputs_v1" in first.response
+
+    draft = service.process_turn(
+        "conv_structured_required_inputs",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured required program inputs.",
+            required_inputs={
+                "goal": "strength",
+                "age": 29,
+                "sex": "male",
+                "height_cm": 175,
+                "bodyweight_kg": 80,
+                "medical_history": "no current injuries, medical conditions, or medications",
+                "baseline_assessments": "squat 140 kg, bench 100 kg, deadlift 180 kg, overhead press 65 kg",
+                "lifestyle_work_demands": "desk job, no relevant physical demands",
+                "days_per_week": 3,
+                "training_days": ["monday", "wednesday", "friday"],
+                "session_duration_minutes": 60,
+                "program_duration_weeks": 4,
+                "experience": "intermediate",
+                "equipment": "full gym and barbell",
+            },
+        ),
+    )
+
+    assert draft.status == "waiting_for_review"
+    context = service.get_context(draft.context_id)
+    collected = context.sections["new_program_working_state"]["collected_inputs"]
+    assert collected["training_days"] == ["monday", "wednesday", "friday"]
+    assert collected["program_duration_weeks"] == 4
+    assert collected["screening"] == "clear"
 
 
 def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
@@ -806,8 +1015,12 @@ def test_user_schedule_survives_clarification_and_raw_split_controls_materializa
         ProgramTurnRequest(
             user_id="usr_program",
             message=(
-                "Create a strength plan. I train 4 days per week for 60 minutes, have intermediate "
-                "experience, use a full gym, and have no injuries. My bench PR is 115 kg."
+                "Create a strength plan. goal: strength; age: 29; sex: male; "
+                "height: 175 cm; bodyweight: 80 kg; medical_history: no current injuries, medical conditions, "
+                "or medications; baseline_assessments: bench 115 kg; lifestyle_work_demands: desk job, no "
+                "relevant physical demands; days_per_week: 4; training_days: monday, tuesday, thursday, saturday; "
+                "duration: 60; program_duration_weeks: 4; experience: intermediate; equipment: full gym; "
+                "My bench PR is 115 kg."
             ),
         ),
     )
@@ -899,10 +1112,7 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
         "conv_weighted_clarification",
         ProgramTurnRequest(
             user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
+            message="Create a strength plan. " + REQUIRED_INPUT_REPLY,
         ),
     )
     assert waiting.status == "waiting_for_user"
@@ -1044,10 +1254,7 @@ def test_malformed_program_json_returns_clean_error_response(tmp_path: Path):
         "conv_bad_json",
         ProgramTurnRequest(
             user_id="usr_program",
-            message=(
-                "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
+            message="Create a strength plan. " + REQUIRED_INPUT_REPLY,
         ),
     )
 
@@ -1072,10 +1279,7 @@ def test_clarification_resumes_same_program_context(tmp_path: Path):
         "conv_clarify",
         ProgramTurnRequest(
             user_id="usr_empty",
-            message=(
-                "goal: strength; days_per_week: 3; duration: 60; experience: intermediate; "
-                "equipment: full gym; screening: no injuries"
-            ),
+            message=REQUIRED_INPUT_REPLY,
         ),
     )
     assert second.context_id == first.context_id
@@ -1120,8 +1324,7 @@ def test_context_budget_continue_resumes_the_original_turn(tmp_path: Path):
     session, _, service = _make_service(tmp_path)
     service.settings.program_max_context_tokens = 1
     original_message = (
-        "Create a strength plan. days_per_week: 3; duration: 60; experience: intermediate; "
-        "equipment: full gym; screening: no injuries"
+        "Create a strength plan. " + REQUIRED_INPUT_REPLY
     )
 
     warning = service.process_turn(
@@ -1141,6 +1344,117 @@ def test_context_budget_continue_resumes_the_original_turn(tmp_path: Path):
     resumed_context = service.get_context(resumed.context_id)
     assert resumed_context.sections["new_program_working_state"]["task_request"] == original_message
     assert resumed_context.sections["sop_progress"]["context_budget_override"] is True
+    session.close()
+
+
+def test_context_budget_pending_rejects_repeated_required_input_submit(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    service.settings.program_max_context_tokens = 1
+    warning = service.process_turn(
+        "conv_budget_table_repeat",
+        ProgramTurnRequest(user_id="usr_program", message="Create a strength plan. " + REQUIRED_INPUT_REPLY),
+    )
+    assert warning.pending_action == "waiting_for_context_budget_decision"
+
+    repeated_submit = service.process_turn(
+        "conv_budget_table_repeat",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured required program inputs.",
+            required_inputs={"equipment": "full gym"},
+        ),
+    )
+
+    assert repeated_submit.pending_action == "waiting_for_context_budget_decision"
+    assert repeated_submit.status == "waiting_for_user"
+    assert "Reply 'continue'" in repeated_submit.response
+    trace = session.get(ProgramTrace, repeated_submit.trace_id)
+    assert trace.action == "context_budget_decision_required"
+    session.close()
+
+
+def test_context_budget_pending_rejects_load_reference_submit(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    service.settings.program_max_context_tokens = 1
+    warning = service.process_turn(
+        "conv_budget_load_repeat",
+        ProgramTurnRequest(user_id="usr_program", message="Create a strength plan. " + REQUIRED_INPUT_REPLY),
+    )
+    assert warning.pending_action == "waiting_for_context_budget_decision"
+
+    repeated_submit = service.process_turn(
+        "conv_budget_load_repeat",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured load references.",
+            load_references=[
+                {"exercise_name": "Weighted Pull-up", "type": "recent_set", "weight_kg": 0, "reps": 10}
+            ],
+        ),
+    )
+
+    assert repeated_submit.pending_action == "waiting_for_context_budget_decision"
+    assert repeated_submit.status == "waiting_for_user"
+    assert "Reply 'continue'" in repeated_submit.response
+    trace = session.get(ProgramTrace, repeated_submit.trace_id)
+    assert trace.action == "context_budget_decision_required"
+    session.close()
+
+
+def test_context_budget_continue_preserves_submitted_load_reference_payload(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    original_updater = service.llm_provider.update_program_plan
+
+    def plan_with_row(request):
+        plan = original_updater(request)
+        if request.sop_step == "programming_intensity_and_volume":
+            plan["sessions"][0]["exercises"].append(
+                {
+                    "name": "Chest-Supported Row",
+                    "mode": "resistance",
+                    "load_type": "weighted",
+                    "sets": 3,
+                    "reps": 8,
+                    "intensity_percent": 70,
+                    "rpe": 7,
+                    "rest_seconds": 120,
+                }
+            )
+        return plan
+
+    service.llm_provider.update_program_plan = plan_with_row
+    waiting = service.process_turn(
+        "conv_budget_load_payload_resume",
+        ProgramTurnRequest(user_id="usr_program", message="Create a strength plan. " + REQUIRED_INPUT_REPLY),
+    )
+    assert waiting.status == "waiting_for_user"
+    assert "Chest-Supported Row" in waiting.response
+
+    service.settings.program_max_context_tokens = 1
+    warning = service.process_turn(
+        "conv_budget_load_payload_resume",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured load references.",
+            load_references=[
+                {"exercise_name": "Chest-Supported Row", "type": "recent_set", "weight_kg": 40, "reps": 10}
+            ],
+        ),
+    )
+    assert warning.pending_action == "waiting_for_context_budget_decision"
+
+    resumed = service.process_turn(
+        "conv_budget_load_payload_resume",
+        ProgramTurnRequest(user_id="usr_program", message="continue"),
+    )
+
+    assert resumed.status == "waiting_for_review"
+    assert "load references" not in resumed.response.lower()
+    context = service.get_context(resumed.context_id)
+    refs = context.sections["new_program_working_state"]["collected_inputs"]["exercise_load_references"]
+    assert refs["chest_supported_row"]["weight_kg"] == 40
+    assert refs["chest_supported_row"]["reps"] == 10
+    assert "pending_missing_inputs" not in context.sections["sop_progress"]
     session.close()
 
 

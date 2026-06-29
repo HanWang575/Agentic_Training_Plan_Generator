@@ -74,7 +74,22 @@ class RationaleAnswerBuilder:
 class SOPStepReadinessAssessor:
     """Report missing raw inputs and the current step's evidence/output state."""
 
-    REQUIRED_INPUTS = ("goal", "days_per_week", "session_duration_minutes", "experience", "equipment", "screening")
+    REQUIRED_INPUTS = (
+        "goal",
+        "age",
+        "sex",
+        "height_cm",
+        "bodyweight_kg",
+        "medical_history",
+        "baseline_assessments",
+        "lifestyle_work_demands",
+        "days_per_week",
+        "training_days",
+        "session_duration_minutes",
+        "program_duration_weeks",
+        "experience",
+        "equipment",
+    )
 
     def __call__(self, state: ProgramGraphState) -> ProgramGraphState:
         context = state.get("context", {})

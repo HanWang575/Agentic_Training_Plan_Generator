@@ -17,6 +17,7 @@ from app.core.config import Settings
 from app.core.errors import ConfigurationError, NotFoundError
 from app.core.llm_provider import (
     OpenAIProvider,
+    ProgramEvidenceQueryPlanRequest,
     ProgramInputExtractionRequest,
     ProgramPlanUpdateRequest,
     ProgramLiftMaxExtractionRequest,
@@ -82,7 +83,22 @@ NEW_PROGRAM_SOP = [
 
 DETERMINISTIC_GENERATION_STEPS = {"load_calculation", "volume_calculation"}
 
-PROGRAM_REQUIRED_INPUTS = ("goal", "days_per_week", "session_duration_minutes", "experience", "equipment", "screening")
+PROGRAM_REQUIRED_INPUTS = (
+    "goal",
+    "age",
+    "sex",
+    "height_cm",
+    "bodyweight_kg",
+    "medical_history",
+    "baseline_assessments",
+    "lifestyle_work_demands",
+    "days_per_week",
+    "training_days",
+    "session_duration_minutes",
+    "program_duration_weeks",
+    "experience",
+    "equipment",
+)
 
 PROGRAM_SECTION_DEFAULTS: dict[str, Any] = {
     "current_user_turn": {},
@@ -138,6 +154,7 @@ class ProgramService:
         if not conversation_id.strip() or not request.user_id.strip():
             raise ValueError("conversation_id and user_id are required.")
         started = clock.perf_counter()
+        resume_after_context_budget = False
         conversation = self.memory_service.ensure_conversation(
             user_id=request.user_id,
             conversation_id=conversation_id,
@@ -163,6 +180,12 @@ class ProgramService:
             "created_at": message.created_at.isoformat(),
             "normalized_input": " ".join(request.message.split()),
         }
+        if request.required_inputs:
+            sections["current_user_turn"]["required_inputs"] = request.required_inputs
+        if request.load_references:
+            sections["current_user_turn"]["load_references"] = [
+                item.model_dump(mode="json") for item in request.load_references
+            ]
         memory_context = self.memory_service.get_memory_context(
             user_id=request.user_id,
             query=request.message,
@@ -206,14 +229,35 @@ class ProgramService:
                 sections["sop_progress"] = progress
                 context.pending_action = None
                 context.status = "open"
+                resume_after_context_budget = True
+            else:
+                self._checkpoint(context, sections)
+                response = (
+                    "The ProgramContext is still over budget. Reply 'continue' to proceed anyway, "
+                    "or 'stop' to close this program conversation."
+                )
+                trace_id = self._trace(context, "context_budget_decision_required", {"warnings": warnings})
+                self._assistant_message(context, response)
+                return self._turn_response(context, response, trace_id, warnings=warnings)
         self._checkpoint(context, sections)
 
-        initial_state = self._graph_state(context)
-        routed = run_program_generator_graph(initial_state, self.llm_provider)
-        route = routed.get("route", "new_program")
-        task_type = "program_generation"
-        context.current_turn_route = route
-        context.active_task_type = task_type
+        if resume_after_context_budget:
+            route = str(context.current_turn_route or "clarification_answer")
+            task_type = str(context.active_task_type or "program_generation")
+        else:
+            initial_state = self._graph_state(context)
+            try:
+                routed = run_program_generator_graph(initial_state, self.llm_provider)
+            except StructuredOutputError as exc:
+                return self._routing_error_response(context, exc, started)
+            except ConfigurationError:
+                raise
+            except Exception as exc:
+                return self._unexpected_routing_error_response(context, exc, started)
+            route = routed.get("route", "new_program")
+            task_type = "program_generation"
+            context.current_turn_route = route
+            context.active_task_type = task_type
 
         if route == "explain_plan_rationale":
             return self._rationale_response(context, started)
@@ -236,6 +280,20 @@ class ProgramService:
             return self._turn_response(context, response, trace_id, warnings=warnings)
 
         effective_message = str(sections.get("current_user_turn", {}).get("content", request.message))
+        effective_required_inputs = (
+            sections.get("current_user_turn", {}).get("required_inputs")
+            if isinstance(sections.get("current_user_turn"), dict)
+            else None
+        )
+        effective_load_references = (
+            sections.get("current_user_turn", {}).get("load_references")
+            if isinstance(sections.get("current_user_turn"), dict)
+            else None
+        )
+        if not isinstance(effective_required_inputs, dict):
+            effective_required_inputs = request.required_inputs
+        if not isinstance(effective_load_references, list):
+            effective_load_references = [item.model_dump(mode="json") for item in request.load_references]
 
         if route == "new_program":
             self._reset_new_program_sections(sections)
@@ -267,18 +325,21 @@ class ProgramService:
         )
         _merge_context_defaults(collected, extracted_from_context)
         collected.update(extracted_from_user)
-        pending_load_names = list(working.get("pending_load_clarifications", []))
+        collected.update(_normalize_required_input_payload(effective_required_inputs))
+        _clear_resolved_pending_missing_inputs(sections, collected)
+        pending_load_names = _pending_load_reference_names_from_sections(sections, working)
         if pending_load_names:
             load_references = dict(collected.get("exercise_load_references", {}))
             load_references.update(_extract_exercise_load_references(effective_message, pending_load_names))
             load_references.update(
                 _normalize_structured_load_references(
-                    [item.model_dump(mode="json") for item in request.load_references],
+                    effective_load_references,
                     pending_load_names,
                 )
             )
             if load_references:
                 collected["exercise_load_references"] = load_references
+                _clear_resolved_pending_missing_inputs(sections, collected)
         if route == "new_program":
             working["task_request"] = effective_message
         working["collected_inputs"] = collected
@@ -296,7 +357,24 @@ class ProgramService:
         sections[working_key] = working
         request_row.goal = str(collected.get("goal", "")) or None
         request_row.constraints_json = _dumps(
-            {key: collected.get(key) for key in ("days_per_week", "session_duration_minutes", "equipment", "screening")}
+            {
+                key: collected.get(key)
+                for key in (
+                    "age",
+                    "sex",
+                    "height_cm",
+                    "bodyweight_kg",
+                    "medical_history",
+                    "baseline_assessments",
+                    "lifestyle_work_demands",
+                    "days_per_week",
+                    "training_days",
+                    "session_duration_minutes",
+                    "program_duration_weeks",
+                    "equipment",
+                    "screening",
+                )
+            }
         )
 
         red_flags = self._red_flags(effective_message, memory_context.sections.get("recent_status", ""))
@@ -607,6 +685,20 @@ class ProgramService:
         trace = self.session.get(ProgramTrace, trace_id)
         if not trace:
             raise NotFoundError(f"Program trace not found: {trace_id}")
+        return self._trace_out(trace)
+
+    def list_context_traces(self, context_id: str, action: str | None = None) -> list[ProgramTraceResponse]:
+        context = self.session.get(ProgramContextRecord, context_id)
+        if not context:
+            raise NotFoundError(f"ProgramContext not found: {context_id}")
+        statement = select(ProgramTrace).where(ProgramTrace.context_id == context_id)
+        if action:
+            statement = statement.where(ProgramTrace.action == action)
+        traces = self.session.exec(statement).all()
+        return [self._trace_out(trace) for trace in sorted(traces, key=lambda item: item.created_at)]
+
+    def _trace_out(self, trace: ProgramTrace) -> ProgramTraceResponse:
+        trace_id = trace.trace_id
         tool_calls = self.session.exec(select(ProgramToolCall).where(ProgramToolCall.trace_id == trace_id)).all()
         calculations = self.session.exec(
             select(CalculationTrace).where(CalculationTrace.trace_id == trace_id)
@@ -889,7 +981,13 @@ class ProgramService:
         )
         if bodyweight is not None:
             extracted["bodyweight_kg"] = bodyweight
-        extracted.update(self._extract_lift_maxes(message))
+        lift_maxes = self._extract_lift_maxes(message)
+        if lift_maxes:
+            extracted.update(lift_maxes)
+            extracted.setdefault(
+                "baseline_assessments",
+                ", ".join(f"{key}={value:g}kg" for key, value in sorted(lift_maxes.items())),
+            )
         return extracted
 
     def _extract_inputs_deterministic(self, message: str, profile_text: str) -> dict[str, Any]:
@@ -906,16 +1004,35 @@ class ProgramService:
             if any(term in lowered for term in terms):
                 result["goal"] = goal
                 break
+        priorities = _extract_physiological_priorities(combined)
+        if priorities:
+            result["physiological_priorities"] = priorities
+        age = _extract_age(combined)
+        if age is not None:
+            result["age"] = age
+        sex = _extract_sex(combined)
+        if sex:
+            result["sex"] = sex
+        height = _extract_height_cm(combined)
+        if height is not None:
+            result["height_cm"] = height
         days = re.search(r"(?:days_per_week|days per week|available_training_days|train)\D{0,12}([1-7])", lowered)
         if not days:
             days = re.search(r"\b([1-7])\s*(?:days?|times?)\s*(?:per|a)?\s*week", lowered)
         if days:
             result["days_per_week"] = int(days.group(1))
+        training_days = _extract_training_days(combined)
+        if training_days:
+            result["training_days"] = training_days
+            result.setdefault("days_per_week", len(training_days))
         duration = re.search(r"(?:session_duration_minutes|session duration|session|workout)\D{0,12}(\d{2,3})\s*(?:minutes?|mins?)", lowered)
         if not duration:
             duration = re.search(r"typical_session_duration_minutes\D{0,4}(\d{2,3})", lowered)
         if duration:
             result["session_duration_minutes"] = min(180, max(20, int(duration.group(1))))
+        program_duration = _extract_program_duration_weeks(combined)
+        if program_duration is not None:
+            result["program_duration_weeks"] = program_duration
         bodyweight = _extract_bodyweight_kg(combined)
         if bodyweight is not None:
             result["bodyweight_kg"] = bodyweight
@@ -928,25 +1045,52 @@ class ProgramService:
             result["equipment"] = ", ".join(dict.fromkeys(equipment_terms))
         if re.search(r"\b(no injuries|no injury|no medical issues|healthy|cleared to train)\b", lowered):
             result["screening"] = "clear"
+            result.setdefault("medical_history", "no current injuries, medical conditions, or medication issues reported")
         elif re.search(r"\b(injury|pain|illness|medical|medication)\b", lowered):
             result["screening"] = "limited"
+            result.setdefault("medical_history", _extract_named_text(message, "medical_history") or "injury, pain, illness, medical condition, or medication concern reported")
+        lifestyle = _extract_lifestyle_work_demands(message)
+        if lifestyle:
+            result["lifestyle_work_demands"] = lifestyle
+        baseline = _extract_baseline_assessments(message)
+        if baseline:
+            result["baseline_assessments"] = baseline
         named_patterns = {
             "goal": r"goal\s*[:=]\s*([^,;\n]+)",
+            "physiological_priorities": r"physiological_priorities\s*[:=]\s*([^;\n]+)",
             "experience": r"experience\s*[:=]\s*([^,;\n]+)",
             "equipment": r"equipment\s*[:=]\s*([^;\n]+)",
             "screening": r"screening\s*[:=]\s*([^,;\n]+)",
+            "medical_history": r"medical_history\s*[:=]\s*([^;\n]+)",
+            "baseline_assessments": r"baseline_assessments\s*[:=]\s*([^;\n]+)",
+            "lifestyle_work_demands": r"lifestyle_work_demands\s*[:=]\s*([^;\n]+)",
+            "sex": r"sex\s*[:=]\s*([^,;\n]+)",
         }
         for key, pattern in named_patterns.items():
             match = re.search(pattern, message, flags=re.IGNORECASE)
             if match:
-                result[key] = match.group(1).strip()
+                value = match.group(1).strip()
+                result[key] = _extract_physiological_priorities(value) if key == "physiological_priorities" else value
         for key, pattern in {
             "days_per_week": r"days(?:_per_week| per week)?\s*[:=]\s*([1-7])",
             "session_duration_minutes": r"(?:duration|session_duration_minutes)\s*[:=]\s*(\d{2,3})",
+            "age": r"age\s*[:=]\s*(\d{1,3})",
+            "height_cm": r"height(?:_cm)?\s*[:=]\s*(\d{2,3})",
+            "bodyweight_kg": r"(?:bodyweight_kg|bodyweight|body weight|bw)\s*[:=]\s*(\d+(?:\.\d+)?)",
+            "program_duration_weeks": r"(?:program_duration_weeks|program duration|duration_weeks)\s*[:=]\s*(\d{1,2})",
         }.items():
             match = re.search(pattern, message, flags=re.IGNORECASE)
             if match:
-                result[key] = int(match.group(1))
+                number = float(match.group(1))
+                if key == "program_duration_weeks" and not 2 <= number <= 16:
+                    continue
+                result[key] = int(number) if key in {"age", "days_per_week", "session_duration_minutes", "program_duration_weeks"} else number
+        named_training_days = _extract_named_text(message, "training_days")
+        if named_training_days:
+            parsed_days = _extract_training_days(named_training_days)
+            if parsed_days:
+                result["training_days"] = parsed_days
+                result.setdefault("days_per_week", len(parsed_days))
         return result
 
     def _extract_lift_maxes(self, message: str) -> dict[str, float]:
@@ -1036,6 +1180,66 @@ class ProgramService:
         self._assistant_message(context, response)
         return self._turn_response(context, response, trace_id, warnings=[str(exc)])
 
+    def _routing_error_response(
+        self,
+        context: ProgramContextRecord,
+        exc: StructuredOutputError,
+        started: float,
+    ) -> ProgramTurnResponse:
+        context.status = "open"
+        context.pending_action = None
+        context.current_turn_route = "route_error"
+        context.active_task_type = "program_generation"
+        self.session.add(context)
+        self.session.commit()
+        response = (
+            "The chat model returned malformed JSON while routing this Program Generator turn, so I did not "
+            "start a new draft. I recorded the failure in the program trace. Please retry the same request."
+        )
+        trace_id = self._trace(
+            context,
+            "route_error",
+            {
+                key: value
+                for key, value in {
+                    "error": str(exc),
+                    "raw_excerpt": getattr(exc, "raw_excerpt", None),
+                    "repair_excerpt": getattr(exc, "repair_excerpt", None),
+                }.items()
+                if value
+            },
+            errors=[str(exc)],
+            started=started,
+        )
+        self._assistant_message(context, response)
+        return self._turn_response(context, response, trace_id, warnings=[str(exc)])
+
+    def _unexpected_routing_error_response(
+        self,
+        context: ProgramContextRecord,
+        exc: Exception,
+        started: float,
+    ) -> ProgramTurnResponse:
+        context.status = "open"
+        context.pending_action = None
+        context.current_turn_route = "route_error"
+        context.active_task_type = "program_generation"
+        self.session.add(context)
+        self.session.commit()
+        response = (
+            "The Program Generator failed while routing this turn, so I did not start a new draft. "
+            "I recorded the failure in the program trace."
+        )
+        trace_id = self._trace(
+            context,
+            "route_error",
+            {"error_type": type(exc).__name__, "error": str(exc)},
+            errors=[f"{type(exc).__name__}: {exc}"],
+            started=started,
+        )
+        self._assistant_message(context, response)
+        return self._turn_response(context, response, trace_id, warnings=[f"{type(exc).__name__}: {exc}"])
+
     def _ask_for_missing(
         self,
         context: ProgramContextRecord,
@@ -1054,12 +1258,19 @@ class ProgramService:
         self._checkpoint(context, sections)
         labels = {
             "goal": "primary training goal",
+            "age": "age",
+            "sex": "sex",
+            "height_cm": "height in centimeters",
+            "bodyweight_kg": "bodyweight in kg",
+            "medical_history": "recent injuries, musculoskeletal problems, medical conditions, medications, or confirmation that none apply",
+            "baseline_assessments": "current testing or baseline data such as 1RMs, recent sets, strengths, weaknesses, or confirmation none are available",
+            "lifestyle_work_demands": "relevant lifestyle or work demands, or confirmation none are relevant",
             "days_per_week": "available training days per week",
+            "training_days": "typical training days chosen from Monday through Sunday",
             "session_duration_minutes": "minutes available per session",
+            "program_duration_weeks": "preferred program duration from 2 to 16 weeks",
             "experience": "experience level (beginner, intermediate, or advanced)",
             "equipment": "available equipment",
-            "screening": "current injuries, pain, medical limitations, or confirmation that none apply",
-            "bodyweight_kg": "current bodyweight in kg for pull-up/chin-up/dip loading",
         }
         standard_missing = [item for item in missing if not item.startswith("load_reference:")]
         load_missing = [item.split(":", 1)[1] for item in missing if item.startswith("load_reference:")]
@@ -1068,7 +1279,14 @@ class ProgramService:
             requested_details.append(
                 "load references for each weighted exercise listed in the template below"
             )
-        question = "Before I design this safely, please provide: " + "; ".join(requested_details) + "."
+        if standard_missing:
+            question = (
+                "Please complete the required program inputs in this structured form.\n\n```json\n"
+                + json.dumps(_required_input_template(standard_missing), indent=2)
+                + "\n```"
+            )
+        else:
+            question = "Please provide: " + "; ".join(requested_details) + "."
         if load_missing:
             question += (
                 "\n\nChoose `1rm` when you know a current one-rep max, or `recent_set` when you know a recent "
@@ -1082,6 +1300,65 @@ class ProgramService:
         self._assistant_message(context, question)
         return self._turn_response(context, question, trace_id)
 
+    def _plan_evidence_queries(
+        self,
+        *,
+        step: str,
+        message: str,
+        inputs: dict[str, Any],
+        progress: dict[str, Any],
+        attempt: int,
+    ) -> dict[str, Any]:
+        relevant_decisions = _relevant_previous_decisions_for_evidence_planning(
+            step,
+            progress.get("decisions", {}),
+        )
+        fallback_query = _fallback_program_evidence_query(step, message, inputs, relevant_decisions, attempt)
+        if not hasattr(self.llm_provider, "plan_program_evidence_queries"):
+            return {
+                "planner": "deterministic_fallback",
+                "queries": [{"query": fallback_query, "purpose": "fallback query for current SOP step"}],
+                "rationale": "LLM evidence query planner is unavailable.",
+                "relevant_previous_decisions": relevant_decisions,
+            }
+        try:
+            result = self.llm_provider.plan_program_evidence_queries(
+                ProgramEvidenceQueryPlanRequest(
+                    sop_step=step,
+                    user_message=message,
+                    collected_inputs=inputs,
+                    relevant_previous_decisions=relevant_decisions,
+                    attempt=attempt,
+                    max_queries=3,
+                )
+            )
+            queries = [
+                {"query": str(item.get("query", "")).strip(), "purpose": str(item.get("purpose", "")).strip()}
+                for item in result.queries
+                if str(item.get("query", "")).strip()
+            ]
+            if queries:
+                return {
+                    "planner": "llm",
+                    "queries": queries,
+                    "rationale": result.rationale,
+                    "relevant_previous_decisions": relevant_decisions,
+                }
+        except Exception as exc:
+            return {
+                "planner": "deterministic_fallback",
+                "queries": [{"query": fallback_query, "purpose": "fallback query after planner failure"}],
+                "rationale": "LLM evidence query planner failed; deterministic fallback was used.",
+                "planner_error": str(exc),
+                "relevant_previous_decisions": relevant_decisions,
+            }
+        return {
+            "planner": "deterministic_fallback",
+            "queries": [{"query": fallback_query, "purpose": "fallback query after empty planner output"}],
+            "rationale": "LLM evidence query planner returned no usable queries.",
+            "relevant_previous_decisions": relevant_decisions,
+        }
+
     def _query_evidence(self, context: ProgramContextRecord, message: str) -> None:
         sections = self._sections(context)
         step = str(context.current_sop_step or "consultation_and_screening")
@@ -1090,22 +1367,27 @@ class ProgramService:
         attempt = int(counters.get("rag_queries", 0)) + 1
         working = sections.get(self._working_key(str(context.active_task_type)), {})
         inputs = working.get("collected_inputs", {})
-        query = (
-            f"Evidence for SOP step '{step}' in an evidence-based {inputs.get('goal', 'general fitness')} program for "
-            f"{inputs.get('experience', 'unknown')} trainee, attempt {attempt}: {message}"
+        query_plan = self._plan_evidence_queries(
+            step=step,
+            message=message,
+            inputs=inputs,
+            progress=progress,
+            attempt=attempt,
         )
+        queries = [item["query"] for item in query_plan.get("queries", [])]
         started = clock.perf_counter()
-        keyword, semantic, semantic_error = self.knowledge_service.search(
-            query=query,
-            keyword_top_k=self.settings.program_evidence_context_top_k,
-            semantic_top_k=self.settings.program_evidence_context_top_k,
-        )
-        combined: dict[str, Any] = {}
-        for item in [*keyword, *semantic]:
-            existing = combined.get(item.chunk_id)
-            if existing is None or item.score > existing.score:
-                combined[item.chunk_id] = item
-        ranked = sorted(combined.values(), key=lambda item: item.score, reverse=True)
+        result_lists: list[list[Any]] = []
+        semantic_errors: list[str] = []
+        for query in queries:
+            keyword, semantic, semantic_error = self.knowledge_service.search(
+                query=query,
+                keyword_top_k=self.settings.program_evidence_context_top_k,
+                semantic_top_k=self.settings.program_evidence_context_top_k,
+            )
+            result_lists.extend([keyword, semantic])
+            if semantic_error:
+                semantic_errors.append(str(semantic_error))
+        ranked = _rank_program_evidence_with_rrf(result_lists=result_lists, rrf_k=self.settings.hybrid_rrf_k)
         evidence = [asdict(item) for item in ranked[: self.settings.program_evidence_context_top_k]]
         counters["rag_queries"] = attempt
         progress.setdefault("evidence_sufficient_by_step", {})[step] = bool(evidence)
@@ -1124,7 +1406,13 @@ class ProgramService:
         trace_id = self._trace(
             context,
             "query_rag",
-            {"query": query, "result_count": len(evidence), "semantic_error": semantic_error},
+            {
+                "queries": queries,
+                "result_count": len(evidence),
+                "query_planner": query_plan,
+                "ranking_method": "reciprocal_rank_fusion",
+                "semantic_errors": semantic_errors,
+            },
             latency_ms=int((clock.perf_counter() - started) * 1000),
         )
         self.session.add(
@@ -1132,8 +1420,8 @@ class ProgramService:
                 tool_call_id=f"ptool_{uuid4().hex[:12]}",
                 trace_id=trace_id,
                 tool_name="search_knowledge",
-                inputs_json=_dumps({"query": query, "top_k": self.settings.program_evidence_context_top_k}),
-                output_json=_dumps({"results": evidence, "semantic_error": semantic_error}),
+                inputs_json=_dumps({"queries": queries, "top_k": self.settings.program_evidence_context_top_k}),
+                output_json=_dumps({"results": evidence, "semantic_errors": semantic_errors, "query_planner": query_plan}),
             )
         )
         for item in evidence:
@@ -1159,8 +1447,17 @@ class ProgramService:
         collected_inputs = dict(working.get("collected_inputs", {}))
         conservative_defaults = {
             "goal": "general fitness",
+            "age": "not_reported",
+            "sex": "not_reported",
+            "height_cm": "not_reported",
+            "bodyweight_kg": "not_reported",
+            "medical_history": "not_reported_use_conservative_limits",
+            "baseline_assessments": "none_available",
+            "lifestyle_work_demands": "not_reported",
             "days_per_week": 2,
+            "training_days": ["monday", "thursday"],
             "session_duration_minutes": 45,
+            "program_duration_weeks": 4,
             "experience": "beginner",
             "equipment": "bodyweight",
             "screening": "unknown_use_conservative_limits",
@@ -3059,6 +3356,107 @@ def _current_evidence_items(sections: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _relevant_previous_decisions_for_evidence_planning(
+    step: str,
+    decisions: Any,
+) -> dict[str, Any]:
+    if not isinstance(decisions, dict):
+        return {}
+    relevant_by_step = {
+        "consultation_and_screening": (),
+        "needs_analysis": ("consultation_and_screening",),
+        "periodization": ("consultation_and_screening", "needs_analysis"),
+        "planning_model": ("needs_analysis", "periodization"),
+        "programming_exercises_and_order": ("needs_analysis", "periodization", "planning_model"),
+        "programming_intensity_and_volume": (
+            "periodization",
+            "planning_model",
+            "programming_exercises_and_order",
+        ),
+        "rest_periods": (
+            "programming_exercises_and_order",
+            "programming_intensity_and_volume",
+        ),
+    }
+    return {
+        key: decisions[key]
+        for key in relevant_by_step.get(step, ())
+        if key in decisions
+    }
+
+
+def _fallback_program_evidence_query(
+    step: str,
+    message: str,
+    inputs: dict[str, Any],
+    relevant_decisions: dict[str, Any],
+    attempt: int,
+) -> str:
+    goal = inputs.get("goal", "strength")
+    experience = inputs.get("experience", "unknown")
+    days = inputs.get("days_per_week", "unknown")
+    step_terms = {
+        "consultation_and_screening": "pre-exercise screening health readiness injury pain medical clearance contraindications",
+        "needs_analysis": "strength training needs analysis goal demands training status constraints equipment movement needs limiting factors",
+        "periodization": "strength training periodization macrocycle mesocycle microcycle phases deload peak timeline",
+        "planning_model": "strength training planning model parallel sequential emphasis organization of training factors",
+        "programming_exercises_and_order": "strength training exercise selection exercise order frequency movement pattern accessories compound lifts",
+        "programming_intensity_and_volume": "strength training intensity volume sets reps RPE percent 1RM progression deload workload",
+        "rest_periods": "strength training rest interval compound accessory exercise fatigue recovery rest periods",
+    }.get(step, "evidence based strength training program design")
+    decision_terms = " ".join(_important_decision_terms(relevant_decisions))[:600]
+    return (
+        f"{step_terms}; {experience} trainee; goal {goal}; {days} training days per week; "
+        f"attempt {attempt}; prior decisions {decision_terms}; user request {message[:240]}"
+    )
+
+
+def _important_decision_terms(value: Any) -> list[str]:
+    terms: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"rationale", "warnings", "assumptions"}:
+                continue
+            if isinstance(child, (str, int, float)):
+                terms.append(f"{key} {child}")
+            elif isinstance(child, list):
+                terms.append(f"{key} " + " ".join(str(item) for item in child[:8]))
+            elif isinstance(child, dict):
+                terms.extend(_important_decision_terms(child))
+    elif isinstance(value, list):
+        for item in value[:8]:
+            terms.extend(_important_decision_terms(item))
+    elif value not in (None, ""):
+        terms.append(str(value))
+    return terms[:40]
+
+
+def _rank_program_evidence_with_rrf(
+    keyword_results: list[Any] | None = None,
+    semantic_results: list[Any] | None = None,
+    rrf_k: int = 60,
+    result_lists: list[list[Any]] | None = None,
+) -> list[Any]:
+    scores: dict[str, float] = {}
+    chunks_by_id: dict[str, Any] = {}
+    lists = result_lists if result_lists is not None else [keyword_results or [], semantic_results or []]
+    for result_list in lists:
+        for chunk in result_list:
+            chunk_id = str(getattr(chunk, "chunk_id", "") or "")
+            if not chunk_id:
+                continue
+            rank = int(getattr(chunk, "rank", 0) or 0)
+            if rank < 1:
+                continue
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + (1.0 / (rrf_k + rank))
+            chunks_by_id[chunk_id] = chunk
+    return sorted(
+        chunks_by_id.values(),
+        key=lambda item: (scores.get(item.chunk_id, 0.0), getattr(item, "score", 0.0)),
+        reverse=True,
+    )
+
+
 def _coerce_string_list(value: Any) -> list[str]:
     items: list[str] = []
 
@@ -3554,6 +3952,143 @@ def _extract_bodyweight_kg(text: str) -> float | None:
     return None
 
 
+def _extract_age(text: str) -> int | None:
+    if not text:
+        return None
+    patterns = (
+        r"\bage\b\D{0,8}(\d{1,3})\b",
+        r"\b(\d{1,3})\s*(?:yo|y/o|years?\s*old)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = int(match.group(1))
+        if 10 <= value <= 100:
+            return value
+    return None
+
+
+def _extract_sex(text: str) -> str | None:
+    if not text:
+        return None
+    lowered = text.lower()
+    if re.search(r"\b(female|woman|girl)\b", lowered):
+        return "female"
+    if re.search(r"\b(male|man|boy)\b", lowered):
+        return "male"
+    for pattern in (r"\bsex\b\s*[:=]\s*([^,;\n]+)", r"\bgender\b\s*[:=]\s*([^,;\n]+)"):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()[:80]
+    return None
+
+
+def _extract_height_cm(text: str) -> float | None:
+    if not text:
+        return None
+    patterns = (
+        r"\bheight\b\D{0,12}(\d{2,3}(?:\.\d+)?)\s*cm\b",
+        r"\b(\d{2,3}(?:\.\d+)?)\s*cm\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = float(match.group(1))
+        if 50 <= value <= 250:
+            return value
+    return None
+
+
+def _extract_program_duration_weeks(text: str) -> int | None:
+    if not text:
+        return None
+    patterns = (
+        r"\b(?:program_duration_weeks|duration_weeks)\b\D{0,8}(\d{1,2})\b",
+        r"\b(?:program duration|plan duration|for)\D{0,12}(\d{1,2})\s*weeks?\b",
+        r"\b(\d{1,2})\s*week(?:s)?\s*(?:program|plan|block)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = int(match.group(1))
+        if 2 <= value <= 16:
+            return value
+    return None
+
+
+def _extract_training_days(text: str) -> list[str]:
+    if not text:
+        return []
+    lowered = text.lower()
+    aliases = {
+        "monday": ("monday", "mon"),
+        "tuesday": ("tuesday", "tue", "tues"),
+        "wednesday": ("wednesday", "wed"),
+        "thursday": ("thursday", "thu", "thur", "thurs"),
+        "friday": ("friday", "fri"),
+        "saturday": ("saturday", "sat"),
+        "sunday": ("sunday", "sun"),
+    }
+    days: list[str] = []
+    for day, names in aliases.items():
+        if any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in names):
+            days.append(day)
+    return days
+
+
+def _extract_physiological_priorities(text: str) -> list[str]:
+    lowered = text.lower()
+    priorities: list[str] = []
+    for label, patterns in {
+        "strength": ("strength", "powerlifting", "maximal strength"),
+        "power": ("power", "explosive"),
+        "hypertrophy": ("hypertrophy", "muscle growth", "bodybuilding"),
+        "muscular endurance": ("muscular endurance", "strength endurance"),
+    }.items():
+        if any(pattern in lowered for pattern in patterns):
+            priorities.append(label)
+    return list(dict.fromkeys(priorities))
+
+
+def _extract_named_text(text: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\b\s*[:=]\s*([^;\n]+)", text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+
+def _extract_lifestyle_work_demands(text: str) -> str | None:
+    named = _extract_named_text(text, "lifestyle_work_demands")
+    if named:
+        return named
+    match = re.search(r"\b(?:job|work|occupation|daily activities)\b\s*[:=]\s*([^;\n]+)", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    lowered = text.lower()
+    if re.search(r"\b(desk job|office job|sedentary work|manual labor|physical job|shift work|prolonged sitting|repeated lifting)\b", lowered):
+        return re.search(
+            r"((?:desk job|office job|sedentary work|manual labor|physical job|shift work|prolonged sitting|repeated lifting)[^.;\n]*)",
+            text,
+            flags=re.IGNORECASE,
+        ).group(1).strip()
+    if re.search(r"\b(no relevant work demands|no physical work demands|nothing relevant)\b", lowered):
+        return "none relevant"
+    return None
+
+
+def _extract_baseline_assessments(text: str) -> str | None:
+    named = _extract_named_text(text, "baseline_assessments")
+    if named:
+        return named
+    lift_maxes = _extract_lift_maxes(text)
+    if lift_maxes:
+        return ", ".join(f"{key}={value:g}kg" for key, value in sorted(lift_maxes.items()))
+    if re.search(r"\b(no baseline|no testing|no assessment|no recent test)\b", text, flags=re.IGNORECASE):
+        return "none available"
+    return None
+
+
 def _bodyweight_kg(profile: str, inputs: dict[str, Any] | None = None) -> float | None:
     if inputs and inputs.get("bodyweight_kg") not in (None, ""):
         try:
@@ -3618,6 +4153,224 @@ def _load_reference_template(exercise_names: list[str]) -> dict[str, Any]:
             for exercise_name in exercise_names
         ]
     }
+
+
+def _required_input_template(missing_keys: list[str]) -> dict[str, Any]:
+    field_definitions: dict[str, dict[str, Any]] = {
+        "goal": {
+            "label": "Primary training goal",
+            "input_type": "text",
+            "placeholder": "Example: maximal strength, powerlifting total, hypertrophy",
+        },
+        "age": {"label": "Age", "input_type": "number", "unit": "years", "min": 10, "max": 100},
+        "sex": {
+            "label": "Sex",
+            "input_type": "select",
+            "options": ["male", "female", "nonbinary", "prefer_not_to_say", "self_describe"],
+        },
+        "height_cm": {"label": "Height", "input_type": "number", "unit": "cm", "min": 50, "max": 250},
+        "bodyweight_kg": {
+            "label": "Bodyweight",
+            "input_type": "number",
+            "unit": "kg",
+            "min": 20,
+            "max": 300,
+        },
+        "medical_history": {
+            "label": "Injury and medical history",
+            "input_type": "textarea",
+            "placeholder": "Recent injuries, pain, medical conditions, medications, or 'none'.",
+        },
+        "baseline_assessments": {
+            "label": "Testing and baseline data",
+            "input_type": "textarea",
+            "placeholder": "Example: squat 140 kg, bench 100 kg, deadlift 180 kg, pull-ups 20 reps.",
+        },
+        "lifestyle_work_demands": {
+            "label": "Lifestyle or work demands",
+            "input_type": "textarea",
+            "placeholder": "Example: desk job, shift work, repeated lifting, prolonged standing, none.",
+        },
+        "days_per_week": {
+            "label": "Training days per week",
+            "input_type": "number",
+            "unit": "days",
+            "min": 1,
+            "max": 7,
+        },
+        "training_days": {
+            "label": "Typical training days",
+            "input_type": "multiselect",
+            "options": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+        },
+        "session_duration_minutes": {
+            "label": "Minutes available per session",
+            "input_type": "number",
+            "unit": "minutes",
+            "min": 20,
+            "max": 240,
+        },
+        "program_duration_weeks": {
+            "label": "Preferred program duration",
+            "input_type": "number",
+            "unit": "weeks",
+            "min": 2,
+            "max": 16,
+        },
+        "experience": {
+            "label": "Training experience",
+            "input_type": "select",
+            "options": ["beginner", "intermediate", "advanced"],
+        },
+        "equipment": {
+            "label": "Available equipment",
+            "input_type": "textarea",
+            "placeholder": "Example: full gym, barbell, rack, dumbbells, machines.",
+        },
+    }
+    return {
+        "format": "program_required_inputs_v1",
+        "required_inputs": [
+            {"key": key, "required": True, "value": None, **field_definitions.get(key, {"label": key, "input_type": "text"})}
+            for key in missing_keys
+        ],
+    }
+
+
+def _clear_resolved_pending_missing_inputs(sections: dict[str, Any], collected_inputs: dict[str, Any]) -> None:
+    progress = sections.get("sop_progress")
+    if not isinstance(progress, dict):
+        return
+    pending = progress.get("pending_missing_inputs")
+    if not isinstance(pending, list):
+        return
+    remaining = []
+    load_references = collected_inputs.get("exercise_load_references", {})
+    if not isinstance(load_references, dict):
+        load_references = {}
+    for item in pending:
+        if not isinstance(item, str):
+            continue
+        if item.startswith("load_reference:"):
+            exercise_name = item.split(":", 1)[1]
+            if _normalize_exercise_name(exercise_name) not in load_references:
+                remaining.append(item)
+            continue
+        if collected_inputs.get(item) in (None, "", []):
+            remaining.append(item)
+    if remaining:
+        progress["pending_missing_inputs"] = remaining
+    else:
+        progress.pop("pending_missing_inputs", None)
+    sections["sop_progress"] = progress
+
+
+def _pending_load_reference_names_from_sections(
+    sections: dict[str, Any],
+    working: dict[str, Any],
+) -> list[str]:
+    names: list[str] = []
+    working_names = working.get("pending_load_clarifications", [])
+    if isinstance(working_names, list):
+        names.extend(str(item) for item in working_names if str(item).strip())
+    pending = sections.get("sop_progress", {}).get("pending_missing_inputs", [])
+    if isinstance(pending, list):
+        names.extend(
+            item.split(":", 1)[1]
+            for item in pending
+            if isinstance(item, str) and item.startswith("load_reference:") and item.split(":", 1)[1].strip()
+        )
+    deduped: dict[str, str] = {}
+    for name in names:
+        deduped.setdefault(_normalize_exercise_name(name), name)
+    return list(deduped.values())
+
+
+def _normalize_required_input_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in PROGRAM_REQUIRED_INPUTS:
+        if key not in payload or payload.get(key) in (None, "", []):
+            continue
+        value = payload[key]
+        if key in {"age", "days_per_week", "session_duration_minutes", "program_duration_weeks"}:
+            parsed = _coerce_required_int(value)
+            if parsed is not None:
+                normalized[key] = parsed
+            continue
+        if key in {"height_cm", "bodyweight_kg"}:
+            parsed_float = _coerce_required_float(value)
+            if parsed_float is not None:
+                normalized[key] = parsed_float
+            continue
+        if key == "training_days":
+            days = _normalize_training_days_value(value)
+            if days:
+                normalized[key] = days
+            continue
+        normalized[key] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if "training_days" in normalized and "days_per_week" not in normalized:
+        normalized["days_per_week"] = len(normalized["training_days"])
+    if "medical_history" in normalized and "screening" not in normalized:
+        normalized["screening"] = _screening_from_medical_history(str(normalized["medical_history"]))
+    return normalized
+
+
+def _coerce_required_int(value: Any) -> int | None:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_required_float(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_training_days_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_days = [str(item) for item in value]
+    else:
+        raw_days = re.split(r"[,;/\n]+|\band\b", str(value), flags=re.IGNORECASE)
+    allowed = {
+        "mon": "monday",
+        "monday": "monday",
+        "tue": "tuesday",
+        "tues": "tuesday",
+        "tuesday": "tuesday",
+        "wed": "wednesday",
+        "weds": "wednesday",
+        "wednesday": "wednesday",
+        "thu": "thursday",
+        "thur": "thursday",
+        "thurs": "thursday",
+        "thursday": "thursday",
+        "fri": "friday",
+        "friday": "friday",
+        "sat": "saturday",
+        "saturday": "saturday",
+        "sun": "sunday",
+        "sunday": "sunday",
+    }
+    days: list[str] = []
+    for raw_day in raw_days:
+        day = re.sub(r"[^a-z]", "", raw_day.lower())
+        if day in allowed and allowed[day] not in days:
+            days.append(allowed[day])
+    return days
+
+
+def _screening_from_medical_history(text: str) -> str:
+    lowered = text.lower()
+    if re.search(r"\b(no|none|without|clear|healthy|injury[-\s]*free)\b", lowered):
+        return "clear"
+    if re.search(r"\b(pain|injur|medical|condition|medication|illness|surgery|limitation)\b", lowered):
+        return "limited"
+    return "unknown"
 
 
 def _extract_exercise_load_references(

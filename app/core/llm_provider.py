@@ -19,6 +19,7 @@ from app.memory.prompts import (
     build_training_sport_type_prompt,
 )
 from app.program.prompts import (
+    build_program_evidence_query_planner_prompt,
     build_program_input_extraction_prompt,
     build_program_lift_max_extraction_prompt,
     build_program_plan_update_prompt,
@@ -222,6 +223,26 @@ class ProgramInputExtractionRequest:
     user_message: str
     recent_status_text: str = ""
     profile_text: str = ""
+
+
+@dataclass(slots=True)
+class ProgramEvidenceQueryPlanRequest:
+    """Current SOP-step state for planning evidence retrieval queries."""
+
+    sop_step: str
+    user_message: str
+    collected_inputs: dict[str, Any]
+    relevant_previous_decisions: dict[str, Any]
+    attempt: int
+    max_queries: int = 3
+
+
+@dataclass(slots=True)
+class ProgramEvidenceQueryPlanResult:
+    """Validated evidence query planner output."""
+
+    queries: list[dict[str, str]]
+    rationale: str
 
 
 @dataclass(slots=True)
@@ -543,7 +564,7 @@ class OpenAIProvider:
             previous_decisions=request.previous_decisions,
             raw_plan=request.raw_plan,
         )
-        return self._generate_json_object(prompt, max_tokens=8000, label="SOPStepExecutor")
+        return self._generate_json_object(prompt, max_tokens=10000, label="SOPStepExecutor")
 
     def update_program_plan(self, request: ProgramPlanUpdateRequest) -> dict[str, Any]:
         """Update the structured raw_plan from one SOP decision."""
@@ -555,7 +576,7 @@ class OpenAIProvider:
             collected_inputs=request.collected_inputs,
             previous_decisions=request.previous_decisions,
         )
-        return self._generate_json_object(prompt, max_tokens=8000, label="PlanUpdater")
+        return self._generate_json_object(prompt, max_tokens=10000, label="PlanUpdater")
 
     def extract_program_lift_maxes(self, request: ProgramLiftMaxExtractionRequest) -> dict[str, float]:
         """Extract current user-reported lift maxes through the LLM extractor node."""
@@ -574,6 +595,29 @@ class OpenAIProvider:
         )
         payload = self._generate_json_object(prompt, max_tokens=800, label="ProgramInputExtractor")
         return _program_inputs_from_payload(payload)
+
+    def plan_program_evidence_queries(
+        self,
+        request: ProgramEvidenceQueryPlanRequest,
+    ) -> ProgramEvidenceQueryPlanResult:
+        """Plan SOP-step-specific evidence retrieval queries."""
+
+        prompt = build_program_evidence_query_planner_prompt(
+            sop_step=request.sop_step,
+            user_message=request.user_message,
+            collected_inputs=request.collected_inputs,
+            relevant_previous_decisions=request.relevant_previous_decisions,
+            attempt=request.attempt,
+            max_queries=request.max_queries,
+        )
+        payload = self._generate_json_object(prompt, max_tokens=800, label="EvidenceQueryPlanner")
+        queries = _program_evidence_queries_from_payload(payload, request.max_queries)
+        if not queries:
+            raise ValueError("EvidenceQueryPlanner returned no usable queries.")
+        return ProgramEvidenceQueryPlanResult(
+            queries=queries,
+            rationale=str(payload.get("rationale", "")).strip(),
+        )
 
     def generate_program_task_route(self, request: ProgramTaskRouteRequest) -> ProgramTaskRouteResult:
         """Classify one Program Generator turn with structured LLM output."""
@@ -751,15 +795,45 @@ def _program_inputs_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     raw_goal = str(raw_inputs.get("goal", "")).strip().lower()
     if raw_goal in goal_aliases:
         values["goal"] = goal_aliases[raw_goal]
+    priorities = _program_priority_list(raw_inputs.get("physiological_priorities"))
+    if priorities:
+        values["physiological_priorities"] = priorities
     raw_experience = str(raw_inputs.get("experience", "")).strip().lower()
     if raw_experience in {"beginner", "intermediate", "advanced"}:
         values["experience"] = raw_experience
+    raw_sex = str(raw_inputs.get("sex", "")).strip().lower()
+    if raw_sex:
+        values["sex"] = raw_sex[:80]
     raw_screening = str(raw_inputs.get("screening", "")).strip().lower()
     if raw_screening in {"clear", "limited"}:
         values["screening"] = raw_screening
+    for key in ("medical_history", "lifestyle_work_demands"):
+        raw_text = str(raw_inputs.get(key, "")).strip()
+        if raw_text:
+            values[key] = raw_text[:500]
+    baseline = raw_inputs.get("baseline_assessments")
+    if isinstance(baseline, (dict, list)):
+        values["baseline_assessments"] = baseline
+    elif str(baseline or "").strip():
+        values["baseline_assessments"] = str(baseline).strip()[:800]
     raw_equipment = str(raw_inputs.get("equipment", "")).strip()
     if raw_equipment:
         values["equipment"] = raw_equipment[:300]
+    for key, lower, upper in (
+        ("age", 10, 100),
+        ("height_cm", 50, 250),
+        ("bodyweight_kg", 20, 300),
+        ("program_duration_weeks", 2, 16),
+    ):
+        try:
+            number = float(raw_inputs.get(key))
+        except (TypeError, ValueError):
+            continue
+        if lower <= number <= upper:
+            values[key] = int(number) if key in {"age", "program_duration_weeks"} else number
+    training_days = _program_training_days(raw_inputs.get("training_days"))
+    if training_days:
+        values["training_days"] = training_days
     try:
         days = int(raw_inputs.get("days_per_week"))
     except (TypeError, ValueError):
@@ -773,6 +847,74 @@ def _program_inputs_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if duration is not None:
         values["session_duration_minutes"] = min(180, max(20, duration))
     return values
+
+
+def _program_priority_list(value: Any) -> list[str]:
+    text = " ".join(str(item) for item in value) if isinstance(value, list) else str(value or "")
+    lowered = text.lower()
+    priorities: list[str] = []
+    for label, patterns in {
+        "strength": ("strength", "maximal strength", "powerlifting"),
+        "power": ("power", "explosive"),
+        "hypertrophy": ("hypertrophy", "muscle growth", "bodybuilding"),
+        "muscular endurance": ("muscular endurance", "strength endurance", "endurance"),
+    }.items():
+        if any(pattern in lowered for pattern in patterns):
+            priorities.append(label)
+    return list(dict.fromkeys(priorities))
+
+
+def _program_training_days(value: Any) -> list[str]:
+    if isinstance(value, list):
+        text = " ".join(str(item) for item in value)
+    else:
+        text = str(value or "")
+    lowered = text.lower()
+    days = []
+    aliases = {
+        "monday": ("monday", "mon"),
+        "tuesday": ("tuesday", "tue", "tues"),
+        "wednesday": ("wednesday", "wed"),
+        "thursday": ("thursday", "thu", "thur", "thurs"),
+        "friday": ("friday", "fri"),
+        "saturday": ("saturday", "sat"),
+        "sunday": ("sunday", "sun"),
+    }
+    for day, names in aliases.items():
+        if any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in names):
+            days.append(day)
+    return days
+
+
+def _program_evidence_queries_from_payload(payload: dict[str, Any], max_queries: int) -> list[dict[str, str]]:
+    raw_queries = payload.get("queries", [])
+    if isinstance(raw_queries, str):
+        raw_queries = [{"query": raw_queries, "purpose": ""}]
+    if not isinstance(raw_queries, list):
+        return []
+    queries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_queries:
+        if isinstance(item, str):
+            query = item
+            purpose = ""
+        elif isinstance(item, dict):
+            query = str(item.get("query", "")).strip()
+            purpose = str(item.get("purpose", "")).strip()
+        else:
+            continue
+        query = re.sub(r"\s+", " ", query).strip()
+        if len(query) < 8:
+            continue
+        query = query[:500]
+        normalized = query.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        queries.append({"query": query, "purpose": purpose[:240]})
+        if len(queries) >= max(1, max_queries):
+            break
+    return queries
 
 
 def _string_list(value: Any) -> list[str]:
