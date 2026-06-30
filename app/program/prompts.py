@@ -220,7 +220,8 @@ COMMON_SOP_STEP_RULES = """- Use the supplied MemoryContext, current-step eviden
 - State conservative assumptions when user facts are missing.
 - Do not calculate load_kg or weekly/session volume in this step; calculator steps do that later.
 - Put the current step's structured decision inside the `decision` object.
-- The current step's structured decision must include a `rationale` field.
+- Put the current step's explanation only in the top-level `rationale` field.
+- Do not put `rationale`, `assumptions`, `warnings`, or `step` inside the `decision` object.
 - Return JSON only."""
 
 
@@ -232,15 +233,16 @@ SOP_STEP_SPECIFIC_RULES: dict[str, str] = {
 - Define goal/sport demands, training status, constraints, schedule, equipment, movement needs, and limiting factors.
 - Ground exercise and loading implications in the user's facts and current-step evidence.""",
     "periodization": """- Use `decision.periodization`.
-- Include fields such as weeks (number of weeks included in the generated program, range [2, 16]), macrocycle, mesocycles, microcycles, target_timeline, deload_week_numbers, and rationale.
+- Include fields such as weeks (number of weeks included in the generated program, range [2, 16]), macrocycle, mesocycles, microcycles, target_timeline, and deload_week_numbers.
 - `deload_week_numbers` must use 1-based program week numbers.""",
     "planning_model": """- Use `decision.planning_model`.
 - Choose parallel, sequential, or emphasis planning.
 - Record the selected model and why it fits the needs analysis, constraints, and periodization.""",
     "programming_exercises_and_order": """- Use `decision.programming_exercises_and_order`.
-- Include `program_exercise_list`, `session_exercise_order`, and rationale.
+- Include `program_exercise_list` and `session_exercise_order`.
 - `program_exercise_list` is the unique exercise catalog, so each exercise appears once there.
 - `session_exercise_order` is the arranged session plan, so the same exercise may appear in multiple sessions when the role differs. 
+- For each planned session, include `training_day` using one of the collected `training_days` values.
 - For each exercise in `session_exercise_order`, include "slot_role" which describe its role such as volume, intensity, technique, accessory, or deload""",
     "programming_intensity_and_volume": """- Use `decision.programming_intensity_and_volume`.
 - Use `previous_decisions.periodization` to make week-by-week intensity and volume choices.
@@ -257,8 +259,7 @@ SOP_STEP_SPECIFIC_RULES: dict[str, str] = {
   "weekly_estimated_progression_kg": ["one number per program week; expected increase in this exercise slot's estimated 1RM for that week, not cumulative; week 1 should usually be 0; deload weeks should usually be 0, choose in [0, 0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]"],
   "deload_session_intensity_reduction_percent": ["one number per program week; must be 0 only for non-deload weeks, non-zero only for weeks in `deload_week_numbers`, range [0, 100]"],
   "deload_session_reps_reduction_percent": ["one number per program week; must be 0 for non-deload weeks, non-zero only for weeks in `deload_week_numbers`, range [0, 100]"],
-  "target_rpe": ["one number per program week, range [1, 10]"],
-  "rationale": "explain the rationale behind briefly."}.
+  "target_rpe": ["one number per program week, range [1, 10]"]}.
 - The deterministic calculator derives intensity_percent and load_kg from `reps_per_set`, `target_rpe`, and cumulative `weekly_estimated_progression_kg`; do not output `week1_intensity_percent_1rm`, `base_intensity_percent_1rm`, or `weekly_progression_percent`.
 - Each list length must equal `decision.periodization.weeks`.
 - Do not express deload/taper by setting `sets_per_week` to 0 or by pre-reducing `reps_per_set`; deload/taper is handled only by `deload_session_intensity_reduction_percent`, `deload_session_reps_reduction_percent`, lower `target_rpe`, and `weekly_estimated_progression_kg: 0`.
@@ -273,7 +274,7 @@ SOP_STEP_SPECIFIC_RULES: dict[str, str] = {
 def _sop_step_rules(sop_step: str) -> str:
     return SOP_STEP_SPECIFIC_RULES.get(
         sop_step,
-        "- Use a current-step-specific decision object and include a concise rationale grounded in supplied context.",
+        "- Use a current-step-specific decision object and put the concise rationale only in the top-level `rationale` field.",
     )
 
 
@@ -408,6 +409,7 @@ Rules:
 - Preserve the raw_plan schema and keep templates.session and templates.exercise.
 - Fill, expand, compact, or update sessions/exercises/sets only as needed by the current SOP decision.
 - Keep one week of session templates in raw_plan.sessions; deterministic code expands them across weeks.
+- Each raw_plan.sessions item must include `training_day` from collected_inputs.training_days when available.
 - Every exercise must include load_type: "weighted" or "bodyweight".
 - All pull-up, chin-up, dip, and grip/tempo/paused/weighted/unweighted variations of those movements must use load_type: "weighted"; bodyweight-only versions use external load 0 kg during load-reference collection.
 - All weighted exercises must include none-zero intensity_percent, sets, reps, rpe, and rest_seconds proposals, but do not invent load_kg.

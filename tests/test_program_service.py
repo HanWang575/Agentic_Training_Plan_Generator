@@ -27,7 +27,6 @@ from app.program.service import (
     NEW_PROGRAM_SOP,
     ProgramService,
     _extract_exercise_load_references,
-    _extract_lift_maxes,
     _intensity_volume_policy_from_sop_progress,
     _rank_program_evidence_with_rrf,
 )
@@ -56,7 +55,32 @@ class FakeProgramProvider:
 
     def extract_program_lift_maxes(self, request):
         self.lift_max_requests.append(request.user_message)
-        return _extract_lift_maxes(request.user_message)
+        text = request.user_message
+        values = {}
+        sbd = re.search(r"\bSBD\b\D{0,12}(\d+(?:\.\d+)?)\D{0,12}(\d+(?:\.\d+)?)\D{0,12}(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        if sbd:
+            values.update(
+                {
+                    "squat_1rm_kg": float(sbd.group(1)),
+                    "bench_press_1rm_kg": float(sbd.group(2)),
+                    "deadlift_1rm_kg": float(sbd.group(3)),
+                }
+            )
+        for lift_name, key in (
+            ("bench press", "bench_press_1rm_kg"),
+            ("bench", "bench_press_1rm_kg"),
+            ("squat", "squat_1rm_kg"),
+            ("deadlift", "deadlift_1rm_kg"),
+            ("overhead press", "overhead_press_1rm_kg"),
+        ):
+            match = re.search(
+                rf"\b{re.escape(lift_name)}\b[^\n.;]{{0,50}}?(?:1\s*rm|\bpr\b|\bmax\b)[^\n.;]{{0,25}}?(\d+(?:\.\d+)?)\s*kg",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                values[key] = float(match.group(1))
+        return values
 
     def extract_program_inputs(self, request):
         self.input_requests.append(request.user_message)
@@ -146,6 +170,15 @@ class FakeProgramProvider:
             match = re.search(rf"{key}\s*[:=]\s*([^;\n]+)", text)
             if match:
                 result[key] = match.group(1).strip()
+        for key in (
+            "squat_1rm_kg",
+            "bench_press_1rm_kg",
+            "deadlift_1rm_kg",
+            "overhead_press_1rm_kg",
+        ):
+            match = re.search(rf"{key}\s*[:=]\s*(\d+(?:\.\d+)?)", text)
+            if match:
+                result[key] = float(match.group(1))
         return result
 
     def generate_program_task_route(self, request):
@@ -514,25 +547,6 @@ def test_calculators_are_deterministic_and_safe(tmp_path: Path):
         ProgramTurnRequest(user_id="", message="Make a plan")
 
 
-def test_lift_max_extraction_does_not_cross_exercise_boundaries():
-    request = (
-        "I am 29 yo male. Height 175 cm, BW 80kgs. I have been trained in gym for almost 3 years. "
-        "SBD 110kg, 115kg, 150kg. For deadlift my PR is 155kg but I have been stopped training "
-        "deadlift for months. I just finished 1RM test for bench press.I train 3-4 days per week. "
-        "I can do about 25 BW pullups and a 55kg weighted pullup. Write a strength program for me. "
-        "My primary goal is to achieve 400 total in Big 3, bench 120kg, and be able to do a single "
-        "arm pull up by the end of the year."
-    )
-    clarification = "Weighted Pull-Up 1RM: 55kg; Overhead Press: 45 kg x 8 reps"
-
-    assert _extract_lift_maxes(request) == {
-        "squat_1rm_kg": 110.0,
-        "bench_press_1rm_kg": 115.0,
-        "deadlift_1rm_kg": 155.0,
-    }
-    assert _extract_lift_maxes(clarification) == {}
-
-
 def test_program_service_uses_llm_input_and_lift_extractors(tmp_path: Path):
     _, _, service = _make_service(tmp_path)
 
@@ -717,6 +731,8 @@ def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
         include_debug=True,
     ).rendered_context
     assert context.sections["sop_progress"]["completed_steps"] == NEW_PROGRAM_SOP
+    load_decision = context.sections["sop_progress"]["decisions"]["load_calculation"]
+    assert all("example_reps" not in item for item in load_decision["weighted_load_summary"])
     assert set(context.sections["sop_progress"]["evidence_sufficient_by_step"]) == (
         set(NEW_PROGRAM_SOP) - {"load_calculation", "volume_calculation"}
     )
@@ -730,7 +746,6 @@ def test_new_program_is_saved_with_traced_numeric_prescriptions(tmp_path: Path):
         {"source_id": "src_strength", "chunk_id": "chk_programming"}
     ]
     working = context.sections["new_program_working_state"]
-    assert "calculated_plan" not in working
     assert working["raw_plan"]["title"] == "Four Week Strength Foundation"
     assert not {
         "screening",
@@ -851,6 +866,31 @@ def test_materialization_uses_sop_periodization_and_intensity_volume_policy(tmp_
     assert any(json.loads(item.inputs_json).get("percentage") == -20 for item in progression_traces)
     assert any(item.tool_name == "calculate_reps_rpe_intensity" for item in session.exec(select(CalculationTrace)).all())
     session.close()
+
+
+def test_materialization_uses_training_days_for_planned_dates_and_session_type(tmp_path: Path):
+    _, _, service = _make_service(tmp_path)
+    original_updater = service.llm_provider.update_program_plan
+
+    def mislabeled_weekday_plan(request):
+        plan = original_updater(request)
+        if request.sop_step == "programming_exercises_and_order":
+            plan["sessions"][0]["name"] = "Tuesday - Squat and Bench"
+        return plan
+
+    service.llm_provider.update_program_plan = mislabeled_weekday_plan
+    response = _start_new_program(service, "conv_training_day_dates")
+    version = service.get_version(response.draft_program_id, response.draft_version_id)
+    context = service.get_context(response.context_id)
+    first_week = [item for item in version.sessions if item.week_number == 1]
+
+    assert [item.planned_date.weekday() for item in first_week] == [0, 2, 4]
+    assert [item.get("training_day") for item in context.sections["new_program_working_state"]["raw_plan"]["sessions"]] == [
+        "monday",
+        "wednesday",
+        "friday",
+    ]
+    assert first_week[0].session_type == "Monday - Squat and Bench"
 
 
 def test_session_specific_intensity_policy_distinguishes_repeated_lift_slots(tmp_path: Path):
@@ -1202,6 +1242,70 @@ def test_weighted_exercise_load_clarification_and_bodyweight_exception(tmp_path:
     session.close()
 
 
+def test_unknown_load_reference_allows_blank_load_prescriptions(tmp_path: Path):
+    session, _, service = _make_service(tmp_path)
+    original_updater = service.llm_provider.update_program_plan
+
+    def plan_with_unknown_machine(request):
+        plan = original_updater(request)
+        if request.sop_step == "programming_intensity_and_volume":
+            plan["sessions"][0]["exercises"].append(
+                {
+                    "name": "Machine Pec Fly",
+                    "mode": "resistance",
+                    "load_type": "weighted",
+                    "sets": 3,
+                    "reps": 10,
+                    "intensity_percent": 70,
+                    "rpe": 7,
+                    "rest_seconds": 120,
+                }
+            )
+        return plan
+
+    service.llm_provider.update_program_plan = plan_with_unknown_machine
+    waiting = service.process_turn(
+        "conv_unknown_load_reference",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Create a strength plan. " + REQUIRED_INPUT_REPLY,
+        ),
+    )
+    assert waiting.status == "waiting_for_user"
+    assert "Machine Pec Fly" in waiting.response
+
+    draft = service.process_turn(
+        "conv_unknown_load_reference",
+        ProgramTurnRequest(
+            user_id="usr_program",
+            message="Submitted structured load references.",
+            load_references=[
+                {
+                    "exercise_name": "Machine Pec Fly",
+                    "type": "unknown",
+                }
+            ],
+        ),
+    )
+
+    assert draft.status == "waiting_for_review"
+    version = service.get_version(draft.draft_program_id, draft.draft_version_id)
+    hack_squat_sets = [
+        prescribed_set
+        for planned_session in version.sessions
+        for exercise in planned_session.exercises
+        if exercise.name == "Machine Pec Fly"
+        for prescribed_set in exercise.sets
+    ]
+    assert hack_squat_sets
+    assert all(item.load_kg is None for item in hack_squat_sets)
+    assert all(item.reps == 10 for item in hack_squat_sets)
+    context = service.get_context(draft.context_id)
+    refs = context.sections["new_program_working_state"]["collected_inputs"]["exercise_load_references"]
+    assert refs["machine_pec_fly"]["source"] == "user_marked_unknown_load_reference"
+    session.close()
+
+
 def test_load_reference_parser_handles_press_and_structured_json():
     message = (
         "Weighted Plank 1RM: 20kg, Weighted Pull-up 1RM: 55kg, "
@@ -1233,13 +1337,21 @@ def test_load_reference_parser_handles_press_and_structured_json():
                 "load_references": [
                     {"exercise_name": "Overhead Press", "type": "recent_set", "weight_kg": 45, "reps": 7},
                     {"exercise_name": "Weighted Pull-up", "type": "1rm", "weight_kg": 55, "reps": 1},
+                    {"exercise_name": "Machine Pec Fly", "type": "unknown"},
                 ]
             }
         ),
-        ["Overhead Press", "Weighted Pull-up"],
+        ["Overhead Press", "Weighted Pull-up", "Machine Pec Fly"],
     )
     assert structured["overhead_press"]["reps"] == 7
     assert structured["weighted_pull_up"]["source"] == "current_user_turn_1rm"
+    assert structured["machine_pec_fly"] == {
+        "exercise_name": "Machine Pec Fly",
+        "type": "unknown",
+        "weight_kg": None,
+        "reps": None,
+        "source": "user_marked_unknown_load_reference",
+    }
 
 
 def test_malformed_program_json_returns_clean_error_response(tmp_path: Path):

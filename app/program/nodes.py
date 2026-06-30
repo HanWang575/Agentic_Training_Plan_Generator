@@ -118,7 +118,7 @@ class SOPStepReadinessAssessor:
             "step_complete": step in completed_steps,
             "sop_complete": bool(progress.get("sop_complete")),
             "has_raw_plan": bool(working.get("raw_plan")),
-            "has_calculated_plan": bool(working.get("calculated_plan") or working.get("calculation_artifacts")),
+            "has_calculated_plan": bool(working.get("calculation_artifacts")),
         }
 
 

@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SetPrescriptionOut(BaseModel):
@@ -65,9 +65,19 @@ class ProgramVersionResponse(BaseModel):
 
 class ProgramLoadReferenceInput(BaseModel):
     exercise_name: str = Field(min_length=1)
-    type: Literal["1rm", "recent_set"]
-    weight_kg: float = Field(ge=0)
+    type: Literal["1rm", "recent_set", "unknown"]
+    weight_kg: float | None = Field(default=None, ge=0)
     reps: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_known_reference(self) -> "ProgramLoadReferenceInput":
+        if self.type == "unknown":
+            return self
+        if self.weight_kg is None:
+            raise ValueError("weight_kg is required unless type is unknown.")
+        if self.type == "recent_set" and self.reps is None:
+            raise ValueError("reps is required for recent_set load references.")
+        return self
 
 
 class ProgramTurnRequest(BaseModel):

@@ -113,7 +113,11 @@ def _post_program_turn_with_progress(
                 )
                 if context_response.is_success:
                     with progress_slot.container():
-                        _render_program_sop_progress(context_response.json(), title="Program Generator Working")
+                        _render_program_sop_progress(
+                            context_response.json(),
+                            title="Program Generator Working",
+                            active_request=True,
+                        )
                 else:
                     progress_slot.progress(0.05, text="Program Generator is working...")
             else:
@@ -386,7 +390,7 @@ def _render_program_load_reference_form(context_payload: dict, user_id: str, con
         return
     context_id = str(context_payload.get("context_id", "program_context"))
     st.markdown("#### Load References")
-    st.caption("Choose one reference type for each weighted exercise, then submit the form.")
+    st.caption("Choose one reference type for each weighted exercise, or choose don't know to leave load blank.")
     with st.form(f"program_load_reference_form_{context_id}"):
         entries = []
         for exercise_name in exercise_names:
@@ -394,9 +398,34 @@ def _render_program_load_reference_form(context_payload: dict, user_id: str, con
             cols[0].markdown(f"**{exercise_name}**")
             ref_type = cols[1].selectbox(
                 "Type",
-                ["recent_set", "1rm"],
+                ["recent_set", "1rm", "unknown"],
+                format_func=lambda value: "don't know" if value == "unknown" else value,
                 key=_program_widget_key("program_load_type", context_id, exercise_name),
             )
+            if ref_type == "unknown":
+                cols[2].number_input(
+                    "Weight kg",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.5,
+                    disabled=True,
+                    key=_program_widget_key("program_load_weight", context_id, exercise_name),
+                )
+                cols[3].number_input(
+                    "Reps",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    disabled=True,
+                    key=_program_widget_key("program_load_reps", context_id, exercise_name),
+                )
+                entries.append(
+                    {
+                        "exercise_name": exercise_name,
+                        "type": "unknown",
+                    }
+                )
+                continue
             weight_kg = cols[2].number_input(
                 "Weight kg",
                 min_value=0.0,
@@ -436,8 +465,11 @@ def _render_program_load_reference_form(context_payload: dict, user_id: str, con
     missing = [
         item["exercise_name"]
         for item in entries
-        if item["weight_kg"] < 0
-        or (item["weight_kg"] == 0 and not _is_bodyweight_dependent_load_reference_name(item["exercise_name"]))
+        if item["type"] != "unknown"
+        and (
+            item["weight_kg"] < 0
+            or (item["weight_kg"] == 0 and not _is_bodyweight_dependent_load_reference_name(item["exercise_name"]))
+        )
     ]
     if missing:
         st.error("Enter a weight for: " + ", ".join(missing))
@@ -459,7 +491,11 @@ def _render_program_load_reference_form(context_payload: dict, user_id: str, con
         st.error(_response_error_detail(response))
 
 
-def _render_program_sop_progress(context_payload: dict, title: str = "Program Generation Progress") -> None:
+def _render_program_sop_progress(
+    context_payload: dict,
+    title: str = "Program Generation Progress",
+    active_request: bool = False,
+) -> None:
     sections = context_payload.get("sections", {})
     progress = sections.get("sop_progress", {})
     if not isinstance(progress, dict):
@@ -481,8 +517,8 @@ def _render_program_sop_progress(context_payload: dict, title: str = "Program Ge
         min(1.0, max(0.0, ratio)),
         text=f"{completed_count}/{total} SOP steps complete",
     )
-    status = context_payload.get("status") or "unknown"
-    pending_action = context_payload.get("pending_action")
+    status = "working" if active_request else (context_payload.get("status") or "unknown")
+    pending_action = None if active_request else context_payload.get("pending_action")
     st.caption(f"Current step: {current_label}. Status: {status}" + (f"; pending: {pending_action}" if pending_action else ""))
 
 

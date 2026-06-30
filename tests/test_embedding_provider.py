@@ -334,7 +334,48 @@ def test_program_sop_step_executor_has_room_for_long_intensity_decision():
         )
     )
 
-    assert fake_client.chat.completions.requests[0]["max_tokens"] == 8000
+    assert fake_client.chat.completions.requests[0]["max_tokens"] == 10000
+
+
+def test_program_sop_step_repair_prompt_includes_error_and_expected_shape():
+    settings = Settings(
+        _env_file=None,
+        llm_api_key="aihubmix-key",
+        llm_model_id="aihubmix-model",
+        llm_base_url="https://aihubmix.com/v1",
+    )
+    malformed = (
+        '{"step":"rest_periods","decision":{"rest_periods":{"Bench Press":150},'
+        '"rationale":"nested rationale"}},"rationale":"top rationale","assumptions":[],"warnings":[]}'
+    )
+    repaired = (
+        '{"step":"rest_periods","decision":{"rest_periods":{"Bench Press":150}},'
+        '"rationale":"top rationale","assumptions":[],"warnings":[]}'
+    )
+    fake_client = FakeSequenceChatClient([malformed, repaired])
+    provider = OpenAIProvider(settings)
+    provider._chat_client = fake_client
+
+    result = provider.generate_program_sop_step_decision(
+        ProgramSOPStepDecisionRequest(
+            task_type="program_generation",
+            sop_step="rest_periods",
+            user_message="Create a program",
+            collected_inputs={},
+            memory_context="",
+            weekly_summaries=[],
+            evidence=[],
+            previous_decisions={},
+            raw_plan={"sessions": []},
+        )
+    )
+
+    repair_prompt = fake_client.chat.completions.requests[1]["messages"][0]["content"]
+    assert result["rationale"] == "top rationale"
+    assert "Parser error:" in repair_prompt
+    assert "Extra data" in repair_prompt
+    assert "Expected root shape:" in repair_prompt
+    assert "The decision object must not contain rationale, assumptions, warnings, or step." in repair_prompt
 
 
 def test_program_evidence_query_planner_returns_clean_queries():

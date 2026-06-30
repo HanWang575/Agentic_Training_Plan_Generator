@@ -666,7 +666,11 @@ class OpenAIProvider:
         try:
             return _parse_json_object(raw_text, label=label)
         except StructuredOutputError as first_error:
-            repair_prompt = _build_json_repair_prompt(raw_text)
+            repair_prompt = _build_json_repair_prompt(
+                raw_text,
+                parse_error=str(first_error),
+                expected_shape=_expected_json_repair_shape(label),
+            )
             repaired_text = self._generate_chat_text(repair_prompt, max_tokens=max_tokens)
             try:
                 return _parse_json_object(repaired_text, label=f"{label}Repair")
@@ -735,11 +739,37 @@ def _json_error_excerpt(text: str, exc: json.JSONDecodeError, radius: int = 1200
     return text[start:end]
 
 
-def _build_json_repair_prompt(raw_text: str) -> str:
+def _expected_json_repair_shape(label: str) -> str:
+    if label == "SOPStepExecutor":
+        return (
+            '{\n'
+            '  "step": "current_sop_step",\n'
+            '  "decision": {"current_step_structured_fields": "values"},\n'
+            '  "rationale": "short reason grounded in the supplied context",\n'
+            '  "assumptions": [],\n'
+            '  "warnings": []\n'
+            '}\n'
+            'For SOPStepExecutor, keep rationale, assumptions, and warnings only at the top level. '
+            'The decision object must not contain rationale, assumptions, warnings, or step.'
+        )
+    return "One valid JSON object matching the original task prompt."
+
+
+def _build_json_repair_prompt(
+    raw_text: str,
+    parse_error: str | None = None,
+    expected_shape: str | None = None,
+) -> str:
+    error_block = f"Parser error:\n{parse_error}\n\n" if parse_error else ""
+    shape_block = f"Expected root shape:\n{expected_shape}\n\n" if expected_shape else ""
     return (
         "Repair the following malformed JSON into one valid JSON object. "
-        "Return only the repaired JSON object. Preserve all fields and values that are present. "
-        "Do not add markdown, comments, or explanation.\n\n"
+        "Use the parser error to fix the exact syntax problem, such as extra data, a missing comma, "
+        "or an extra closing brace. Return only the repaired JSON object. "
+        "Preserve all fields and values that are present, but move misplaced fields into the expected "
+        "root location when needed. Do not add markdown, comments, or explanation.\n\n"
+        f"{error_block}"
+        f"{shape_block}"
         "MALFORMED_JSON:\n"
         f"{raw_text}"
     )

@@ -69,6 +69,14 @@ def test_program_sop_prompt_includes_only_current_step_rules():
     assert "session_exercise_order" not in prompt
 
 
+def test_program_sop_prompt_keeps_rationale_top_level_only():
+    prompt = _program_sop_prompt("rest_periods")
+
+    assert "Put the current step's explanation only in the top-level `rationale` field." in prompt
+    assert "Do not put `rationale`, `assumptions`, `warnings`, or `step` inside the `decision` object." in prompt
+    assert "structured decision must include a `rationale` field" not in prompt
+
+
 def test_program_intensity_prompt_keeps_intensity_schema():
     prompt = _program_sop_prompt("programming_intensity_and_volume")
 
@@ -76,6 +84,13 @@ def test_program_intensity_prompt_keeps_intensity_schema():
     assert "weekly_estimated_progression_kg" in prompt
     assert "deload_session_intensity_reduction_percent" in prompt
     assert "session_exercise_order" in prompt
+
+
+def test_program_exercise_order_prompt_requires_training_day():
+    prompt = _program_sop_prompt("programming_exercises_and_order")
+
+    assert "include `training_day`" in prompt
+    assert "collected `training_days`" in prompt
 
 
 def test_program_evidence_query_planner_prompt_uses_current_sop_rules():

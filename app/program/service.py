@@ -295,6 +295,8 @@ class ProgramService:
         if not isinstance(effective_load_references, list):
             effective_load_references = [item.model_dump(mode="json") for item in request.load_references]
 
+        context.status = "open"
+        context.pending_action = None
         if route == "new_program":
             self._reset_new_program_sections(sections)
             context.active_sop = "new_program_design"
@@ -303,7 +305,6 @@ class ProgramService:
             answers = list(sections.get("user_clarification_answers", []))
             answers.append(sections["current_user_turn"])
             sections["user_clarification_answers"] = answers
-            context.pending_action = None
 
         request_row = ProgramRequest(
             request_id=f"preq_{uuid4().hex[:12]}",
@@ -797,13 +798,14 @@ class ProgramService:
             normalized["memory_context"] = _compact_memory_context_for_program_context(memory_context)
         working = normalized.get("new_program_working_state")
         if isinstance(working, dict):
-            normalized["new_program_working_state"] = _compact_calculated_plan_working_state(working)
+            normalized["new_program_working_state"] = _compact_program_working_state(working)
         original_retrieved_evidence = normalized.get("retrieved_evidence")
         retrieved_evidence, sop_progress = _normalize_retrieved_evidence_section(
             original_retrieved_evidence,
             context.current_sop_step,
             normalized.get("sop_progress", {}),
         )
+        sop_progress = _strip_load_calculation_example_reps(sop_progress)
         if isinstance(original_retrieved_evidence, list):
             latest_items = self._latest_step_evidence_items(context.context_id, context.current_sop_step)
             if latest_items is not None:
@@ -956,31 +958,16 @@ class ProgramService:
         profile_text: str,
         recent_status_text: str = "",
     ) -> dict[str, Any]:
-        extracted: dict[str, Any] = {}
-        if self.llm_provider and hasattr(self.llm_provider, "extract_program_inputs"):
-            try:
-                llm_inputs = self.llm_provider.extract_program_inputs(
-                    ProgramInputExtractionRequest(
-                        user_message=message,
-                        recent_status_text=recent_status_text,
-                        profile_text=profile_text,
-                    )
-                )
-                if isinstance(llm_inputs, dict):
-                    extracted.update(llm_inputs)
-            except (ConfigurationError, StructuredOutputError, ValueError, TypeError):
-                extracted = {}
-        if not extracted:
-            extracted.update(self._extract_inputs_deterministic("", profile_text))
-            extracted.update(self._extract_inputs_deterministic("", recent_status_text))
-            extracted.update(self._extract_inputs_deterministic(message, ""))
-        bodyweight = (
-            _extract_bodyweight_kg(message)
-            or _extract_bodyweight_kg(recent_status_text)
-            or _extract_bodyweight_kg(profile_text)
+        if not self.llm_provider or not hasattr(self.llm_provider, "extract_program_inputs"):
+            raise ConfigurationError("Program input extraction requires a configured LLM provider.")
+        llm_inputs = self.llm_provider.extract_program_inputs(
+            ProgramInputExtractionRequest(
+                user_message=message,
+                recent_status_text=recent_status_text,
+                profile_text=profile_text,
+            )
         )
-        if bodyweight is not None:
-            extracted["bodyweight_kg"] = bodyweight
+        extracted = dict(llm_inputs) if isinstance(llm_inputs, dict) else {}
         lift_maxes = self._extract_lift_maxes(message)
         if lift_maxes:
             extracted.update(lift_maxes)
@@ -990,123 +977,15 @@ class ProgramService:
             )
         return extracted
 
-    def _extract_inputs_deterministic(self, message: str, profile_text: str) -> dict[str, Any]:
-        combined = f"{profile_text}\n{message}"
-        lowered = combined.lower()
-        result: dict[str, Any] = {}
-        goals = {
-            "strength": ("strength", "powerlifting"),
-            "hypertrophy": ("muscle", "hypertrophy", "bodybuilding"),
-            "endurance": ("endurance", "running", "run", "hyrox"),
-            "general fitness": ("general fitness", "health", "fitness"),
-        }
-        for goal, terms in goals.items():
-            if any(term in lowered for term in terms):
-                result["goal"] = goal
-                break
-        priorities = _extract_physiological_priorities(combined)
-        if priorities:
-            result["physiological_priorities"] = priorities
-        age = _extract_age(combined)
-        if age is not None:
-            result["age"] = age
-        sex = _extract_sex(combined)
-        if sex:
-            result["sex"] = sex
-        height = _extract_height_cm(combined)
-        if height is not None:
-            result["height_cm"] = height
-        days = re.search(r"(?:days_per_week|days per week|available_training_days|train)\D{0,12}([1-7])", lowered)
-        if not days:
-            days = re.search(r"\b([1-7])\s*(?:days?|times?)\s*(?:per|a)?\s*week", lowered)
-        if days:
-            result["days_per_week"] = int(days.group(1))
-        training_days = _extract_training_days(combined)
-        if training_days:
-            result["training_days"] = training_days
-            result.setdefault("days_per_week", len(training_days))
-        duration = re.search(r"(?:session_duration_minutes|session duration|session|workout)\D{0,12}(\d{2,3})\s*(?:minutes?|mins?)", lowered)
-        if not duration:
-            duration = re.search(r"typical_session_duration_minutes\D{0,4}(\d{2,3})", lowered)
-        if duration:
-            result["session_duration_minutes"] = min(180, max(20, int(duration.group(1))))
-        program_duration = _extract_program_duration_weeks(combined)
-        if program_duration is not None:
-            result["program_duration_weeks"] = program_duration
-        bodyweight = _extract_bodyweight_kg(combined)
-        if bodyweight is not None:
-            result["bodyweight_kg"] = bodyweight
-        for level in ("beginner", "intermediate", "advanced"):
-            if level in lowered:
-                result["experience"] = level
-                break
-        equipment_terms = [term for term in ("full gym", "barbell", "dumbbell", "machine", "bodyweight", "home gym") if term in lowered]
-        if equipment_terms:
-            result["equipment"] = ", ".join(dict.fromkeys(equipment_terms))
-        if re.search(r"\b(no injuries|no injury|no medical issues|healthy|cleared to train)\b", lowered):
-            result["screening"] = "clear"
-            result.setdefault("medical_history", "no current injuries, medical conditions, or medication issues reported")
-        elif re.search(r"\b(injury|pain|illness|medical|medication)\b", lowered):
-            result["screening"] = "limited"
-            result.setdefault("medical_history", _extract_named_text(message, "medical_history") or "injury, pain, illness, medical condition, or medication concern reported")
-        lifestyle = _extract_lifestyle_work_demands(message)
-        if lifestyle:
-            result["lifestyle_work_demands"] = lifestyle
-        baseline = _extract_baseline_assessments(message)
-        if baseline:
-            result["baseline_assessments"] = baseline
-        named_patterns = {
-            "goal": r"goal\s*[:=]\s*([^,;\n]+)",
-            "physiological_priorities": r"physiological_priorities\s*[:=]\s*([^;\n]+)",
-            "experience": r"experience\s*[:=]\s*([^,;\n]+)",
-            "equipment": r"equipment\s*[:=]\s*([^;\n]+)",
-            "screening": r"screening\s*[:=]\s*([^,;\n]+)",
-            "medical_history": r"medical_history\s*[:=]\s*([^;\n]+)",
-            "baseline_assessments": r"baseline_assessments\s*[:=]\s*([^;\n]+)",
-            "lifestyle_work_demands": r"lifestyle_work_demands\s*[:=]\s*([^;\n]+)",
-            "sex": r"sex\s*[:=]\s*([^,;\n]+)",
-        }
-        for key, pattern in named_patterns.items():
-            match = re.search(pattern, message, flags=re.IGNORECASE)
-            if match:
-                value = match.group(1).strip()
-                result[key] = _extract_physiological_priorities(value) if key == "physiological_priorities" else value
-        for key, pattern in {
-            "days_per_week": r"days(?:_per_week| per week)?\s*[:=]\s*([1-7])",
-            "session_duration_minutes": r"(?:duration|session_duration_minutes)\s*[:=]\s*(\d{2,3})",
-            "age": r"age\s*[:=]\s*(\d{1,3})",
-            "height_cm": r"height(?:_cm)?\s*[:=]\s*(\d{2,3})",
-            "bodyweight_kg": r"(?:bodyweight_kg|bodyweight|body weight|bw)\s*[:=]\s*(\d+(?:\.\d+)?)",
-            "program_duration_weeks": r"(?:program_duration_weeks|program duration|duration_weeks)\s*[:=]\s*(\d{1,2})",
-        }.items():
-            match = re.search(pattern, message, flags=re.IGNORECASE)
-            if match:
-                number = float(match.group(1))
-                if key == "program_duration_weeks" and not 2 <= number <= 16:
-                    continue
-                result[key] = int(number) if key in {"age", "days_per_week", "session_duration_minutes", "program_duration_weeks"} else number
-        named_training_days = _extract_named_text(message, "training_days")
-        if named_training_days:
-            parsed_days = _extract_training_days(named_training_days)
-            if parsed_days:
-                result["training_days"] = parsed_days
-                result.setdefault("days_per_week", len(parsed_days))
-        return result
-
     def _extract_lift_maxes(self, message: str) -> dict[str, float]:
         if not message.strip():
             return {}
-        if self.llm_provider and hasattr(self.llm_provider, "extract_program_lift_maxes"):
-            try:
-                extracted = self.llm_provider.extract_program_lift_maxes(
-                    ProgramLiftMaxExtractionRequest(user_message=message)
-                )
-                cleaned = _sanitize_lift_maxes(extracted)
-                if cleaned:
-                    return cleaned
-            except (ConfigurationError, StructuredOutputError, ValueError, TypeError):
-                pass
-        return _extract_lift_maxes(message)
+        if not self.llm_provider or not hasattr(self.llm_provider, "extract_program_lift_maxes"):
+            raise ConfigurationError("Program lift-max extraction requires a configured LLM provider.")
+        extracted = self.llm_provider.extract_program_lift_maxes(
+            ProgramLiftMaxExtractionRequest(user_message=message)
+        )
+        return _sanitize_lift_maxes(extracted)
 
     def _red_flags(self, message: str, recent_status: str) -> list[dict[str, str]]:
         text = f"{message}\n{recent_status}".lower()
@@ -1290,9 +1169,10 @@ class ProgramService:
         if load_missing:
             question += (
                 "\n\nChoose `1rm` when you know a current one-rep max, or `recent_set` when you know a recent "
-                "weighted set. Keep one object for each exercise and fill `weight_kg` plus `reps`; for `1rm`, "
-                "use `reps: 1`. For pull-up/chin-up/dip variations, `weight_kg` means external added load only; "
-                "use `0` for bodyweight sets.\n\n```json\n"
+                "weighted set. Choose `unknown` when you have never tried the exercise or cannot provide a usable "
+                "reference; load_kg will be left blank for that exercise. For `1rm`, use `reps: 1`. For "
+                "pull-up/chin-up/dip variations, `weight_kg` means external added load only; use `0` for "
+                "bodyweight sets.\n\n```json\n"
                 + json.dumps(_load_reference_template(load_missing), indent=2)
                 + "\n```"
             )
@@ -1313,51 +1193,31 @@ class ProgramService:
             step,
             progress.get("decisions", {}),
         )
-        fallback_query = _fallback_program_evidence_query(step, message, inputs, relevant_decisions, attempt)
         if not hasattr(self.llm_provider, "plan_program_evidence_queries"):
-            return {
-                "planner": "deterministic_fallback",
-                "queries": [{"query": fallback_query, "purpose": "fallback query for current SOP step"}],
-                "rationale": "LLM evidence query planner is unavailable.",
-                "relevant_previous_decisions": relevant_decisions,
-            }
-        try:
-            result = self.llm_provider.plan_program_evidence_queries(
-                ProgramEvidenceQueryPlanRequest(
-                    sop_step=step,
-                    user_message=message,
-                    collected_inputs=inputs,
-                    relevant_previous_decisions=relevant_decisions,
-                    attempt=attempt,
-                    max_queries=3,
-                )
+            raise ConfigurationError("Program evidence query planning requires a configured LLM provider.")
+        result = self.llm_provider.plan_program_evidence_queries(
+            ProgramEvidenceQueryPlanRequest(
+                sop_step=step,
+                user_message=message,
+                collected_inputs=inputs,
+                relevant_previous_decisions=relevant_decisions,
+                attempt=attempt,
+                max_queries=3,
             )
-            queries = [
-                {"query": str(item.get("query", "")).strip(), "purpose": str(item.get("purpose", "")).strip()}
-                for item in result.queries
-                if str(item.get("query", "")).strip()
-            ]
-            if queries:
-                return {
-                    "planner": "llm",
-                    "queries": queries,
-                    "rationale": result.rationale,
-                    "relevant_previous_decisions": relevant_decisions,
-                }
-        except Exception as exc:
+        )
+        queries = [
+            {"query": str(item.get("query", "")).strip(), "purpose": str(item.get("purpose", "")).strip()}
+            for item in result.queries
+            if str(item.get("query", "")).strip()
+        ]
+        if queries:
             return {
-                "planner": "deterministic_fallback",
-                "queries": [{"query": fallback_query, "purpose": "fallback query after planner failure"}],
-                "rationale": "LLM evidence query planner failed; deterministic fallback was used.",
-                "planner_error": str(exc),
+                "planner": "llm",
+                "queries": queries,
+                "rationale": result.rationale,
                 "relevant_previous_decisions": relevant_decisions,
             }
-        return {
-            "planner": "deterministic_fallback",
-            "queries": [{"query": fallback_query, "purpose": "fallback query after empty planner output"}],
-            "rationale": "LLM evidence query planner returned no usable queries.",
-            "relevant_previous_decisions": relevant_decisions,
-        }
+        raise ValueError("LLM evidence query planner returned no usable queries.")
 
     def _query_evidence(self, context: ProgramContextRecord, message: str) -> None:
         sections = self._sections(context)
@@ -1516,7 +1376,6 @@ class ProgramService:
                     periodization=_periodization_from_sop_progress(progress, raw_plan),
                     intensity_volume_policy=_intensity_volume_policy_from_sop_progress(progress),
                 )
-                working.pop("calculated_plan", None)
                 output = self._load_calculation_step_output(working["calculation_artifacts"])
             else:
                 artifacts = working.get("calculation_artifacts")
@@ -1560,6 +1419,7 @@ class ProgramService:
                 "rest_periods",
             })
             raw_plan = _strip_raw_plan_sop_metadata(updated_plan)
+            _apply_training_days_to_raw_plan(raw_plan, collected_inputs)
             working["raw_plan"] = raw_plan
             working["pending_load_clarifications"] = self._missing_weighted_load_references(
                 raw_plan,
@@ -1583,7 +1443,6 @@ class ProgramService:
                 periodization=_periodization_from_sop_progress(progress, raw_plan),
                 intensity_volume_policy=_intensity_volume_policy_from_sop_progress(progress),
             )
-            working.pop("calculated_plan", None)
         if step == "rest_periods":
             output = self._rest_periods_step_output(working.get("calculation_artifacts", {}))
 
@@ -1621,6 +1480,7 @@ class ProgramService:
             "templates": {
                 "session": {
                     "name": "",
+                    "training_day": "",
                     "goal": "",
                     "duration_minutes": duration,
                     "exercises": [],
@@ -1684,7 +1544,7 @@ class ProgramService:
                     continue
                 entry = by_exercise.setdefault(
                     name,
-                    {"exercise": name, "min_load_kg": None, "max_load_kg": None, "example_reps": first_set.get("reps")},
+                    {"exercise": name, "min_load_kg": None, "max_load_kg": None},
                 )
                 load = float(first_set.get("load_kg"))
                 entry["min_load_kg"] = load if entry["min_load_kg"] is None else min(entry["min_load_kg"], load)
@@ -1719,22 +1579,6 @@ class ProgramService:
                 name = str(exercise.get("name", ""))
                 rests[name] = {"exercise": name, "rest_seconds": first_set.get("rest_seconds")}
         return list(rests.values())
-
-    def _validate_raw_plan(self, raw_plan: dict[str, Any]) -> None:
-        if not raw_plan.get("title") or not raw_plan.get("sessions"):
-            raise ValueError("Program generator returned a plan without title or sessions.")
-        if not isinstance(raw_plan["sessions"], list):
-            raise ValueError("Program sessions must be a list.")
-        for session in raw_plan["sessions"]:
-            for exercise in session.get("exercises", []):
-                load_type = str(exercise.get("load_type") or "").strip().lower()
-                if not load_type:
-                    load_type = "bodyweight" if _is_bodyweight_exercise(exercise) else "weighted"
-                    exercise["load_type"] = load_type
-                if load_type not in {"weighted", "bodyweight"}:
-                    raise ValueError(
-                        f"Exercise '{exercise.get('name', '')}' has invalid load_type '{load_type}'."
-                    )
 
     def _missing_weighted_load_references(
         self,
@@ -1785,6 +1629,9 @@ class ProgramService:
         if not reference:
             cache[key] = (None, "missing_load_reference")
             return cache[key]
+        if reference.get("source") == "user_marked_unknown_load_reference" or reference.get("type") == "unknown":
+            cache[key] = (None, "unknown_load_reference")
+            return cache[key]
         external_weight = float(reference["weight_kg"])
         reps = int(reference.get("reps", 1))
         if is_bodyweight_dependent:
@@ -1829,7 +1676,6 @@ class ProgramService:
             intensity_volume_policy=_intensity_volume_policy_from_sop_progress(sections.get("sop_progress", {})),
         )
         working["calculation_artifacts"] = artifacts
-        working.pop("calculated_plan", None)
         sections[working_key] = working
         self._checkpoint(context, sections)
 
@@ -1843,15 +1689,23 @@ class ProgramService:
         intensity_volume_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         periodization = periodization if isinstance(periodization, dict) else raw.get("periodization", {})
+        _apply_training_days_to_raw_plan(raw, inputs)
         weeks = int(max(1, min(52, _coerce_float(periodization.get("weeks"), 4))))
         raw_sessions = list(raw.get("sessions", []))
-        days_source = len(raw_sessions) if raw_sessions else inputs.get("days_per_week", 3)
+        collected_training_days = _normalize_training_days_value(inputs.get("training_days", []))
+        days_source = len(collected_training_days) if collected_training_days else len(raw_sessions) if raw_sessions else inputs.get("days_per_week", 3)
         days = int(max(1, min(7, days_source)))
-        templates = raw_sessions[:days]
+        templates = [dict(item) if isinstance(item, dict) else item for item in raw_sessions[:days]]
         if not templates:
             raise ValueError("At least one session template is required.")
         while len(templates) < days:
-            templates.append(templates[len(templates) % len(raw["sessions"])])
+            source_template = templates[len(templates) % len(raw["sessions"])]
+            templates.append(dict(source_template) if isinstance(source_template, dict) else source_template)
+        session_training_days = _session_training_days(templates, inputs)
+        for template_index, training_day in enumerate(session_training_days):
+            if training_day and template_index < len(templates) and isinstance(templates[template_index], dict):
+                templates[template_index]["training_day"] = training_day
+        raw["sessions"] = templates
         start_date = _next_monday(datetime.now(timezone.utc))
         profile = str(memory_context.get("sections", {}).get("profile", ""))
         intensity_volume_policy = intensity_volume_policy if isinstance(intensity_volume_policy, dict) else {}
@@ -1875,6 +1729,7 @@ class ProgramService:
         slot_set_count_cache: dict[str, int] = {}
         for week in range(1, weeks + 1):
             for day_index, template in enumerate(templates, start=1):
+                training_day = session_training_days[day_index - 1] if day_index - 1 < len(session_training_days) else None
                 session_id = f"psess_{uuid4().hex[:12]}"
                 duration = self._calculation(
                     trace_id,
@@ -1923,10 +1778,6 @@ class ProgramService:
                         trace_id,
                         training_max_cache,
                     )
-                    if not is_bodyweight and one_rm is None:
-                        raise ValueError(
-                            f"Weighted exercise '{exercise.get('name', '')}' has no 1RM or recent performance record."
-                        )
                     reps = exercise_reps
                     raw_intensity_value = _coerce_float(exercise.get("intensity_percent"), None)
                     weekly_estimated_progression_kg = _policy_week_float(
@@ -2098,10 +1949,14 @@ class ProgramService:
                 sessions.append(
                     {
                         "session_id": session_id,
-                        "planned_date": (start_date + timedelta(weeks=week - 1, days=day_index - 1)).isoformat(),
+                        "planned_date": _planned_training_datetime(start_date, week, day_index, training_day).isoformat(),
                         "week_number": week,
                         "day_number": day_index,
-                        "session_type": str(template.get("name", f"Session {day_index}")),
+                        "session_type": _session_type_with_training_day(
+                            str(template.get("name", f"Session {day_index}")),
+                            training_day,
+                            f"Session {day_index}",
+                        ),
                         "goal": str(template.get("goal", raw.get("goal", "general fitness"))),
                         "duration_minutes": int(self._calculation_value(duration)),
                         "duration_calculation_trace_id": duration,
@@ -2281,7 +2136,9 @@ class ProgramService:
                 calculation_trace_ids_json=_dumps(exercise_data.get("calculation_trace_ids", [])),
             )
             self.session.add(exercise)
-            for set_data in _calculated_sets_for_exercise(exercise_data):
+            for set_data in exercise_data.get("sets", []):
+                if not isinstance(set_data, dict):
+                    continue
                 self.session.add(
                     SetPrescription(
                         set_prescription_id=set_data["set_id"],
@@ -2768,7 +2625,7 @@ def _stringify_memory_context_section(value: Any) -> str:
     return _dumps(value)
 
 
-def _compact_calculated_plan_working_state(working: dict[str, Any]) -> dict[str, Any]:
+def _compact_program_working_state(working: dict[str, Any]) -> dict[str, Any]:
     compacted = dict(working)
     compacted.pop("step_outputs", None)
     if isinstance(compacted.get("raw_plan"), dict):
@@ -2777,34 +2634,7 @@ def _compact_calculated_plan_working_state(working: dict[str, Any]) -> dict[str,
         compacted["calculation_artifacts"] = _compact_calculation_artifacts_set_groups(
             compacted["calculation_artifacts"]
         )
-    if "calculated_plan" not in compacted or compacted.get("calculation_artifacts"):
-        return compacted
-    calculated_plan = compacted.get("calculated_plan")
-    if not isinstance(calculated_plan, dict):
-        return compacted
-    compacted["calculation_artifacts"] = _calculation_artifacts_from_calculated_plan(
-        calculated_plan,
-        compacted.get("raw_plan", {}),
-    )
-    compacted.pop("calculated_plan", None)
     return compacted
-
-
-def _calculation_artifacts_from_calculated_plan(
-    calculated_plan: dict[str, Any],
-    raw_plan: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    raw_periodization = (raw_plan or {}).get("periodization", {})
-    calculated_periodization = calculated_plan.get("periodization", {})
-    return {
-        "schema": "calculated_plan_delta_v1",
-        "calculated_sessions": _compact_calculated_sessions_set_groups(calculated_plan.get("sessions", [])),
-        "calculated_periodization": {
-            key: value
-            for key, value in calculated_periodization.items()
-            if not isinstance(raw_periodization, dict) or raw_periodization.get(key) != value
-        },
-    }
 
 
 RAW_PLAN_SOP_METADATA_KEYS = {
@@ -2864,11 +2694,7 @@ def _strip_raw_plan_set_details(raw_plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def _calculated_sets_for_exercise(exercise: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return expanded calculated set rows from either legacy sets or compact set_groups."""
-
-    sets = exercise.get("sets")
-    if isinstance(sets, list):
-        return [dict(item) for item in sets if isinstance(item, dict)]
+    """Return expanded calculated set rows from compact set_groups."""
 
     expanded: list[dict[str, Any]] = []
     groups = exercise.get("set_groups")
@@ -2985,10 +2811,7 @@ def _expand_calculated_sessions_set_groups(sessions: list[dict[str, Any]]) -> li
 
 
 def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(working.get("calculated_plan"), dict):
-        raw_plan = dict(working["calculated_plan"])
-    else:
-        raw_plan = _strip_raw_plan_sop_metadata(dict(working.get("raw_plan") or {}))
+    raw_plan = _strip_raw_plan_sop_metadata(dict(working.get("raw_plan") or {}))
     artifacts = working.get("calculation_artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("Calculated plan is missing calculation artifacts.")
@@ -2998,7 +2821,7 @@ def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict
     calculated_periodization = artifacts.get("calculated_periodization", {})
     if not isinstance(calculated_periodization, dict):
         raise ValueError("Calculation artifacts have invalid calculated_periodization.")
-    metadata = _program_metadata_from_sop_progress(sections.get("sop_progress", {}), working, raw_plan)
+    metadata = _program_metadata_from_sop_progress(sections.get("sop_progress", {}), raw_plan)
     periodization = {
         **metadata["periodization"],
         **calculated_periodization,
@@ -3018,14 +2841,11 @@ def _build_calculated_plan_from_sections(working: dict[str, Any], sections: dict
 
 def _program_metadata_from_sop_progress(
     sop_progress: dict[str, Any],
-    working: dict[str, Any],
     raw_plan: dict[str, Any],
 ) -> dict[str, Any]:
-    legacy_raw = working.get("raw_plan", {}) if isinstance(working.get("raw_plan"), dict) else {}
-    legacy_metadata = working.get("plan_metadata", {}) if isinstance(working.get("plan_metadata"), dict) else {}
     screening_decision = _sop_decision_payload(sop_progress, "consultation_and_screening")
     needs_decision = _sop_decision_payload(sop_progress, "needs_analysis")
-    periodization_decision = _periodization_from_sop_progress(sop_progress, legacy_metadata or legacy_raw)
+    periodization_decision = _periodization_from_sop_progress(sop_progress)
     planning_decision = _sop_decision_payload(sop_progress, "planning_model")
     planning_model = planning_decision.get("planning_model", planning_decision) if isinstance(planning_decision, dict) else {}
     if not isinstance(planning_model, dict):
@@ -3035,20 +2855,11 @@ def _program_metadata_from_sop_progress(
     screening = screening_decision.get("screening", screening_decision) if isinstance(screening_decision, dict) else {}
     needs_analysis = needs_decision.get("needs_analysis", needs_decision) if isinstance(needs_decision, dict) else {}
     return {
-        "screening": (
-            screening
-            if isinstance(screening, dict) and screening
-            else legacy_metadata.get("screening", legacy_raw.get("screening", {}))
-        ),
-        "needs_analysis": (
-            needs_analysis
-            if isinstance(needs_analysis, dict) and needs_analysis
-            else legacy_metadata.get("needs_analysis", legacy_raw.get("needs_analysis", {}))
-        ),
+        "screening": screening if isinstance(screening, dict) else {},
+        "needs_analysis": needs_analysis if isinstance(needs_analysis, dict) else {},
         "periodization": periodization_decision,
         "planning_model": str(
             planning_model.get("model")
-            or legacy_metadata.get("planning_model")
             or periodization_decision.get("model")
             or "parallel"
         ),
@@ -3058,25 +2869,9 @@ def _program_metadata_from_sop_progress(
     }
 
 
-def _metadata_from_legacy_raw_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
-    periodization = raw_plan.get("periodization", {}) if isinstance(raw_plan.get("periodization"), dict) else {}
-    planning_model = raw_plan.get("planning_model")
-    if isinstance(planning_model, dict):
-        planning_model = planning_model.get("model")
-    return {
-        "screening": raw_plan.get("screening", {}) if isinstance(raw_plan.get("screening"), dict) else {},
-        "needs_analysis": raw_plan.get("needs_analysis", {}) if isinstance(raw_plan.get("needs_analysis"), dict) else {},
-        "periodization": periodization,
-        "planning_model": str(planning_model or periodization.get("model") or "parallel"),
-    }
-
-
 def _periodization_from_sop_progress(sop_progress: dict[str, Any], raw_plan: dict[str, Any] | None = None) -> dict[str, Any]:
-    raw_plan = raw_plan if isinstance(raw_plan, dict) else {}
     decision = _sop_decision_payload(sop_progress, "periodization")
     periodization = decision.get("periodization", decision) if isinstance(decision, dict) else {}
-    if not isinstance(periodization, dict) or not periodization:
-        periodization = raw_plan.get("periodization", {}) if isinstance(raw_plan.get("periodization"), dict) else {}
     if not periodization:
         periodization = {"weeks": 4, "macrocycle": "four_week_block", "phases": []}
     return dict(periodization)
@@ -3347,6 +3142,38 @@ def _normalize_retrieved_evidence_section(
     return {"current_step": step or None, "items": []}, progress
 
 
+def _strip_load_calculation_example_reps(sop_progress: Any) -> dict[str, Any]:
+    progress = dict(sop_progress) if isinstance(sop_progress, dict) else {}
+    decisions = progress.get("decisions")
+    if not isinstance(decisions, dict):
+        return progress
+    load_calculation = decisions.get("load_calculation")
+    if not isinstance(load_calculation, dict):
+        return progress
+    summary = load_calculation.get("weighted_load_summary")
+    if not isinstance(summary, list):
+        return progress
+    cleaned_summary = []
+    changed = False
+    for item in summary:
+        if not isinstance(item, dict):
+            cleaned_summary.append(item)
+            continue
+        cleaned_item = dict(item)
+        if "example_reps" in cleaned_item:
+            cleaned_item.pop("example_reps", None)
+            changed = True
+        cleaned_summary.append(cleaned_item)
+    if not changed:
+        return progress
+    cleaned_load_calculation = dict(load_calculation)
+    cleaned_load_calculation["weighted_load_summary"] = cleaned_summary
+    cleaned_decisions = dict(decisions)
+    cleaned_decisions["load_calculation"] = cleaned_load_calculation
+    progress["decisions"] = cleaned_decisions
+    return progress
+
+
 def _current_evidence_items(sections: dict[str, Any]) -> list[dict[str, Any]]:
     retrieved = sections.get("retrieved_evidence", {})
     if isinstance(retrieved, dict):
@@ -3383,52 +3210,6 @@ def _relevant_previous_decisions_for_evidence_planning(
         for key in relevant_by_step.get(step, ())
         if key in decisions
     }
-
-
-def _fallback_program_evidence_query(
-    step: str,
-    message: str,
-    inputs: dict[str, Any],
-    relevant_decisions: dict[str, Any],
-    attempt: int,
-) -> str:
-    goal = inputs.get("goal", "strength")
-    experience = inputs.get("experience", "unknown")
-    days = inputs.get("days_per_week", "unknown")
-    step_terms = {
-        "consultation_and_screening": "pre-exercise screening health readiness injury pain medical clearance contraindications",
-        "needs_analysis": "strength training needs analysis goal demands training status constraints equipment movement needs limiting factors",
-        "periodization": "strength training periodization macrocycle mesocycle microcycle phases deload peak timeline",
-        "planning_model": "strength training planning model parallel sequential emphasis organization of training factors",
-        "programming_exercises_and_order": "strength training exercise selection exercise order frequency movement pattern accessories compound lifts",
-        "programming_intensity_and_volume": "strength training intensity volume sets reps RPE percent 1RM progression deload workload",
-        "rest_periods": "strength training rest interval compound accessory exercise fatigue recovery rest periods",
-    }.get(step, "evidence based strength training program design")
-    decision_terms = " ".join(_important_decision_terms(relevant_decisions))[:600]
-    return (
-        f"{step_terms}; {experience} trainee; goal {goal}; {days} training days per week; "
-        f"attempt {attempt}; prior decisions {decision_terms}; user request {message[:240]}"
-    )
-
-
-def _important_decision_terms(value: Any) -> list[str]:
-    terms: list[str] = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in {"rationale", "warnings", "assumptions"}:
-                continue
-            if isinstance(child, (str, int, float)):
-                terms.append(f"{key} {child}")
-            elif isinstance(child, list):
-                terms.append(f"{key} " + " ".join(str(item) for item in child[:8]))
-            elif isinstance(child, dict):
-                terms.extend(_important_decision_terms(child))
-    elif isinstance(value, list):
-        for item in value[:8]:
-            terms.extend(_important_decision_terms(item))
-    elif value not in (None, ""):
-        terms.append(str(value))
-    return terms[:40]
 
 
 def _rank_program_evidence_with_rrf(
@@ -3582,70 +3363,6 @@ def _weekly_plan_signals(active_plan: Any, week_start: date, week_end: date) -> 
         if week_start <= event_date <= week_end:
             change_types.append(str(event.get("event_type", "progress_update")))
     return len(planned_ids), completed, list(dict.fromkeys(change_types))
-
-
-def _extract_lift_maxes(message: str) -> dict[str, float]:
-    values: dict[str, float] = {}
-    lift_aliases = (
-        ("bench press", "bench_press_1rm_kg"),
-        ("bench", "bench_press_1rm_kg"),
-        ("squat", "squat_1rm_kg"),
-        ("deadlift", "deadlift_1rm_kg"),
-        ("overhead press", "overhead_press_1rm_kg"),
-    )
-    exact_keys: set[str] = set()
-    for _, key in lift_aliases:
-        named = re.search(rf"{re.escape(key)}\s*[:=]\s*(\d+(?:\.\d+)?)", message, re.IGNORECASE)
-        if named:
-            values[key] = float(named.group(1))
-            exact_keys.add(key)
-
-    sbd = re.search(
-        r"\bSBD\b\D{0,12}(\d+(?:\.\d+)?)\s*kg?\D{0,12}(\d+(?:\.\d+)?)\s*kg?\D{0,12}(\d+(?:\.\d+)?)\s*kg?",
-        message,
-        re.IGNORECASE,
-    )
-    if sbd:
-        for key, group_index in (
-            ("squat_1rm_kg", 1),
-            ("bench_press_1rm_kg", 2),
-            ("deadlift_1rm_kg", 3),
-        ):
-            values.setdefault(key, float(sbd.group(group_index)))
-
-    max_marker = r"(?:1\s*rm|one\s*rep\s*max|max|\bpr\b|personal\s+record)"
-    for lift_name, key in lift_aliases:
-        if key in exact_keys:
-            continue
-        for lift_match in re.finditer(rf"\b{re.escape(lift_name)}\b", message, re.IGNORECASE):
-            segment = message[lift_match.start() : lift_match.start() + 100]
-            segment = re.split(r"[\n.;]", segment, maxsplit=1)[0]
-            direct = re.search(
-                rf"\b{re.escape(lift_name)}\b\s*{max_marker}\s*[:=]?\s*(\d+(?:\.\d+)?)\s*kg",
-                segment,
-                re.IGNORECASE,
-            )
-            marked = re.search(
-                rf"\b{re.escape(lift_name)}\b[^\n.;]{{0,50}}?{max_marker}[^\n.;]{{0,25}}?(\d+(?:\.\d+)?)\s*kg",
-                segment,
-                re.IGNORECASE,
-            )
-            match = direct or marked
-            if match:
-                values[key] = float(match.group(1))
-                break
-
-    for lift_name, key in lift_aliases:
-        if key in exact_keys:
-            continue
-        natural = re.search(
-            rf"{max_marker}[^\n.;]{{0,35}}?\b{re.escape(lift_name)}\b[^\n.;]{{0,35}}?(\d+(?:\.\d+)?)\s*kg",
-            message,
-            re.IGNORECASE,
-        )
-        if natural:
-            values[key] = float(natural.group(1))
-    return values
 
 
 def _sanitize_lift_maxes(value: Any) -> dict[str, float]:
@@ -3952,143 +3669,6 @@ def _extract_bodyweight_kg(text: str) -> float | None:
     return None
 
 
-def _extract_age(text: str) -> int | None:
-    if not text:
-        return None
-    patterns = (
-        r"\bage\b\D{0,8}(\d{1,3})\b",
-        r"\b(\d{1,3})\s*(?:yo|y/o|years?\s*old)\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = int(match.group(1))
-        if 10 <= value <= 100:
-            return value
-    return None
-
-
-def _extract_sex(text: str) -> str | None:
-    if not text:
-        return None
-    lowered = text.lower()
-    if re.search(r"\b(female|woman|girl)\b", lowered):
-        return "female"
-    if re.search(r"\b(male|man|boy)\b", lowered):
-        return "male"
-    for pattern in (r"\bsex\b\s*[:=]\s*([^,;\n]+)", r"\bgender\b\s*[:=]\s*([^,;\n]+)"):
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip()[:80]
-    return None
-
-
-def _extract_height_cm(text: str) -> float | None:
-    if not text:
-        return None
-    patterns = (
-        r"\bheight\b\D{0,12}(\d{2,3}(?:\.\d+)?)\s*cm\b",
-        r"\b(\d{2,3}(?:\.\d+)?)\s*cm\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = float(match.group(1))
-        if 50 <= value <= 250:
-            return value
-    return None
-
-
-def _extract_program_duration_weeks(text: str) -> int | None:
-    if not text:
-        return None
-    patterns = (
-        r"\b(?:program_duration_weeks|duration_weeks)\b\D{0,8}(\d{1,2})\b",
-        r"\b(?:program duration|plan duration|for)\D{0,12}(\d{1,2})\s*weeks?\b",
-        r"\b(\d{1,2})\s*week(?:s)?\s*(?:program|plan|block)\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = int(match.group(1))
-        if 2 <= value <= 16:
-            return value
-    return None
-
-
-def _extract_training_days(text: str) -> list[str]:
-    if not text:
-        return []
-    lowered = text.lower()
-    aliases = {
-        "monday": ("monday", "mon"),
-        "tuesday": ("tuesday", "tue", "tues"),
-        "wednesday": ("wednesday", "wed"),
-        "thursday": ("thursday", "thu", "thur", "thurs"),
-        "friday": ("friday", "fri"),
-        "saturday": ("saturday", "sat"),
-        "sunday": ("sunday", "sun"),
-    }
-    days: list[str] = []
-    for day, names in aliases.items():
-        if any(re.search(rf"\b{re.escape(name)}\b", lowered) for name in names):
-            days.append(day)
-    return days
-
-
-def _extract_physiological_priorities(text: str) -> list[str]:
-    lowered = text.lower()
-    priorities: list[str] = []
-    for label, patterns in {
-        "strength": ("strength", "powerlifting", "maximal strength"),
-        "power": ("power", "explosive"),
-        "hypertrophy": ("hypertrophy", "muscle growth", "bodybuilding"),
-        "muscular endurance": ("muscular endurance", "strength endurance"),
-    }.items():
-        if any(pattern in lowered for pattern in patterns):
-            priorities.append(label)
-    return list(dict.fromkeys(priorities))
-
-
-def _extract_named_text(text: str, key: str) -> str | None:
-    match = re.search(rf"\b{re.escape(key)}\b\s*[:=]\s*([^;\n]+)", text, flags=re.IGNORECASE)
-    return match.group(1).strip() if match else None
-
-
-def _extract_lifestyle_work_demands(text: str) -> str | None:
-    named = _extract_named_text(text, "lifestyle_work_demands")
-    if named:
-        return named
-    match = re.search(r"\b(?:job|work|occupation|daily activities)\b\s*[:=]\s*([^;\n]+)", text, flags=re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    lowered = text.lower()
-    if re.search(r"\b(desk job|office job|sedentary work|manual labor|physical job|shift work|prolonged sitting|repeated lifting)\b", lowered):
-        return re.search(
-            r"((?:desk job|office job|sedentary work|manual labor|physical job|shift work|prolonged sitting|repeated lifting)[^.;\n]*)",
-            text,
-            flags=re.IGNORECASE,
-        ).group(1).strip()
-    if re.search(r"\b(no relevant work demands|no physical work demands|nothing relevant)\b", lowered):
-        return "none relevant"
-    return None
-
-
-def _extract_baseline_assessments(text: str) -> str | None:
-    named = _extract_named_text(text, "baseline_assessments")
-    if named:
-        return named
-    lift_maxes = _extract_lift_maxes(text)
-    if lift_maxes:
-        return ", ".join(f"{key}={value:g}kg" for key, value in sorted(lift_maxes.items()))
-    if re.search(r"\b(no baseline|no testing|no assessment|no recent test)\b", text, flags=re.IGNORECASE):
-        return "none available"
-    return None
-
-
 def _bodyweight_kg(profile: str, inputs: dict[str, Any] | None = None) -> float | None:
     if inputs and inputs.get("bodyweight_kg") not in (None, ""):
         try:
@@ -4149,6 +3729,7 @@ def _load_reference_template(exercise_names: list[str]) -> dict[str, Any]:
                 "type": "recent_set",
                 "weight_kg": None,
                 "reps": None,
+                "allowed_types": ["recent_set", "1rm", "unknown"],
             }
             for exercise_name in exercise_names
         ]
@@ -4364,6 +3945,83 @@ def _normalize_training_days_value(value: Any) -> list[str]:
     return days
 
 
+WEEKDAY_OFFSETS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _session_training_days(templates: list[dict[str, Any]], inputs: dict[str, Any]) -> list[str | None]:
+    collected_days = _normalize_training_days_value(inputs.get("training_days", []))
+    assigned: list[str | None] = []
+    used: set[str] = set()
+    for index, template in enumerate(templates):
+        explicit_day = _normalize_single_training_day(template.get("training_day"))
+        if explicit_day and (not collected_days or explicit_day in collected_days) and explicit_day not in used:
+            day = explicit_day
+        elif index < len(collected_days):
+            day = collected_days[index]
+        else:
+            day = explicit_day
+        assigned.append(day)
+        if day:
+            used.add(day)
+    return assigned
+
+
+def _apply_training_days_to_raw_plan(raw_plan: dict[str, Any], inputs: dict[str, Any]) -> dict[str, Any]:
+    sessions = raw_plan.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return raw_plan
+    templates = [dict(item) if isinstance(item, dict) else item for item in sessions]
+    training_days = _session_training_days(
+        [item for item in templates if isinstance(item, dict)],
+        inputs,
+    )
+    day_index = 0
+    for template in templates:
+        if not isinstance(template, dict):
+            continue
+        training_day = training_days[day_index] if day_index < len(training_days) else None
+        if training_day:
+            template["training_day"] = training_day
+        day_index += 1
+    raw_plan["sessions"] = templates
+    return raw_plan
+
+
+def _normalize_single_training_day(value: Any) -> str | None:
+    days = _normalize_training_days_value(value)
+    return days[0] if days else None
+
+
+def _planned_training_datetime(
+    week_start: datetime,
+    week: int,
+    day_index: int,
+    training_day: str | None,
+) -> datetime:
+    offset = WEEKDAY_OFFSETS.get(str(training_day or "").lower(), day_index - 1)
+    return week_start + timedelta(weeks=week - 1, days=max(0, min(6, int(offset))))
+
+
+def _session_type_with_training_day(name: str, training_day: str | None, fallback: str) -> str:
+    cleaned = name.strip() or fallback
+    if not training_day:
+        return cleaned
+    day_label = str(training_day).capitalize()
+    weekday_pattern = r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b\s*(?:[-:|]\s*)?"
+    if re.match(weekday_pattern, cleaned, flags=re.IGNORECASE):
+        suffix = re.sub(weekday_pattern, "", cleaned, count=1, flags=re.IGNORECASE).strip()
+        return f"{day_label} - {suffix}" if suffix else day_label
+    return f"{day_label} - {cleaned}"
+
+
 def _screening_from_medical_history(text: str) -> str:
     lowered = text.lower()
     if re.search(r"\b(no|none|without|clear|healthy|injury[-\s]*free)\b", lowered):
@@ -4384,6 +4042,15 @@ def _extract_exercise_load_references(
             continue
         segment = _exercise_message_segment(message, exercise_name, exercise_names)
         if not segment:
+            continue
+        if re.search(r"\b(?:unknown|not\s+sure|unsure|don'?t\s+know|never\s+tried|no\s+reference)\b", segment, re.IGNORECASE):
+            references[key] = {
+                "exercise_name": exercise_name,
+                "type": "unknown",
+                "weight_kg": None,
+                "reps": None,
+                "source": "user_marked_unknown_load_reference",
+            }
             continue
         if _is_bodyweight_dependent_weighted_exercise_name(exercise_name):
             bodyweight_match = re.search(
@@ -4475,6 +4142,16 @@ def _normalize_structured_load_references(
         key = _normalize_exercise_name(str(item.get("exercise_name") or item.get("exercise") or item.get("name") or ""))
         if key not in allowed:
             continue
+        raw_type = str(item.get("type") or item.get("reference_type") or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if raw_type in {"unknown", "dont_know", "don_t_know", "do_not_know", "not_sure", "unsure", "no_reference"}:
+            references[key] = {
+                "exercise_name": allowed[key],
+                "type": "unknown",
+                "weight_kg": None,
+                "reps": None,
+                "source": "user_marked_unknown_load_reference",
+            }
+            continue
         try:
             weight = float(item.get("weight_kg"))
         except (TypeError, ValueError):
@@ -4482,7 +4159,6 @@ def _normalize_structured_load_references(
         is_bodyweight_dependent = _is_bodyweight_dependent_weighted_exercise_name(allowed[key])
         if weight < 0 or (weight == 0 and not is_bodyweight_dependent):
             continue
-        raw_type = str(item.get("type") or item.get("reference_type") or "").strip().lower().replace("-", "_").replace(" ", "_")
         try:
             reps = int(item.get("reps")) if item.get("reps") not in (None, "") else None
         except (TypeError, ValueError):
@@ -4500,6 +4176,7 @@ def _normalize_structured_load_references(
             source = "current_user_turn_1rm" if reps == 1 else "current_user_turn_recent_performance"
         references[key] = {
             "exercise_name": allowed[key],
+            "type": "1rm" if reps == 1 else "recent_set",
             "weight_kg": weight,
             "reps": reps,
             "source": source,
