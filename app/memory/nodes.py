@@ -43,7 +43,6 @@ MEMORY_SECTION_TOKEN_BUDGETS = {
     "profile": 3000,
     "recent_status": 3000,
     "active_plan_progress": 5000,
-    "training_log_summary": 4000,
 }
 
 

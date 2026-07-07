@@ -921,19 +921,17 @@ def test_xunji_import_is_idempotent_and_summarized(tmp_path: Path):
 
     imported = service.import_xunji(request)
     duplicate = service.import_xunji(request)
-    summary = service.get_training_log_summary("usr_test", days=30)
+    listed_sessions = service.list_training_sessions("usr_test")
 
     assert imported.imported is True
     assert imported.sessions_imported == 1
     assert duplicate.skipped_duplicate is True
-    assert summary.session_count == 1
-    assert summary.sport_counts == {"strength": 1}
+    assert listed_sessions.session_count == 1
+    assert listed_sessions.sessions[0].sport_type == "strength"
+    assert listed_sessions.sessions[0].notes == "Felt solid."
+    assert listed_sessions.sessions[0].exercises[0]["name"] == "Squat"
     context = service.get_memory_context("usr_test", query="Review my recent training.")
-    training_summary = context.sections["training_log_summary"]
-    assert "exercises_count: 1" in training_summary
-    assert "Squat" in training_summary
-    assert "sets_summary" in training_summary or "sets=3" in training_summary
-    assert "notes=Felt solid." in training_summary
+    assert "training_log_summary" not in context.sections
     session.close()
 
 
@@ -1015,9 +1013,7 @@ def test_xunji_import_labels_sport_type_drops_overlapping_less_detailed_session_
     assert "time" not in strength_only.sessions[0].exercises[0]["sets"][0]
     assert "time" in strength_only.sessions[0].raw_payload["movements"][0]["sets"][0]
     context = service.get_memory_context("usr_test", query="Review my recent training.")
-    training_summary = context.sections["training_log_summary"]
-    assert "Bench Press" in training_summary
-    assert "time=180" not in training_summary
+    assert "training_log_summary" not in context.sections
     session.close()
 
 

@@ -174,14 +174,6 @@ def create_mcp_server():
             return plan.model_dump() if plan else None
 
     @mcp.tool()
-    def get_training_log_summary(user_id: str, days: int = 30) -> dict:
-        """Return a recent imported training-log summary."""
-
-        with Session(engine) as session:
-            service = MemoryService(session=session, settings=get_settings())
-            return service.get_training_log_summary(user_id=user_id, days=days).model_dump()
-
-    @mcp.tool()
     def activate_approved_plan(
         user_id: str,
         program_id: str,

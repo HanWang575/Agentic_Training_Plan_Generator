@@ -40,7 +40,6 @@ from app.memory.schemas import (
     TrainingLogImportResponse,
     TrainingLogXunjiSyncRequest,
     TrainingLogXunjiSyncResponse,
-    TrainingLogSummaryResponse,
     TrainingSessionListResponse,
     UserCreateRequest,
     UserOut,
@@ -555,13 +554,3 @@ def list_training_sessions(
         limit=limit,
     )
 
-
-@router.get("/training-log/summary", response_model=TrainingLogSummaryResponse)
-def get_training_log_summary(
-    user_id: str,
-    days: int = 30,
-    service: MemoryService = Depends(memory_service_dependency),
-) -> TrainingLogSummaryResponse:
-    """Return recent imported training-log summary."""
-
-    return service.get_training_log_summary(user_id=user_id, days=days)

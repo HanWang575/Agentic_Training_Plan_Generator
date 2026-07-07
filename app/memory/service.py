@@ -68,7 +68,6 @@ from app.memory.schemas import (
     TrainingLogImportResponse,
     TrainingLogXunjiSyncRequest,
     TrainingLogXunjiSyncResponse,
-    TrainingLogSummaryResponse,
     TrainingSessionListResponse,
     TrainingSessionOut,
     UserOut,
@@ -1128,29 +1127,6 @@ class MemoryService:
             errors=errors,
         )
 
-    def get_training_log_summary(self, user_id: str, days: int = 30) -> TrainingLogSummaryResponse:
-        """Return recent imported training sessions and simple counts."""
-
-        self._ensure_user(user_id)
-        cutoff = utc_now() - timedelta(days=days)
-        rows = self.session.exec(
-            select(TrainingSession).where(TrainingSession.user_id == user_id)
-        ).all()
-        recent = [
-            item
-            for item in rows
-            if _ensure_aware(item.session_date) >= cutoff
-        ]
-        recent = sorted(recent, key=lambda item: item.session_date, reverse=True)
-        sport_counts = Counter(item.sport_type for item in recent)
-        return TrainingLogSummaryResponse(
-            user_id=user_id,
-            days=days,
-            session_count=len(recent),
-            sport_counts=dict(sport_counts),
-            recent_sessions=[_training_session_out(item) for item in recent[:20]],
-        )
-
     def list_training_sessions(
         self,
         user_id: str,
@@ -1308,7 +1284,6 @@ class MemoryService:
             "profile": "",
             "recent_status": "",
             "active_plan_progress": "",
-            "training_log_summary": "",
         }
         memory_ids: list[str] = []
         if conversation_id:
@@ -1356,10 +1331,6 @@ class MemoryService:
             else:
                 sections["active_plan_progress"] = _render_plan_full(active_plan)
 
-        log_summary = self.get_training_log_summary(user_id, days=30)
-        if log_summary.session_count:
-            memory_ids.extend(item.session_id for item in log_summary.recent_sessions)
-            sections["training_log_summary"] = _render_training_log_summary(log_summary)
         return sections, list(dict.fromkeys(memory_ids))
 
     def _delete_query_rows(self, label: str, statement: Any, counts: dict[str, int]) -> None:
@@ -3018,86 +2989,6 @@ def _compact_prescribed_exercise(exercise: dict[str, Any]) -> list[Any]:
         exercise.get("notes", ""),
         groups,
     ]
-
-
-def _render_training_log_summary(summary: TrainingLogSummaryResponse) -> str:
-    lines = [
-        f"Recent {summary.days}-day imported training sessions: {summary.session_count}",
-        f"Sport counts: {summary.sport_counts}",
-    ]
-    for session in summary.recent_sessions[:10]:
-        lines.extend(_render_training_session_details(session))
-    return "\n".join(lines)
-
-
-def _render_training_session_details(session: TrainingSessionOut) -> list[str]:
-    """Render one normalized training session with bounded exercise/set details."""
-
-    lines = [
-        (
-            f"[{session.session_id} | {session.session_date.isoformat()} | {session.sport_type}] "
-            f"title={session.title or ''} start={session.start_at.isoformat() if session.start_at else ''} "
-            f"end={session.end_at.isoformat() if session.end_at else ''} "
-            f"duration_seconds={session.duration_seconds} rpe={session.rpe} notes={session.notes or ''}"
-        )
-    ]
-    if session.sets_summary:
-        lines.append(f"  sets_summary: {_short_json(_strip_xunji_set_time(session.sets_summary), max_chars=900)}")
-    exercises = session.exercises if isinstance(session.exercises, list) else []
-    if not exercises:
-        return lines
-    lines.append(f"  exercises_count: {len(exercises)}")
-    for index, exercise in enumerate(exercises[:12], start=1):
-        if not isinstance(exercise, dict):
-            lines.append(f"  {index}. {_short_json(exercise, max_chars=300)}")
-            continue
-        name = exercise.get("name") or exercise.get("title") or exercise.get("movement") or "unknown"
-        raw_sets = exercise.get("sets")
-        sets = raw_sets if isinstance(raw_sets, list) else []
-        metrics = exercise.get("metrics")
-        prefix = f"  {index}. {name}"
-        if sets:
-            prefix += f" sets={len(sets)}"
-        elif raw_sets not in (None, ""):
-            prefix += f" sets={raw_sets}"
-        if metrics:
-            prefix += f" metrics={_short_json(metrics, max_chars=260)}"
-        lines.append(prefix)
-        for set_index, set_item in enumerate(sets[:12], start=1):
-            lines.append(f"     set {set_index}: {_render_training_set(set_item)}")
-        if len(sets) > 12:
-            lines.append(f"     ... {len(sets) - 12} more set(s)")
-    if len(exercises) > 12:
-        lines.append(f"  ... {len(exercises) - 12} more exercise(s)")
-    return lines
-
-
-def _render_training_set(set_item: Any) -> str:
-    set_item = _strip_xunji_set_time(set_item)
-    if not isinstance(set_item, dict):
-        return _short_json(set_item, max_chars=240)
-    parts = []
-    for key in (
-        "done",
-        "weight",
-        "weight_kg",
-        "unit",
-        "reps",
-        "duration_s",
-        "selfWeight",
-        "restSeconds",
-    ):
-        if key in set_item and set_item.get(key) not in (None, ""):
-            parts.append(f"{key}={set_item.get(key)}")
-    metrics = set_item.get("metrics")
-    if metrics:
-        parts.append(f"metrics={_short_json(metrics, max_chars=260)}")
-    items = set_item.get("items")
-    if isinstance(items, list) and items:
-        parts.append(f"items_count={len(items)}")
-    if parts:
-        return ", ".join(parts)
-    return _short_json(set_item, max_chars=300)
 
 
 def _short_json(value: Any, max_chars: int = 400) -> str:

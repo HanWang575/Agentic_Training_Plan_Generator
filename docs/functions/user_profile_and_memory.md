@@ -435,7 +435,6 @@ recent_status_items
 latest_user_query
 plan_context_level
 active_plan_progress
-training_log_summary
 retrieved_episodes
 memory_context
 budget_warnings
@@ -478,7 +477,6 @@ Do not close a conversation while it still has pending memory approvals, unresol
 - `GET /api/memory/plans/active`
 - `PATCH /api/memory/plans/{plan_id}/progress`
 - `POST /api/memory/imports/xunji`
-- `GET /api/memory/training-log/summary`
 
 ### Q&A Integration
 
@@ -520,7 +518,6 @@ For adaptation, use `task_type="program_adaptation"`, `context_profile="program_
 - `get_recent_status`
 - `list_expiring_recent_status`
 - `get_active_plan_progress`
-- `get_training_log_summary`
 
 `get_user_memory_context` accepts `task_type`, `context_profile`, and optional `plan_context_level`; it returns the same structured MemoryContext schema for every caller, with profile-specific selection and token caps.
 

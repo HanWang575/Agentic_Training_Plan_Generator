@@ -573,6 +573,5 @@ The MCP server exposes these memory tools:
 - `get_recent_status`
 - `list_expiring_recent_status`
 - `get_active_plan_progress`
-- `get_training_log_summary`
 
 They call the same `MemoryService` used by the FastAPI routes.

@@ -434,16 +434,6 @@ class TrainingLogXunjiSyncResponse(BaseModel):
     errors: list[dict[str, str]] = Field(default_factory=list)
 
 
-class TrainingLogSummaryResponse(BaseModel):
-    """Recent training log summary response."""
-
-    user_id: str
-    days: int
-    session_count: int
-    sport_counts: dict[str, int] = Field(default_factory=dict)
-    recent_sessions: list[TrainingSessionOut] = Field(default_factory=list)
-
-
 class TrainingSessionListResponse(BaseModel):
     """Filtered training-session list response."""
 
@@ -496,7 +486,6 @@ class MemoryWorkflowState(TypedDict, total=False):
     plan_context_rationale: str
     plan_context_confidence: float
     active_plan_progress: PlanProgressOut | None
-    training_log_summary: TrainingLogSummaryResponse | None
     retrieved_episodes: list[EpisodeOut]
     memory_context: MemoryContextOut
     budget_warnings: list[dict[str, Any]]
